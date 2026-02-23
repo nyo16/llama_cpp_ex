@@ -32,7 +32,8 @@ defmodule LlamaCppEx.MixProject do
       {:elixir_make, "~> 0.8", runtime: false},
       {:fine, "~> 0.1", runtime: false},
       {:telemetry, "~> 1.0"},
-      {:ex_doc, "~> 0.34", only: :dev, runtime: false}
+      {:ex_doc, "~> 0.34", only: :dev, runtime: false},
+      {:benchee, "~> 1.0", only: :bench, runtime: false}
     ]
   end
 

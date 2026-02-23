@@ -12,6 +12,10 @@ Built with C++ NIFs using [fine](https://github.com/elixir-nx/fine) for ergonomi
 - Chat template support (ChatML, Llama, etc.)
 - RAII resource management — models, contexts, and samplers are garbage collected by the BEAM
 - Configurable sampling: temperature, top-k, top-p, min-p, repetition penalty
+- Embedding generation with L2 normalization
+- Grammar-constrained generation (GBNF)
+- Continuous batching server for concurrent inference
+- Telemetry integration for observability
 
 ## Installation
 
@@ -100,6 +104,59 @@ LlamaCppEx.Model.desc(model)          # "llama 7B Q4_K - Medium"
 LlamaCppEx.Model.n_params(model)      # 6_738_415_616
 LlamaCppEx.Model.chat_template(model) # "<|im_start|>..."
 LlamaCppEx.Tokenizer.vocab_size(model) # 32000
+```
+
+## Server (Continuous Batching)
+
+For concurrent inference, `LlamaCppEx.Server` manages a shared model/context with a slot pool and continuous batching:
+
+```elixir
+{:ok, server} = LlamaCppEx.Server.start_link(
+  model_path: "model.gguf",
+  n_gpu_layers: -1,
+  n_parallel: 4,
+  n_ctx: 8192
+)
+
+# Synchronous
+{:ok, text} = LlamaCppEx.Server.generate(server, "Once upon a time", max_tokens: 100)
+
+# Streaming
+LlamaCppEx.Server.stream(server, "Tell me a story", max_tokens: 200)
+|> Enum.each(&IO.write/1)
+```
+
+Multiple callers are batched into a single forward pass per tick, improving throughput under load.
+
+## Benchmarks
+
+Measured on Apple M4 Max (64 GB) with Qwen3-4B Q4_K_M, Metal backend (`n_gpu_layers: -1`).
+
+### Single-sequence generation
+
+| Prompt | 32 tokens | 128 tokens |
+|--------|-----------|------------|
+| short (6 tok) | 0.31s (3.19 ips) | 1.01s (0.98 ips) |
+| medium (100 tok) | 0.36s (2.79 ips) | 1.06s (0.94 ips) |
+| long (500 tok) | 0.65s (1.53 ips) | 1.29s (0.77 ips) |
+
+### Continuous batching throughput
+
+```
+max_tokens: 32, prompt: "short"
+──────────────────────────────────────────────────────────────────────────────
+Concurrency  Wall time    Total tok/s  Per-req tok/s  Speedup  Avg batch
+1            318ms        100.6        100.6          1.00x    1.1
+2            440ms        145.5         72.7          1.45x    2.2
+4            824ms        155.3         38.8          1.54x    4.5
+```
+
+Run benchmarks yourself:
+
+```bash
+MIX_ENV=bench mix deps.get
+LLAMA_MODEL_PATH=path/to/model.gguf MIX_ENV=bench mix run bench/single_generate.exs
+LLAMA_MODEL_PATH=path/to/model.gguf MIX_ENV=bench mix run bench/server_concurrent.exs
 ```
 
 ## Architecture
