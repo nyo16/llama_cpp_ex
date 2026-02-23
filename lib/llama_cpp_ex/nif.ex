@@ -95,4 +95,8 @@ defmodule LlamaCppEx.NIF do
   def prefill(_ctx, _tokens, _seq_id), do: :erlang.nif_error(:not_loaded)
   def decode_batch(_ctx, _sampler, _entries), do: :erlang.nif_error(:not_loaded)
   def decode_token(_ctx, _token_id, _pos, _seq_id), do: :erlang.nif_error(:not_loaded)
+
+  # Continuous batching
+  def batch_eval(_ctx, _entries), do: :erlang.nif_error(:not_loaded)
+  def sampler_sample_at(_sampler, _ctx, _idx), do: :erlang.nif_error(:not_loaded)
 end

@@ -2,7 +2,7 @@
 
 ## Status
 
-Proposed (Phase 3)
+Superseded by [ADR 006](006-continuous-batching.md)
 
 ## Context
 

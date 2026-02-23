@@ -614,6 +614,54 @@ decode_token(
 }
 FINE_NIF(decode_token, ERL_NIF_DIRTY_JOB_CPU_BOUND);
 
+// --- Batch eval (forward pass only, no sampling) ---
+
+std::variant<fine::Ok<>, fine::Error<std::string>>
+batch_eval(
+    ErlNifEnv* env,
+    fine::ResourcePtr<LlamaContext> ctx,
+    std::vector<std::tuple<int64_t, int64_t, int64_t, bool>> entries)
+{
+    int n = static_cast<int>(entries.size());
+    if (n == 0) {
+        return fine::Error(std::string("empty entries list"));
+    }
+
+    llama_batch batch = llama_batch_init(n, 0, 1);
+    batch.n_tokens = n;
+
+    for (int i = 0; i < n; i++) {
+        auto& [token_id, pos, seq_id, logits] = entries[i];
+        batch.token[i]      = static_cast<llama_token>(token_id);
+        batch.pos[i]        = static_cast<llama_pos>(pos);
+        batch.n_seq_id[i]   = 1;
+        batch.seq_id[i][0]  = static_cast<llama_seq_id>(seq_id);
+        batch.logits[i]     = logits;
+    }
+
+    int ret = llama_decode(ctx->ctx, batch);
+    llama_batch_free(batch);
+
+    if (ret != 0) {
+        return fine::Error(std::string("batch_eval failed with code: " + std::to_string(ret)));
+    }
+
+    return fine::Ok();
+}
+FINE_NIF(batch_eval, ERL_NIF_DIRTY_JOB_CPU_BOUND);
+
+// --- Sampler sample at batch index ---
+
+int64_t sampler_sample_at(
+    ErlNifEnv* env,
+    fine::ResourcePtr<LlamaSampler> sampler,
+    fine::ResourcePtr<LlamaContext> ctx,
+    int64_t idx)
+{
+    return llama_sampler_sample(sampler->sampler, ctx->ctx, static_cast<int32_t>(idx));
+}
+FINE_NIF(sampler_sample_at, 0);
+
 // --- Chat template ---
 
 static ERL_NIF_TERM make_binary_term(ErlNifEnv* env, const char* data, size_t len) {

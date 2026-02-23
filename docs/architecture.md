@@ -33,6 +33,8 @@ graph LR
         D[Sampler]
         E[Tokenizer]
         F[Chat]
+        H[Embedding]
+        I[Server]
     end
 
     subgraph "Internal"
@@ -44,11 +46,15 @@ graph LR
     A --> D
     A --> E
     A --> F
+    A --> H
+    A --> I
     B --> G
     C --> G
     D --> G
     E --> G
     F --> G
+    H --> G
+    I --> G
 ```
 
 ## Resource Lifecycle
@@ -106,6 +112,13 @@ NIFs are assigned to the appropriate scheduler based on their execution characte
 | `tokenize`, `detokenize` | Normal | Fast string operations |
 | `sampler_*` | Normal | Lightweight operations |
 | `model_*` (introspection) | Normal | Simple field reads |
+| `prefill` | DirtyCPU | Prompt processing forward pass |
+| `embed_decode` | DirtyCPU | Embedding forward pass |
+| `get_embeddings` | Normal | Read embedding vectors |
+| `batch_eval` | DirtyCPU | Batched forward pass (continuous batching) |
+| `sampler_sample_at` | Normal | Sample at specific batch index |
+| `decode_token` | DirtyCPU | Single-token forward pass |
+| `decode_batch` | DirtyCPU | Multi-sequence decode + sample |
 
 **Why dirty schedulers?** Regular NIF calls must return within ~1ms to avoid blocking BEAM schedulers. Model loading and inference can take seconds to minutes. Dirty schedulers provide dedicated OS threads for these long-running operations without impacting BEAM responsiveness.
 
@@ -220,29 +233,64 @@ graph TD
     end
 ```
 
-## Batching Architecture (Planned - Phase 3)
+## Continuous Batching
 
-For serving multiple concurrent users, llama.cpp supports batched inference where multiple sequences share a single forward pass:
+The Server uses continuous batching to serve multiple concurrent users with a single forward pass per tick:
 
 ```mermaid
 graph TD
     subgraph "Elixir Layer"
-        A[Caller 1] --> D[LlamaCppEx.Server<br/>GenServer Batcher]
+        A[Caller 1] --> D[LlamaCppEx.Server<br/>Tick-driven GenServer]
         B[Caller 2] --> D
         C[Caller 3] --> D
+        D -->|Queue| Q[Request Queue<br/>FIFO :queue]
     end
 
-    D -->|Flush on batch_size<br/>or batch_timeout| E[decode_batch NIF]
+    D -->|"One tick = one forward pass"| E[batch_eval NIF]
 
     subgraph "C++ Layer"
-        E --> F[Build llama_batch<br/>with all sequences]
+        E --> F[Build llama_batch<br/>decode tokens + prefill chunks]
         F --> G[Single llama_decode call]
-        G --> H[Sample per sequence]
     end
 
-    H --> I[Reply to Caller 1]
-    H --> J[Reply to Caller 2]
-    H --> K[Reply to Caller 3]
+    G --> H[sampler_sample_at per slot]
+    H --> I[Stream/reply to callers]
+```
+
+### Tick Loop
+
+Each tick executes five phases:
+
+1. **Finish** — Complete slots that hit EOG or max tokens, dequeue waiting requests
+2. **Build batch** — Add decode tokens first (priority), then fill remaining budget with prefill chunks
+3. **Forward pass** — Single `batch_eval` NIF call
+4. **Sample** — `sampler_sample_at` for each generating/completing slot at their batch index
+5. **Continue** — Schedule next tick if any active slots remain
+
+### Chunked Prefill
+
+Long prompts are split into chunks (default 512 tokens) and processed across multiple ticks, interleaved with decode tokens from generating slots:
+
+```mermaid
+sequenceDiagram
+    participant S as Server
+    participant NIF as batch_eval NIF
+
+    Note over S: Tick 1: Slot 0 generating, Slot 1 prefilling (2048 tok prompt)
+    S->>NIF: batch_eval([slot0_decode_tok, slot1_prefill_chunk_0..511])
+    NIF-->>S: :ok
+    Note over S: Sample slot 0, advance slot 1 prefill_pos
+
+    Note over S: Tick 2: Slot 0 generating, Slot 1 still prefilling
+    S->>NIF: batch_eval([slot0_decode_tok, slot1_prefill_chunk_512..1023])
+    NIF-->>S: :ok
+
+    Note over S: Tick 3-4: Continue chunking...
+
+    Note over S: Tick 5: Slot 1 prefill complete (last chunk has logits=true)
+    S->>NIF: batch_eval([slot0_decode_tok, slot1_prefill_chunk_1536..2047])
+    NIF-->>S: :ok
+    Note over S: Sample both slots — slot 1 now generating
 ```
 
 ### Why Batching Matters
@@ -250,51 +298,6 @@ graph TD
 - **Prefill** (prompt processing): Already GPU-efficient, compute-bound
 - **Decode** (token generation): Memory-bandwidth-bound, GPU utilization 10-30%
 - **Batching**: Converts N serial matrix-vector ops into one matrix-matrix multiply
-
-### How `llama_batch` Enables Multi-Sequence Batching
-
-Each token in a batch carries its sequence ID. Tokens only attend to tokens with the same sequence ID, enabling independent sequences to share a forward pass:
-
-```
-llama_batch:
-  token[0] = {id: 1234, pos: 42, seq_id: [0], logits: true}   # Sequence 0
-  token[1] = {id: 5678, pos: 18, seq_id: [1], logits: true}   # Sequence 1
-  token[2] = {id: 9012, pos: 31, seq_id: [2], logits: true}   # Sequence 2
-```
-
-### Shared System Prompt
-
-Tag prompt tokens with ALL sequence IDs to cache the system prompt once and share it across all sequences:
-
-```mermaid
-graph LR
-    subgraph "KV Cache"
-        A["System prompt tokens<br/>seq_id: [0,1,2,3]"] --> B["Seq 0 tokens"]
-        A --> C["Seq 1 tokens"]
-        A --> D["Seq 2 tokens"]
-        A --> E["Seq 3 tokens"]
-    end
-```
-
-### GenServer Batcher Design
-
-```mermaid
-sequenceDiagram
-    participant C1 as Caller 1
-    participant C2 as Caller 2
-    participant S as Server (GenServer)
-    participant NIF as decode_batch NIF
-
-    C1->>S: GenServer.call({:generate, ...})
-    Note over S: Start batch_timeout timer (20ms)
-    C2->>S: GenServer.call({:generate, ...})
-
-    Note over S: Timer fires or batch_size reached
-    S->>NIF: decode_batch([{seq0, token, pos}, {seq1, token, pos}])
-    NIF-->>S: [{seq0, next_token}, {seq1, next_token}]
-    S-->>C1: GenServer.reply(from1, next_token)
-    S-->>C2: GenServer.reply(from2, next_token)
-```
 
 ## File Map
 
@@ -305,18 +308,20 @@ llama_cpp_ex/
 ├── vendor/llama.cpp/                # Git submodule (pinned to release)
 ├── c_src/llama_cpp_ex/
 │   ├── llama_nif.h                  # RAII wrappers (LlamaModel, LlamaContext, LlamaSampler)
-│   └── llama_nif.cpp                # All NIF implementations (~560 lines)
+│   └── llama_nif.cpp                # All NIF implementations (~900 lines)
 ├── lib/
-│   ├── llama_cpp_ex.ex              # High-level API: generate, stream, chat
+│   ├── llama_cpp_ex.ex              # High-level API: generate, stream, chat, embed
 │   └── llama_cpp_ex/
 │       ├── nif.ex                   # @on_load + NIF stubs
 │       ├── model.ex                 # Model loading + introspection
 │       ├── context.ex               # Inference context with KV cache
 │       ├── sampler.ex               # Sampling chain configuration
 │       ├── tokenizer.ex             # Text <-> token conversion
-│       └── chat.ex                  # Chat template formatting
+│       ├── chat.ex                  # Chat template formatting
+│       ├── embedding.ex             # Text embeddings (L2 norm, batched)
+│       └── server.ex                # Continuous batching GenServer
 ├── priv/                            # Build output (.so / .dylib)
 ├── docs/                            # Architecture docs + ADRs
 └── test/
-    └── llama_cpp_ex_test.exs        # 11 tests (2 unit + 9 model-dependent)
+    └── llama_cpp_ex_test.exs        # 46 tests (2 unit + 44 model-dependent)
 ```

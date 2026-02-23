@@ -426,23 +426,91 @@ defmodule LlamaCppExTest do
         end
       end
 
-      test "returns error when no slots available", %{server: server} do
-        # Fill both slots
+      test "requests queue when all slots busy", %{server: server} do
+        # n_parallel=2, so fire 4 requests — 2 will queue
         tasks =
-          for _ <- 1..2 do
+          for i <- 1..4 do
             Task.async(fn ->
-              LlamaCppEx.Server.generate(server, "Long story:", max_tokens: 100)
+              LlamaCppEx.Server.generate(server, "Count to #{i}:", max_tokens: 8)
             end)
           end
 
-        # Give tasks time to acquire slots
-        Process.sleep(100)
+        results = Task.await_many(tasks, 120_000)
+        assert length(results) == 4
 
-        # Third request should fail
-        assert {:error, :no_slots} =
-                 LlamaCppEx.Server.generate(server, "Another one", max_tokens: 1)
+        for result <- results do
+          assert {:ok, text} = result
+          assert is_binary(text)
+          assert byte_size(text) > 0
+        end
+      end
 
-        Task.await_many(tasks, 60_000)
+      test "get_stats returns server state", %{server: server} do
+        stats = LlamaCppEx.Server.get_stats(server)
+        assert stats.n_parallel == 2
+        assert stats.idle_slots == 2
+        assert stats.active_slots == 0
+        assert stats.queue_depth == 0
+      end
+
+      test "chunked prefill with long prompt", %{server: server} do
+        # Generate a prompt long enough to require chunking (chunk_size defaults to 512)
+        long_prompt = String.duplicate("The quick brown fox jumps over the lazy dog. ", 50)
+
+        {:ok, text} =
+          LlamaCppEx.Server.generate(server, long_prompt, max_tokens: 8, timeout: 120_000)
+
+        assert is_binary(text)
+        assert byte_size(text) > 0
+      end
+
+      test "telemetry events fire on request completion", %{server: server} do
+        ref = make_ref()
+        test_pid = self()
+
+        :telemetry.attach(
+          "test-request-done-#{inspect(ref)}",
+          [:llama_cpp_ex, :server, :request, :done],
+          fn _event, measurements, metadata, _config ->
+            send(test_pid, {:telemetry, measurements, metadata})
+          end,
+          nil
+        )
+
+        :telemetry.attach(
+          "test-tick-#{inspect(ref)}",
+          [:llama_cpp_ex, :server, :tick],
+          fn _event, measurements, _metadata, _config ->
+            send(test_pid, {:tick_telemetry, measurements})
+          end,
+          nil
+        )
+
+        {:ok, _text} = LlamaCppEx.Server.generate(server, "Hello", max_tokens: 4)
+
+        assert_receive {:telemetry, measurements, metadata}, 5_000
+
+        assert is_number(measurements.prompt_tokens)
+        assert measurements.prompt_tokens > 0
+        assert is_number(measurements.generated_tokens)
+        assert is_number(measurements.duration_ms)
+        assert measurements.duration_ms > 0
+        assert is_number(measurements.ttft_ms)
+        assert is_number(measurements.prompt_eval_rate)
+        assert is_number(measurements.generation_rate)
+
+        assert is_pid(metadata.server)
+        assert is_integer(metadata.seq_id)
+        assert metadata.mode == :generate
+
+        # Should also have received tick telemetry
+        assert_receive {:tick_telemetry, tick_measurements}, 1_000
+        assert is_number(tick_measurements.batch_size)
+        assert tick_measurements.batch_size > 0
+        assert is_number(tick_measurements.eval_ms)
+
+        :telemetry.detach("test-request-done-#{inspect(ref)}")
+        :telemetry.detach("test-tick-#{inspect(ref)}")
       end
     end
   else

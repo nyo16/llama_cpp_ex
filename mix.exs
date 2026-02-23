@@ -31,6 +31,7 @@ defmodule LlamaCppEx.MixProject do
     [
       {:elixir_make, "~> 0.8", runtime: false},
       {:fine, "~> 0.1", runtime: false},
+      {:telemetry, "~> 1.0"},
       {:ex_doc, "~> 0.34", only: :dev, runtime: false}
     ]
   end
@@ -64,7 +65,8 @@ defmodule LlamaCppEx.MixProject do
         "docs/adr/002-fine-for-nif-ergonomics.md",
         "docs/adr/003-static-linking.md",
         "docs/adr/004-streaming-via-enif-send.md",
-        "docs/adr/005-batching-architecture.md"
+        "docs/adr/005-batching-architecture.md",
+        "docs/adr/006-continuous-batching.md"
       ],
       groups_for_extras: [
         "Architecture Decision Records": ~r/docs\/adr\/.*/
@@ -76,7 +78,9 @@ defmodule LlamaCppEx.MixProject do
           LlamaCppEx.Context,
           LlamaCppEx.Sampler,
           LlamaCppEx.Tokenizer,
-          LlamaCppEx.Chat
+          LlamaCppEx.Chat,
+          LlamaCppEx.Embedding,
+          LlamaCppEx.Server
         ],
         Internal: [LlamaCppEx.NIF]
       ]
