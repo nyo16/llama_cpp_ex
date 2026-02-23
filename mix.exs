@@ -2,6 +2,7 @@ defmodule LlamaCppEx.MixProject do
   use Mix.Project
 
   @version "0.1.0"
+  @source_url "https://github.com/nyo16/llama_cpp_ex"
 
   def project do
     [
@@ -12,7 +13,13 @@ defmodule LlamaCppEx.MixProject do
       deps: deps(),
       compilers: [:elixir_make] ++ Mix.compilers(),
       make_env: &make_env/0,
-      make_clean: ["clean"]
+      make_clean: ["clean"],
+      description: description(),
+      package: package(),
+      name: "LlamaCppEx",
+      source_url: @source_url,
+      homepage_url: @source_url,
+      docs: docs()
     ]
   end
 
@@ -23,7 +30,56 @@ defmodule LlamaCppEx.MixProject do
   defp deps do
     [
       {:elixir_make, "~> 0.8", runtime: false},
-      {:fine, "~> 0.1", runtime: false}
+      {:fine, "~> 0.1", runtime: false},
+      {:ex_doc, "~> 0.34", only: :dev, runtime: false}
+    ]
+  end
+
+  defp description do
+    "Elixir bindings for llama.cpp — run LLMs locally with Metal, CUDA, Vulkan, or CPU acceleration."
+  end
+
+  defp package do
+    [
+      name: "llama_cpp_ex",
+      licenses: ["Apache-2.0"],
+      links: %{
+        "GitHub" => @source_url,
+        "llama.cpp" => "https://github.com/ggml-org/llama.cpp"
+      },
+      files: ~w(
+        lib c_src Makefile mix.exs README.md LICENSE .formatter.exs
+      )
+    ]
+  end
+
+  defp docs do
+    [
+      main: "readme",
+      extras: [
+        "README.md",
+        "docs/architecture.md",
+        "docs/cross-platform-builds.md",
+        "docs/adr/001-cpp-nif-over-rustler.md",
+        "docs/adr/002-fine-for-nif-ergonomics.md",
+        "docs/adr/003-static-linking.md",
+        "docs/adr/004-streaming-via-enif-send.md",
+        "docs/adr/005-batching-architecture.md"
+      ],
+      groups_for_extras: [
+        "Architecture Decision Records": ~r/docs\/adr\/.*/
+      ],
+      groups_for_modules: [
+        "High-Level API": [LlamaCppEx],
+        "Core Modules": [
+          LlamaCppEx.Model,
+          LlamaCppEx.Context,
+          LlamaCppEx.Sampler,
+          LlamaCppEx.Tokenizer,
+          LlamaCppEx.Chat
+        ],
+        Internal: [LlamaCppEx.NIF]
+      ]
     ]
   end
 
