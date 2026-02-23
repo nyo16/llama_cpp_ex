@@ -32,14 +32,35 @@ defmodule LlamaCppEx.NIF do
   def token_to_piece(_model, _token), do: :erlang.nif_error(:not_loaded)
 
   # Context
-  def context_create(_model, _n_ctx, _n_batch, _n_ubatch, _n_threads, _n_threads_batch),
-    do: :erlang.nif_error(:not_loaded)
+  def context_create(
+        _model,
+        _n_ctx,
+        _n_batch,
+        _n_ubatch,
+        _n_threads,
+        _n_threads_batch,
+        _embeddings,
+        _pooling_type,
+        _n_seq_max
+      ),
+      do: :erlang.nif_error(:not_loaded)
 
   def context_n_ctx(_ctx), do: :erlang.nif_error(:not_loaded)
+  def context_n_seq_max(_ctx), do: :erlang.nif_error(:not_loaded)
 
   # Sampler
-  def sampler_init(_seed, _temp, _top_k, _top_p, _min_p, _penalty_repeat),
-    do: :erlang.nif_error(:not_loaded)
+  def sampler_init(
+        _model,
+        _seed,
+        _temp,
+        _top_k,
+        _top_p,
+        _min_p,
+        _penalty_repeat,
+        _grammar_str,
+        _grammar_root
+      ),
+      do: :erlang.nif_error(:not_loaded)
 
   def sampler_accept(_sampler, _token), do: :erlang.nif_error(:not_loaded)
   def sampler_reset(_sampler), do: :erlang.nif_error(:not_loaded)
@@ -52,6 +73,8 @@ defmodule LlamaCppEx.NIF do
   def memory_clear(_ctx), do: :erlang.nif_error(:not_loaded)
   def memory_seq_rm(_ctx, _seq_id, _p0, _p1), do: :erlang.nif_error(:not_loaded)
   def memory_seq_cp(_ctx, _seq_id_src, _seq_id_dst, _p0, _p1), do: :erlang.nif_error(:not_loaded)
+  def memory_seq_keep(_ctx, _seq_id), do: :erlang.nif_error(:not_loaded)
+  def memory_seq_pos_max(_ctx, _seq_id), do: :erlang.nif_error(:not_loaded)
 
   # Chat template
   def chat_apply_template(_template, _messages, _add_assistant),
@@ -63,4 +86,13 @@ defmodule LlamaCppEx.NIF do
 
   # High-level generation
   def generate(_ctx, _sampler, _prompt_tokens, _max_tokens), do: :erlang.nif_error(:not_loaded)
+
+  # Embeddings
+  def embed_decode(_ctx, _tokens, _seq_id), do: :erlang.nif_error(:not_loaded)
+  def get_embeddings(_ctx, _seq_id, _normalize), do: :erlang.nif_error(:not_loaded)
+
+  # Batched inference
+  def prefill(_ctx, _tokens, _seq_id), do: :erlang.nif_error(:not_loaded)
+  def decode_batch(_ctx, _sampler, _entries), do: :erlang.nif_error(:not_loaded)
+  def decode_token(_ctx, _token_id, _pos, _seq_id), do: :erlang.nif_error(:not_loaded)
 end

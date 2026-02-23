@@ -23,10 +23,11 @@ defmodule LlamaCppEx do
     * `LlamaCppEx.Context` - Inference context with KV cache
     * `LlamaCppEx.Sampler` - Token sampling configuration
     * `LlamaCppEx.Tokenizer` - Text tokenization and detokenization
+    * `LlamaCppEx.Embedding` - Embedding generation
 
   """
 
-  alias LlamaCppEx.{Model, Context, Sampler, Tokenizer, Chat}
+  alias LlamaCppEx.{Model, Context, Sampler, Tokenizer, Chat, Embedding}
 
   @doc """
   Initializes the llama.cpp backend. Call once at application start.
@@ -62,7 +63,8 @@ defmodule LlamaCppEx do
     * `:min_p` - Min-P filtering. Defaults to `0.05`.
     * `:seed` - Random seed. Defaults to random.
     * `:penalty_repeat` - Repetition penalty. Defaults to `1.0`.
-    * `:n_gpu_layers` - GPU layers (passed to context). Inherited from model.
+    * `:grammar` - GBNF grammar string for constrained generation.
+    * `:grammar_root` - Root rule name for grammar. Defaults to `"root"`.
 
   """
   @spec generate(Model.t(), String.t(), keyword()) :: {:ok, String.t()} | {:error, String.t()}
@@ -71,7 +73,16 @@ defmodule LlamaCppEx do
     n_ctx = Keyword.get(opts, :n_ctx, 2048)
 
     sampler_opts =
-      Keyword.take(opts, [:seed, :temp, :top_k, :top_p, :min_p, :penalty_repeat])
+      Keyword.take(opts, [
+        :seed,
+        :temp,
+        :top_k,
+        :top_p,
+        :min_p,
+        :penalty_repeat,
+        :grammar,
+        :grammar_root
+      ])
 
     # Tokenize prompt
     {:ok, tokens} = Tokenizer.encode(model, prompt)
@@ -85,7 +96,7 @@ defmodule LlamaCppEx do
       |> Keyword.put(:n_ctx, ctx_size)
 
     with {:ok, ctx} <- Context.create(model, ctx_opts),
-         {:ok, sampler} <- Sampler.create(sampler_opts) do
+         {:ok, sampler} <- Sampler.create(model, sampler_opts) do
       Context.generate(ctx, sampler, tokens, max_tokens: max_tokens)
     end
   end
@@ -112,7 +123,16 @@ defmodule LlamaCppEx do
     timeout = Keyword.get(opts, :timeout, 60_000)
 
     sampler_opts =
-      Keyword.take(opts, [:seed, :temp, :top_k, :top_p, :min_p, :penalty_repeat])
+      Keyword.take(opts, [
+        :seed,
+        :temp,
+        :top_k,
+        :top_p,
+        :min_p,
+        :penalty_repeat,
+        :grammar,
+        :grammar_root
+      ])
 
     ctx_opts =
       Keyword.take(opts, [:n_threads, :n_threads_batch, :n_batch, :n_ubatch])
@@ -123,7 +143,7 @@ defmodule LlamaCppEx do
         {:ok, tokens} = Tokenizer.encode(model, prompt)
         ctx_size = max(n_ctx, length(tokens) + max_tokens)
         {:ok, ctx} = Context.create(model, Keyword.put(ctx_opts, :n_ctx, ctx_size))
-        {:ok, sampler} = Sampler.create(sampler_opts)
+        {:ok, sampler} = Sampler.create(model, sampler_opts)
 
         ref = make_ref()
         parent = self()
@@ -204,5 +224,26 @@ defmodule LlamaCppEx do
     {chat_opts, gen_opts} = Keyword.split(opts, [:template, :add_assistant])
     {:ok, prompt} = Chat.apply_template(model, messages, chat_opts)
     stream(model, prompt, gen_opts)
+  end
+
+  @doc """
+  Computes an embedding for a single text.
+
+  See `LlamaCppEx.Embedding.embed/3` for options.
+  """
+  @spec embed(Model.t(), String.t(), keyword()) :: {:ok, Embedding.t()} | {:error, String.t()}
+  def embed(%Model{} = model, text, opts \\ []) do
+    Embedding.embed(model, text, opts)
+  end
+
+  @doc """
+  Computes embeddings for multiple texts.
+
+  See `LlamaCppEx.Embedding.embed_batch/3` for options.
+  """
+  @spec embed_batch(Model.t(), [String.t()], keyword()) ::
+          {:ok, [Embedding.t()]} | {:error, String.t()}
+  def embed_batch(%Model{} = model, texts, opts \\ []) do
+    Embedding.embed_batch(model, texts, opts)
   end
 end

@@ -186,14 +186,28 @@ context_create(
     int64_t n_batch,
     int64_t n_ubatch,
     int64_t n_threads,
-    int64_t n_threads_batch)
+    int64_t n_threads_batch,
+    bool embeddings,
+    int64_t pooling_type,
+    int64_t n_seq_max)
 {
     auto params = llama_context_default_params();
-    params.n_ctx         = static_cast<uint32_t>(n_ctx);
-    params.n_batch       = static_cast<uint32_t>(n_batch);
-    params.n_ubatch      = static_cast<uint32_t>(n_ubatch);
-    params.n_threads     = static_cast<int32_t>(n_threads);
+    params.n_ctx           = static_cast<uint32_t>(n_ctx);
+    params.n_batch         = static_cast<uint32_t>(n_batch);
+    params.n_ubatch        = static_cast<uint32_t>(n_ubatch);
+    params.n_threads       = static_cast<int32_t>(n_threads);
     params.n_threads_batch = static_cast<int32_t>(n_threads_batch);
+    params.embeddings      = embeddings;
+    params.pooling_type    = static_cast<enum llama_pooling_type>(pooling_type);
+
+    if (n_seq_max > 0) {
+        params.n_seq_max = static_cast<uint32_t>(n_seq_max);
+    }
+
+    // For embedding models, n_ubatch must equal n_batch
+    if (embeddings) {
+        params.n_ubatch = params.n_batch;
+    }
 
     llama_context* ctx = llama_init_from_model(model->model, params);
     if (!ctx) {
@@ -214,15 +228,28 @@ FINE_NIF(context_n_ctx, 0);
 fine::ResourcePtr<LlamaSampler>
 sampler_init(
     ErlNifEnv* env,
+    fine::ResourcePtr<LlamaModel> model,
     int64_t seed,
     double temp,
     int64_t top_k,
     double top_p,
     double min_p,
-    double penalty_repeat)
+    double penalty_repeat,
+    std::string grammar_str,
+    std::string grammar_root)
 {
     auto chain_params = llama_sampler_chain_default_params();
     auto* chain = llama_sampler_chain_init(chain_params);
+
+    // Grammar sampler goes first (before penalties/temperature)
+    if (!grammar_str.empty()) {
+        const auto* vocab = model->vocab();
+        auto* grammar = llama_sampler_init_grammar(
+            vocab, grammar_str.c_str(), grammar_root.c_str());
+        if (grammar) {
+            llama_sampler_chain_add(chain, grammar);
+        }
+    }
 
     // Add samplers in recommended order: penalties -> top_k -> top_p -> min_p -> temp -> dist/greedy
     if (penalty_repeat != 1.0) {
@@ -324,6 +351,268 @@ fine::Ok<> memory_seq_cp(ErlNifEnv* env, fine::ResourcePtr<LlamaContext> ctx,
     return fine::Ok();
 }
 FINE_NIF(memory_seq_cp, 0);
+
+// --- Memory seq_keep ---
+
+fine::Ok<> memory_seq_keep(ErlNifEnv* env, fine::ResourcePtr<LlamaContext> ctx, int64_t seq_id) {
+    llama_memory_seq_keep(
+        llama_get_memory(ctx->ctx),
+        static_cast<llama_seq_id>(seq_id));
+    return fine::Ok();
+}
+FINE_NIF(memory_seq_keep, 0);
+
+// --- Memory seq_pos_max ---
+
+int64_t memory_seq_pos_max(ErlNifEnv* env, fine::ResourcePtr<LlamaContext> ctx, int64_t seq_id) {
+    return llama_memory_seq_pos_max(
+        llama_get_memory(ctx->ctx),
+        static_cast<llama_seq_id>(seq_id));
+}
+FINE_NIF(memory_seq_pos_max, 0);
+
+// --- Context n_seq_max ---
+
+int64_t context_n_seq_max(ErlNifEnv* env, fine::ResourcePtr<LlamaContext> ctx) {
+    return llama_n_seq_max(ctx->ctx);
+}
+FINE_NIF(context_n_seq_max, 0);
+
+// --- Embeddings ---
+
+std::variant<fine::Ok<>, fine::Error<std::string>>
+embed_decode(
+    ErlNifEnv* env,
+    fine::ResourcePtr<LlamaContext> ctx,
+    std::vector<int64_t> token_ids,
+    int64_t seq_id)
+{
+    int n_tokens = static_cast<int>(token_ids.size());
+    if (n_tokens == 0) {
+        return fine::Error(std::string("empty token list"));
+    }
+
+    // Clear memory for a fresh decode
+    llama_memory_clear(llama_get_memory(ctx->ctx), true);
+
+    // Build batch with explicit seq_id and position tracking
+    llama_batch batch = llama_batch_init(n_tokens, 0, 1);
+    batch.n_tokens = n_tokens;
+
+    for (int i = 0; i < n_tokens; i++) {
+        batch.token[i]      = static_cast<llama_token>(token_ids[i]);
+        batch.pos[i]        = static_cast<llama_pos>(i);
+        batch.n_seq_id[i]   = 1;
+        batch.seq_id[i][0]  = static_cast<llama_seq_id>(seq_id);
+        batch.logits[i]     = true; // all tokens get embeddings
+    }
+
+    int ret = llama_decode(ctx->ctx, batch);
+    llama_batch_free(batch);
+
+    if (ret != 0) {
+        return fine::Error(std::string("embed_decode failed with code: " + std::to_string(ret)));
+    }
+
+    return fine::Ok();
+}
+FINE_NIF(embed_decode, ERL_NIF_DIRTY_JOB_CPU_BOUND);
+
+std::variant<fine::Ok<std::vector<double>>, fine::Error<std::string>>
+get_embeddings(
+    ErlNifEnv* env,
+    fine::ResourcePtr<LlamaContext> ctx,
+    int64_t seq_id,
+    int64_t normalize)
+{
+    int n_embd = llama_model_n_embd(llama_get_model(ctx->ctx));
+    enum llama_pooling_type ptype = llama_pooling_type(ctx->ctx);
+
+    const float* embd = nullptr;
+
+    if (ptype == LLAMA_POOLING_TYPE_NONE) {
+        // No pooling: get embeddings for the last token
+        embd = llama_get_embeddings_ith(ctx->ctx, -1);
+    } else {
+        // Pooled: get embeddings for the sequence
+        embd = llama_get_embeddings_seq(ctx->ctx, static_cast<llama_seq_id>(seq_id));
+    }
+
+    if (!embd) {
+        return fine::Error(std::string("failed to get embeddings (null pointer)"));
+    }
+
+    std::vector<double> out(n_embd);
+
+    if (normalize == 2) {
+        // L2 normalization
+        double sum = 0.0;
+        for (int i = 0; i < n_embd; i++) sum += (double)embd[i] * (double)embd[i];
+        double norm = sum > 0.0 ? 1.0 / std::sqrt(sum) : 0.0;
+        for (int i = 0; i < n_embd; i++) out[i] = (double)embd[i] * norm;
+    } else if (normalize == 0) {
+        // Max-abs normalization
+        double max_abs = 0.0;
+        for (int i = 0; i < n_embd; i++) {
+            double a = std::abs((double)embd[i]);
+            if (a > max_abs) max_abs = a;
+        }
+        double norm = max_abs > 0.0 ? 1.0 / max_abs : 0.0;
+        for (int i = 0; i < n_embd; i++) out[i] = (double)embd[i] * norm;
+    } else {
+        // No normalization
+        for (int i = 0; i < n_embd; i++) out[i] = (double)embd[i];
+    }
+
+    return fine::Ok(out);
+}
+FINE_NIF(get_embeddings, 0);
+
+// --- Prefill (batched inference) ---
+
+std::variant<fine::Ok<int64_t>, fine::Error<std::string>>
+prefill(
+    ErlNifEnv* env,
+    fine::ResourcePtr<LlamaContext> ctx,
+    std::vector<int64_t> token_ids,
+    int64_t seq_id)
+{
+    int n_tokens = static_cast<int>(token_ids.size());
+    if (n_tokens == 0) {
+        return fine::Error(std::string("empty token list"));
+    }
+
+    int n_batch = llama_n_batch(ctx->ctx);
+
+    for (int i = 0; i < n_tokens; i += n_batch) {
+        int n = std::min(n_tokens - i, n_batch);
+        bool is_last_chunk = (i + n >= n_tokens);
+
+        llama_batch batch = llama_batch_init(n, 0, 1);
+        batch.n_tokens = n;
+
+        for (int j = 0; j < n; j++) {
+            batch.token[j]      = static_cast<llama_token>(token_ids[i + j]);
+            batch.pos[j]        = static_cast<llama_pos>(i + j);
+            batch.n_seq_id[j]   = 1;
+            batch.seq_id[j][0]  = static_cast<llama_seq_id>(seq_id);
+            // Only request logits for the last token of the last chunk
+            batch.logits[j]     = (is_last_chunk && j == n - 1);
+        }
+
+        int ret = llama_decode(ctx->ctx, batch);
+        llama_batch_free(batch);
+
+        if (ret != 0) {
+            return fine::Error(std::string("prefill decode failed with code: " + std::to_string(ret)));
+        }
+    }
+
+    return fine::Ok(static_cast<int64_t>(n_tokens));
+}
+FINE_NIF(prefill, ERL_NIF_DIRTY_JOB_CPU_BOUND);
+
+// --- Decode batch (batched inference) ---
+
+std::variant<
+    fine::Ok<std::vector<std::tuple<int64_t, int64_t, std::string>>>,
+    fine::Error<std::string>
+>
+decode_batch(
+    ErlNifEnv* env,
+    fine::ResourcePtr<LlamaContext> ctx,
+    fine::ResourcePtr<LlamaSampler> sampler,
+    std::vector<std::tuple<int64_t, int64_t, int64_t>> entries)
+{
+    // entries: [{seq_id, token_id, position}, ...]
+    int n = static_cast<int>(entries.size());
+    if (n == 0) {
+        return fine::Error(std::string("empty entries list"));
+    }
+
+    const auto* vocab = ctx->model->vocab();
+
+    // Build a single batch with all entries
+    llama_batch batch = llama_batch_init(n, 0, 1);
+    batch.n_tokens = n;
+
+    for (int i = 0; i < n; i++) {
+        auto& [seq_id, token_id, pos] = entries[i];
+        batch.token[i]      = static_cast<llama_token>(token_id);
+        batch.pos[i]        = static_cast<llama_pos>(pos);
+        batch.n_seq_id[i]   = 1;
+        batch.seq_id[i][0]  = static_cast<llama_seq_id>(seq_id);
+        batch.logits[i]     = true; // need logits for all entries to sample
+    }
+
+    int ret = llama_decode(ctx->ctx, batch);
+    llama_batch_free(batch);
+
+    if (ret != 0) {
+        return fine::Error(std::string("decode_batch failed with code: " + std::to_string(ret)));
+    }
+
+    // Sample next token for each entry
+    std::vector<std::tuple<int64_t, int64_t, std::string>> results;
+    results.reserve(n);
+
+    for (int i = 0; i < n; i++) {
+        auto& [seq_id, token_id, pos] = entries[i];
+
+        llama_sampler_reset(sampler->sampler);
+        llama_token new_token = llama_sampler_sample(sampler->sampler, ctx->ctx, i);
+        llama_sampler_accept(sampler->sampler, new_token);
+
+        // Detokenize
+        std::string piece;
+        if (!llama_vocab_is_eog(vocab, new_token)) {
+            char buf[1024];
+            int pn = llama_token_to_piece(vocab, new_token, buf, sizeof(buf), 0, false);
+            if (pn < 0) {
+                std::vector<char> large_buf(-pn);
+                pn = llama_token_to_piece(vocab, new_token,
+                    large_buf.data(), large_buf.size(), 0, false);
+                if (pn > 0) piece.assign(large_buf.data(), pn);
+            } else if (pn > 0) {
+                piece.assign(buf, pn);
+            }
+        }
+
+        results.emplace_back(seq_id, static_cast<int64_t>(new_token), piece);
+    }
+
+    return fine::Ok(results);
+}
+FINE_NIF(decode_batch, ERL_NIF_DIRTY_JOB_CPU_BOUND);
+
+// --- Decode single token with seq_id (for Server) ---
+
+std::variant<fine::Ok<>, fine::Error<std::string>>
+decode_token(
+    ErlNifEnv* env,
+    fine::ResourcePtr<LlamaContext> ctx,
+    int64_t token_id,
+    int64_t pos,
+    int64_t seq_id)
+{
+    llama_batch batch = llama_batch_init(1, 0, 1);
+    batch.n_tokens     = 1;
+    batch.token[0]     = static_cast<llama_token>(token_id);
+    batch.pos[0]       = static_cast<llama_pos>(pos);
+    batch.n_seq_id[0]  = 1;
+    batch.seq_id[0][0] = static_cast<llama_seq_id>(seq_id);
+    batch.logits[0]    = true;
+
+    int ret = llama_decode(ctx->ctx, batch);
+    llama_batch_free(batch);
+
+    if (ret != 0) {
+        return fine::Error(std::string("decode_token failed with code: " + std::to_string(ret)));
+    }
+
+    return fine::Ok();
+}
+FINE_NIF(decode_token, ERL_NIF_DIRTY_JOB_CPU_BOUND);
 
 // --- Chat template ---
 
