@@ -24,7 +24,7 @@ Add `llama_cpp_ex` to your list of dependencies in `mix.exs`:
 ```elixir
 def deps do
   [
-    {:llama_cpp_ex, "~> 0.1.0"}
+    {:llama_cpp_ex, "~> 0.2.0"}
   ]
 end
 ```
@@ -93,7 +93,7 @@ For fine-grained control over the inference pipeline:
 
 # Create context and sampler separately
 {:ok, ctx} = LlamaCppEx.Context.create(model, n_ctx: 4096)
-{:ok, sampler} = LlamaCppEx.Sampler.create(temp: 0.7, top_p: 0.9)
+{:ok, sampler} = LlamaCppEx.Sampler.create(model, temp: 0.7, top_p: 0.9)
 
 # Run generation with your own context
 {:ok, tokens} = LlamaCppEx.Tokenizer.encode(model, "The answer is")

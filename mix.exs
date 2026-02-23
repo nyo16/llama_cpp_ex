@@ -1,7 +1,7 @@
 defmodule LlamaCppEx.MixProject do
   use Mix.Project
 
-  @version "0.1.0"
+  @version "0.2.0"
   @source_url "https://github.com/nyo16/llama_cpp_ex"
 
   def project do
@@ -50,7 +50,7 @@ defmodule LlamaCppEx.MixProject do
         "llama.cpp" => "https://github.com/ggml-org/llama.cpp"
       },
       files: ~w(
-        lib c_src Makefile mix.exs README.md LICENSE .formatter.exs
+        lib c_src Makefile mix.exs README.md CHANGELOG.md LICENSE .formatter.exs
       )
     ]
   end
@@ -60,6 +60,7 @@ defmodule LlamaCppEx.MixProject do
       main: "readme",
       extras: [
         "README.md",
+        "CHANGELOG.md",
         "docs/architecture.md",
         "docs/cross-platform-builds.md",
         "docs/adr/001-cpp-nif-over-rustler.md",
