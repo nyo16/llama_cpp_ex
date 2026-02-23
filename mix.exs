@@ -61,6 +61,7 @@ defmodule LlamaCppEx.MixProject do
       extras: [
         "README.md",
         "CHANGELOG.md",
+        "LICENSE",
         "docs/architecture.md",
         "docs/cross-platform-builds.md",
         "docs/adr/001-cpp-nif-over-rustler.md",
