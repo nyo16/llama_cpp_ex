@@ -17,7 +17,7 @@ defmodule LlamaCppExTest do
     describe "model loading" do
       setup do
         :ok = LlamaCppEx.init()
-        {:ok, model} = LlamaCppEx.load_model(@model_path, n_gpu_layers: 0)
+        {:ok, model} = LlamaCppEx.load_model(@model_path)
         %{model: model}
       end
 
@@ -38,7 +38,7 @@ defmodule LlamaCppExTest do
     describe "tokenizer" do
       setup do
         :ok = LlamaCppEx.init()
-        {:ok, model} = LlamaCppEx.load_model(@model_path, n_gpu_layers: 0)
+        {:ok, model} = LlamaCppEx.load_model(@model_path)
         %{model: model}
       end
 
@@ -80,7 +80,7 @@ defmodule LlamaCppExTest do
     describe "generation" do
       setup do
         :ok = LlamaCppEx.init()
-        {:ok, model} = LlamaCppEx.load_model(@model_path, n_gpu_layers: 0)
+        {:ok, model} = LlamaCppEx.load_model(@model_path)
         %{model: model}
       end
 
@@ -106,7 +106,7 @@ defmodule LlamaCppExTest do
     describe "streaming" do
       setup do
         :ok = LlamaCppEx.init()
-        {:ok, model} = LlamaCppEx.load_model(@model_path, n_gpu_layers: 0)
+        {:ok, model} = LlamaCppEx.load_model(@model_path)
         %{model: model}
       end
 
@@ -149,7 +149,7 @@ defmodule LlamaCppExTest do
     describe "chat" do
       setup do
         :ok = LlamaCppEx.init()
-        {:ok, model} = LlamaCppEx.load_model(@model_path, n_gpu_layers: 0)
+        {:ok, model} = LlamaCppEx.load_model(@model_path)
 
         case LlamaCppEx.Model.chat_template(model) do
           nil -> %{model: model, has_template: false}
@@ -168,6 +168,35 @@ defmodule LlamaCppExTest do
           assert is_binary(prompt)
           assert byte_size(prompt) > 0
           assert prompt =~ "Say hello"
+        end
+      end
+
+      test "apply_template with enable_thinking option", %{
+        model: model,
+        has_template: has_template
+      } do
+        if has_template do
+          messages = [
+            %{role: "user", content: "Hello"}
+          ]
+
+          {:ok, prompt_thinking} =
+            LlamaCppEx.Chat.apply_template(model, messages, enable_thinking: true)
+
+          {:ok, prompt_no_thinking} =
+            LlamaCppEx.Chat.apply_template(model, messages, enable_thinking: false)
+
+          # Both should be valid prompts
+          assert is_binary(prompt_thinking)
+          assert is_binary(prompt_no_thinking)
+          assert byte_size(prompt_thinking) > 0
+          assert byte_size(prompt_no_thinking) > 0
+
+          # For models that support enable_thinking (like Qwen3), the prompts
+          # will differ. For models that don't, they may be the same.
+          # Either way, both should contain the user message.
+          assert prompt_thinking =~ "Hello"
+          assert prompt_no_thinking =~ "Hello"
         end
       end
 
@@ -200,12 +229,92 @@ defmodule LlamaCppExTest do
           assert length(chunks) > 0
         end
       end
+
+      test "chat_completion returns ChatCompletion struct", %{
+        model: model,
+        has_template: has_template
+      } do
+        if has_template do
+          {:ok, completion} =
+            LlamaCppEx.chat_completion(
+              model,
+              [%{role: "user", content: "Say hello."}],
+              max_tokens: 16,
+              seed: 42
+            )
+
+          assert %LlamaCppEx.ChatCompletion{} = completion
+          assert String.starts_with?(completion.id, "chatcmpl-")
+          assert completion.object == "chat.completion"
+          assert is_integer(completion.created)
+          assert is_binary(completion.model)
+
+          [choice] = completion.choices
+          assert choice.index == 0
+          assert choice.message.role == "assistant"
+          assert is_binary(choice.message.content)
+          assert byte_size(choice.message.content) > 0
+          assert choice.finish_reason in ["stop", "length"]
+
+          assert completion.usage.prompt_tokens > 0
+          assert completion.usage.completion_tokens > 0
+
+          assert completion.usage.total_tokens ==
+                   completion.usage.prompt_tokens + completion.usage.completion_tokens
+        end
+      end
+
+      test "stream_chat_completion emits ChatCompletionChunk structs", %{
+        model: model,
+        has_template: has_template
+      } do
+        if has_template do
+          chunks =
+            LlamaCppEx.stream_chat_completion(
+              model,
+              [%{role: "user", content: "Say hello."}],
+              max_tokens: 16,
+              seed: 42
+            )
+            |> Enum.to_list()
+
+          assert length(chunks) >= 2
+
+          # All chunks are ChatCompletionChunk structs
+          assert Enum.all?(chunks, &match?(%LlamaCppEx.ChatCompletionChunk{}, &1))
+
+          # All chunks share the same id and created
+          [first | _] = chunks
+          assert String.starts_with?(first.id, "chatcmpl-")
+          assert Enum.all?(chunks, fn c -> c.id == first.id end)
+          assert Enum.all?(chunks, fn c -> c.created == first.created end)
+
+          # First chunk has role delta
+          first_choice = hd(first.choices)
+          assert first_choice.delta.role == "assistant"
+          assert first_choice.finish_reason == nil
+
+          # Last chunk has finish_reason
+          last = List.last(chunks)
+          last_choice = hd(last.choices)
+          assert last_choice.finish_reason in ["stop", "length"]
+
+          # Middle chunks have content deltas
+          middle = Enum.slice(chunks, 1..-2//1)
+
+          for chunk <- middle do
+            choice = hd(chunk.choices)
+            assert is_binary(choice.delta.content)
+            assert choice.finish_reason == nil
+          end
+        end
+      end
     end
 
     describe "context" do
       setup do
         :ok = LlamaCppEx.init()
-        {:ok, model} = LlamaCppEx.load_model(@model_path, n_gpu_layers: 0)
+        {:ok, model} = LlamaCppEx.load_model(@model_path)
         %{model: model}
       end
 
@@ -238,7 +347,7 @@ defmodule LlamaCppExTest do
     describe "sampler" do
       setup do
         :ok = LlamaCppEx.init()
-        {:ok, model} = LlamaCppEx.load_model(@model_path, n_gpu_layers: 0)
+        {:ok, model} = LlamaCppEx.load_model(@model_path)
         %{model: model}
       end
 
@@ -261,6 +370,19 @@ defmodule LlamaCppExTest do
         assert %LlamaCppEx.Sampler{} = sampler
       end
 
+      test "create with penalty_present and penalty_freq", %{model: model} do
+        {:ok, sampler} =
+          LlamaCppEx.Sampler.create(model,
+            temp: 1.0,
+            top_k: 20,
+            top_p: 0.95,
+            penalty_present: 1.5,
+            penalty_freq: 0.5
+          )
+
+        assert %LlamaCppEx.Sampler{} = sampler
+      end
+
       test "reset sampler", %{model: model} do
         {:ok, sampler} = LlamaCppEx.Sampler.create(model)
         assert :ok = LlamaCppEx.Sampler.reset(sampler)
@@ -270,7 +392,7 @@ defmodule LlamaCppExTest do
     describe "grammar" do
       setup do
         :ok = LlamaCppEx.init()
-        {:ok, model} = LlamaCppEx.load_model(@model_path, n_gpu_layers: 0)
+        {:ok, model} = LlamaCppEx.load_model(@model_path)
         %{model: model}
       end
 
@@ -332,7 +454,7 @@ defmodule LlamaCppExTest do
     describe "prefill and batching NIFs" do
       setup do
         :ok = LlamaCppEx.init()
-        {:ok, model} = LlamaCppEx.load_model(@model_path, n_gpu_layers: 0)
+        {:ok, model} = LlamaCppEx.load_model(@model_path)
         %{model: model}
       end
 
@@ -385,7 +507,6 @@ defmodule LlamaCppExTest do
         {:ok, server} =
           LlamaCppEx.Server.start_link(
             model_path: @model_path,
-            n_gpu_layers: 0,
             n_parallel: 2,
             n_ctx: 2048
           )
@@ -524,7 +645,7 @@ defmodule LlamaCppExTest do
     describe "embeddings" do
       setup do
         :ok = LlamaCppEx.init()
-        {:ok, model} = LlamaCppEx.load_model(@embedding_model_path, n_gpu_layers: 0)
+        {:ok, model} = LlamaCppEx.load_model(@embedding_model_path)
         %{model: model}
       end
 

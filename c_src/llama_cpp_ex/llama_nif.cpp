@@ -235,6 +235,8 @@ sampler_init(
     double top_p,
     double min_p,
     double penalty_repeat,
+    double penalty_freq,
+    double penalty_present,
     std::string grammar_str,
     std::string grammar_root)
 {
@@ -252,9 +254,10 @@ sampler_init(
     }
 
     // Add samplers in recommended order: penalties -> top_k -> top_p -> min_p -> temp -> dist/greedy
-    if (penalty_repeat != 1.0) {
+    if (penalty_repeat != 1.0 || penalty_freq != 0.0 || penalty_present != 0.0) {
         llama_sampler_chain_add(chain,
-            llama_sampler_init_penalties(64, static_cast<float>(penalty_repeat), 0.0f, 0.0f));
+            llama_sampler_init_penalties(64, static_cast<float>(penalty_repeat),
+                static_cast<float>(penalty_freq), static_cast<float>(penalty_present)));
     }
 
     if (top_k > 0) {
@@ -705,6 +708,39 @@ std::string chat_apply_template(
     return std::string(buf.data(), n);
 }
 FINE_NIF(chat_apply_template, 0);
+
+// --- Jinja chat template (via common library) ---
+
+std::string chat_apply_template_jinja(
+    ErlNifEnv* env,
+    fine::ResourcePtr<LlamaModel> model,
+    std::vector<std::tuple<std::string, std::string>> messages,
+    bool add_assistant,
+    bool enable_thinking,
+    std::vector<std::tuple<std::string, std::string>> extra_kwargs)
+{
+    common_chat_templates_inputs inputs;
+    inputs.add_generation_prompt = add_assistant;
+    inputs.use_jinja = true;
+    inputs.enable_thinking = enable_thinking;
+
+    // Build messages
+    for (const auto& msg : messages) {
+        common_chat_msg m;
+        m.role = std::get<0>(msg);
+        m.content = std::get<1>(msg);
+        inputs.messages.push_back(std::move(m));
+    }
+
+    // Extra kwargs
+    for (const auto& kv : extra_kwargs) {
+        inputs.chat_template_kwargs[std::get<0>(kv)] = std::get<1>(kv);
+    }
+
+    auto result = common_chat_templates_apply(model->chat_templates.get(), inputs);
+    return result.prompt;
+}
+FINE_NIF(chat_apply_template_jinja, 0);
 
 // --- Streaming generation ---
 

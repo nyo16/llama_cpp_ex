@@ -57,6 +57,8 @@ defmodule LlamaCppEx.NIF do
         _top_p,
         _min_p,
         _penalty_repeat,
+        _penalty_freq,
+        _penalty_present,
         _grammar_str,
         _grammar_root
       ),
@@ -79,6 +81,16 @@ defmodule LlamaCppEx.NIF do
   # Chat template
   def chat_apply_template(_template, _messages, _add_assistant),
     do: :erlang.nif_error(:not_loaded)
+
+  # Jinja chat template (via common library)
+  def chat_apply_template_jinja(
+        _model,
+        _messages,
+        _add_assistant,
+        _enable_thinking,
+        _extra_kwargs
+      ),
+      do: :erlang.nif_error(:not_loaded)
 
   # Streaming generation (sends messages to caller_pid tagged with ref)
   def generate_tokens(_ctx, _sampler, _prompt_tokens, _max_tokens, _caller_pid, _ref),

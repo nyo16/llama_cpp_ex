@@ -9,9 +9,9 @@ Built with C++ NIFs using [fine](https://github.com/elixir-nx/fine) for ergonomi
 - Load and run GGUF models directly from Elixir
 - GPU acceleration: Metal (macOS), CUDA (NVIDIA), Vulkan, or CPU
 - Streaming token generation via lazy `Stream`
-- Chat template support (ChatML, Llama, etc.)
+- Jinja chat templates with `enable_thinking` support (Qwen3, Qwen3.5, etc.)
 - RAII resource management — models, contexts, and samplers are garbage collected by the BEAM
-- Configurable sampling: temperature, top-k, top-p, min-p, repetition penalty
+- Configurable sampling: temperature, top-k, top-p, min-p, repetition penalty, frequency & presence penalty
 - Embedding generation with L2 normalization
 - Grammar-constrained generation (GBNF)
 - Continuous batching server for concurrent inference
@@ -24,7 +24,7 @@ Add `llama_cpp_ex` to your list of dependencies in `mix.exs`:
 ```elixir
 def deps do
   [
-    {:llama_cpp_ex, "~> 0.2.0"}
+    {:llama_cpp_ex, "~> 0.3.0"}
   ]
 end
 ```
@@ -73,6 +73,11 @@ model
   %{role: "system", content: "You are a helpful assistant."},
   %{role: "user", content: "What is Elixir?"}
 ], max_tokens: 200)
+
+# Chat with thinking disabled (Qwen3/3.5 and similar models)
+{:ok, reply} = LlamaCppEx.chat(model, [
+  %{role: "user", content: "What is 2+2?"}
+], max_tokens: 64, enable_thinking: false)
 
 # Stream a chat response
 model
@@ -158,6 +163,86 @@ MIX_ENV=bench mix deps.get
 LLAMA_MODEL_PATH=path/to/model.gguf MIX_ENV=bench mix run bench/single_generate.exs
 LLAMA_MODEL_PATH=path/to/model.gguf MIX_ENV=bench mix run bench/server_concurrent.exs
 ```
+
+## Running Qwen3.5-35B-A3B
+
+[Qwen3.5-35B-A3B](https://huggingface.co/Qwen/Qwen3.5-35B-A3B-GGUF) is a Mixture-of-Experts model with 35B total parameters but only 3B active per token. It supports 256K context and both thinking (CoT) and non-thinking modes.
+
+### Hardware requirements
+
+| Quantization | RAM / VRAM | File size |
+|-------------|------------|-----------|
+| Q4_K_M | ~20 GB | ~19 GB |
+| Q8_0 | ~37 GB | ~36 GB |
+| BF16 | ~70 GB | ~67 GB |
+
+### Download
+
+```bash
+# Install the HuggingFace CLI if needed: pip install huggingface-hub
+huggingface-cli download Qwen/Qwen3.5-35B-A3B-GGUF Qwen3.5-35B-A3B-Q4_K_M.gguf --local-dir models/
+```
+
+### Thinking mode (general)
+
+```elixir
+:ok = LlamaCppEx.init()
+{:ok, model} = LlamaCppEx.load_model("models/Qwen3.5-35B-A3B-Q4_K_M.gguf", n_gpu_layers: -1)
+
+# Qwen3.5 recommended: temp 1.0, top_p 0.95, top_k 20, presence_penalty 1.5
+{:ok, reply} = LlamaCppEx.chat(model, [
+  %{role: "user", content: "Explain the birthday paradox."}
+], max_tokens: 2048, temp: 1.0, top_p: 0.95, top_k: 20, min_p: 0.0, penalty_present: 1.5)
+```
+
+### Thinking mode (math/code)
+
+```elixir
+# For math and code, lower temperature without presence penalty
+{:ok, reply} = LlamaCppEx.chat(model, [
+  %{role: "user", content: "Write a function to find the longest palindromic substring."}
+], max_tokens: 4096, temp: 0.6, top_p: 0.95, top_k: 20, min_p: 0.0)
+```
+
+### Non-thinking mode
+
+```elixir
+# Disable thinking via enable_thinking option (uses Jinja chat template kwargs)
+{:ok, reply} = LlamaCppEx.chat(model, [
+  %{role: "user", content: "What is the capital of France?"}
+], max_tokens: 256, enable_thinking: false, temp: 0.7, top_p: 0.8, top_k: 20, min_p: 0.0, penalty_present: 1.5)
+```
+
+### Streaming with Server
+
+```elixir
+{:ok, server} = LlamaCppEx.Server.start_link(
+  model_path: "models/Qwen3.5-35B-A3B-Q4_K_M.gguf",
+  n_gpu_layers: -1,
+  n_parallel: 2,
+  n_ctx: 16384,
+  temp: 1.0, top_p: 0.95, top_k: 20, min_p: 0.0, penalty_present: 1.5
+)
+
+LlamaCppEx.Server.stream(server, "Explain monads in simple terms", max_tokens: 1024)
+|> Enum.each(&IO.write/1)
+```
+
+### Qwen3.5 enable_thinking benchmarks
+
+Measured on **MacBook Pro, Apple M4 Max (16-core, 64 GB)**, Metal backend, `n_gpu_layers: -1`, 512 output tokens, `temp: 0.6`.
+
+| Metric | Qwen3.5-27B (Q4_K_XL) | Qwen3.5-35B-A3B (Q6_K) |
+|---|---|---|
+| | Think ON / Think OFF | Think ON / Think OFF |
+| **Prompt tokens** | 65 / 66 | 65 / 66 |
+| **Output tokens** | 512 / 512 | 512 / 512 |
+| **TTFT** | 599 ms / 573 ms | 554 ms / 191 ms |
+| **Prompt eval** | 108.5 / 115.2 t/s | 117.3 / 345.5 t/s |
+| **Gen speed** | 17.5 / 17.3 t/s | 56.0 / 56.0 t/s |
+| **Total time** | 29.77 / 30.10 s | 9.69 / 9.33 s |
+
+The MoE model (35B-A3B) is ~3.2x faster at generation since only 3B parameters are active per token despite the 35B total. Thinking mode only affects the prompt template, not inference speed.
 
 ## Architecture
 

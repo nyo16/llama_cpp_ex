@@ -24,6 +24,8 @@ defmodule LlamaCppEx.Sampler do
     * `:top_p` - Top-P (nucleus) filtering. `1.0` to disable. Defaults to `0.95`.
     * `:min_p` - Min-P filtering. `0.0` to disable. Defaults to `0.05`.
     * `:penalty_repeat` - Repetition penalty. `1.0` to disable. Defaults to `1.0`.
+    * `:penalty_freq` - Frequency penalty (0.0–2.0). `0.0` to disable. Defaults to `0.0`.
+    * `:penalty_present` - Presence penalty (0.0–2.0). `0.0` to disable. Defaults to `0.0`.
     * `:grammar` - GBNF grammar string for constrained generation. Defaults to `""` (none).
     * `:grammar_root` - Root rule name for grammar. Defaults to `"root"`.
 
@@ -36,6 +38,8 @@ defmodule LlamaCppEx.Sampler do
     top_p = Keyword.get(opts, :top_p, 0.95)
     min_p = Keyword.get(opts, :min_p, 0.05)
     penalty_repeat = Keyword.get(opts, :penalty_repeat, 1.0)
+    penalty_freq = Keyword.get(opts, :penalty_freq, 0.0)
+    penalty_present = Keyword.get(opts, :penalty_present, 0.0)
     grammar = Keyword.get(opts, :grammar, "")
     grammar_root = Keyword.get(opts, :grammar_root, "root")
 
@@ -48,6 +52,8 @@ defmodule LlamaCppEx.Sampler do
         top_p / 1,
         min_p / 1,
         penalty_repeat / 1,
+        penalty_freq / 1,
+        penalty_present / 1,
         grammar,
         grammar_root
       )
