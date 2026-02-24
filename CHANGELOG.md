@@ -1,5 +1,22 @@
 # Changelog
 
+## v0.3.0
+
+### Added
+
+- **Jinja chat templates** — switched from `llama_chat_apply_template()` C API to the full Jinja-based `common_chat_templates_apply()` engine from llama.cpp's common library.
+- **`enable_thinking` option** — pass `enable_thinking: false` to `Chat.apply_template/3`, `chat/3`, `stream_chat/3`, `chat_completion/3`, and `stream_chat_completion/3` to disable CoT reasoning for models like Qwen3/3.5.
+- **`chat_template_kwargs` option** — pass arbitrary key-value pairs to the Jinja template engine.
+- **Penalty parameters** — `penalty_repeat`, `penalty_freq`, and `penalty_present` options for repetition/frequency/presence penalties in sampling.
+- **OpenAI-compatible response format** — `chat_completion/3` and `stream_chat_completion/3` return `ChatCompletion` and `ChatCompletionChunk` structs.
+- **Qwen3.5 benchmark results** in README — Qwen3.5-27B and Qwen3.5-35B-A3B on Apple M4 Max.
+
+### Changed
+
+- `Chat.apply_template/3` now uses the Jinja engine and takes the model ref directly (no longer accepts `:template` option for raw template strings).
+- Linked `libcommon.a` from llama.cpp build (previously excluded).
+- `LlamaModel` RAII wrapper now caches `common_chat_templates` at model load time.
+
 ## v0.2.0
 
 ### Added
