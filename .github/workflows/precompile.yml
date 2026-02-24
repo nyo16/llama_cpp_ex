@@ -1,0 +1,90 @@
+name: Precompile NIFs
+on:
+  push:
+    tags: ['v*']
+
+jobs:
+  precompile:
+    strategy:
+      matrix:
+        include:
+          - os: macos-14
+            target: aarch64-apple-darwin
+            otp: '27.0'
+            elixir: '1.17'
+            backend: metal
+          - os: macos-14
+            target: aarch64-apple-darwin
+            otp: '28.0'
+            elixir: '1.18'
+            backend: metal
+          - os: ubuntu-22.04
+            target: x86_64-linux-gnu
+            otp: '27.0'
+            elixir: '1.17'
+            backend: cpu
+          - os: ubuntu-22.04
+            target: x86_64-linux-gnu
+            otp: '28.0'
+            elixir: '1.18'
+            backend: cpu
+
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - uses: erlef/setup-beam@v1
+        with:
+          otp-version: ${{ matrix.otp }}
+          elixir-version: ${{ matrix.elixir }}
+      - name: Install cmake (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y cmake
+      - run: mix deps.get
+      - run: mix elixir_make.precompile
+        env:
+          LLAMA_BACKEND: ${{ matrix.backend }}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: nif-${{ matrix.target }}-otp${{ matrix.otp }}
+          path: |
+            ~/.cache/elixir_make/*.tar.gz
+            ~/.cache/elixir_make/*.sha256
+
+  release:
+    needs: precompile
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          merge-multiple: true
+          path: artifacts/
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: artifacts/*.tar.gz
+
+  checksum:
+    needs: release
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - uses: erlef/setup-beam@v1
+        with:
+          otp-version: '27.0'
+          elixir-version: '1.17'
+      - run: mix deps.get
+      - run: mix elixir_make.checksum --all --ignore-unavailable
+      - name: Commit checksum.exs
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add checksum.exs
+          git commit -m "Update checksum.exs for ${{ github.ref_name }}"
+          git push origin HEAD:master
