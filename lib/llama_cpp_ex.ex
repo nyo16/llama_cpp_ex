@@ -223,7 +223,9 @@ defmodule LlamaCppEx do
   """
   @spec chat(Model.t(), [Chat.message()], keyword()) :: {:ok, String.t()} | {:error, String.t()}
   def chat(%Model{} = model, messages, opts \\ []) when is_list(messages) do
-    {chat_opts, gen_opts} = Keyword.split(opts, [:template, :add_assistant])
+    {chat_opts, gen_opts} =
+      Keyword.split(opts, [:add_assistant, :enable_thinking, :chat_template_kwargs])
+
     {:ok, prompt} = Chat.apply_template(model, messages, chat_opts)
     generate(model, prompt, gen_opts)
   end
@@ -236,7 +238,9 @@ defmodule LlamaCppEx do
   """
   @spec stream_chat(Model.t(), [Chat.message()], keyword()) :: Enumerable.t()
   def stream_chat(%Model{} = model, messages, opts \\ []) when is_list(messages) do
-    {chat_opts, gen_opts} = Keyword.split(opts, [:template, :add_assistant])
+    {chat_opts, gen_opts} =
+      Keyword.split(opts, [:add_assistant, :enable_thinking, :chat_template_kwargs])
+
     {:ok, prompt} = Chat.apply_template(model, messages, chat_opts)
     stream(model, prompt, gen_opts)
   end
@@ -265,7 +269,9 @@ defmodule LlamaCppEx do
   @spec chat_completion(Model.t(), [Chat.message()], keyword()) ::
           {:ok, ChatCompletion.t()} | {:error, term()}
   def chat_completion(%Model{} = model, messages, opts \\ []) when is_list(messages) do
-    {chat_opts, gen_opts} = Keyword.split(opts, [:template, :add_assistant])
+    {chat_opts, gen_opts} =
+      Keyword.split(opts, [:add_assistant, :enable_thinking, :chat_template_kwargs])
+
     max_tokens = Keyword.get(gen_opts, :max_tokens, 256)
     n_ctx = Keyword.get(gen_opts, :n_ctx, 2048)
     timeout = Keyword.get(gen_opts, :timeout, 60_000)
@@ -356,7 +362,9 @@ defmodule LlamaCppEx do
   """
   @spec stream_chat_completion(Model.t(), [Chat.message()], keyword()) :: Enumerable.t()
   def stream_chat_completion(%Model{} = model, messages, opts \\ []) when is_list(messages) do
-    {chat_opts, gen_opts} = Keyword.split(opts, [:template, :add_assistant])
+    {chat_opts, gen_opts} =
+      Keyword.split(opts, [:add_assistant, :enable_thinking, :chat_template_kwargs])
+
     max_tokens = Keyword.get(gen_opts, :max_tokens, 256)
     n_ctx = Keyword.get(gen_opts, :n_ctx, 2048)
     timeout = Keyword.get(gen_opts, :timeout, 60_000)

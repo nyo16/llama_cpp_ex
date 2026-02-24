@@ -9,7 +9,7 @@ Built with C++ NIFs using [fine](https://github.com/elixir-nx/fine) for ergonomi
 - Load and run GGUF models directly from Elixir
 - GPU acceleration: Metal (macOS), CUDA (NVIDIA), Vulkan, or CPU
 - Streaming token generation via lazy `Stream`
-- Chat template support (ChatML, Llama, etc.)
+- Jinja chat templates with `enable_thinking` support (Qwen3, Qwen3.5, etc.)
 - RAII resource management — models, contexts, and samplers are garbage collected by the BEAM
 - Configurable sampling: temperature, top-k, top-p, min-p, repetition penalty, frequency & presence penalty
 - Embedding generation with L2 normalization
@@ -73,6 +73,11 @@ model
   %{role: "system", content: "You are a helpful assistant."},
   %{role: "user", content: "What is Elixir?"}
 ], max_tokens: 200)
+
+# Chat with thinking disabled (Qwen3/3.5 and similar models)
+{:ok, reply} = LlamaCppEx.chat(model, [
+  %{role: "user", content: "What is 2+2?"}
+], max_tokens: 64, enable_thinking: false)
 
 # Stream a chat response
 model
@@ -199,13 +204,13 @@ huggingface-cli download Qwen/Qwen3.5-35B-A3B-GGUF Qwen3.5-35B-A3B-Q4_K_M.gguf -
 ], max_tokens: 4096, temp: 0.6, top_p: 0.95, top_k: 20, min_p: 0.0)
 ```
 
-### Non-thinking mode (general)
+### Non-thinking mode
 
 ```elixir
-# Disable thinking with /no_think tag
+# Disable thinking via enable_thinking option (uses Jinja chat template kwargs)
 {:ok, reply} = LlamaCppEx.chat(model, [
-  %{role: "user", content: "/no_think\nWhat is the capital of France?"}
-], max_tokens: 256, temp: 0.7, top_p: 0.8, top_k: 20, min_p: 0.0, penalty_present: 1.5)
+  %{role: "user", content: "What is the capital of France?"}
+], max_tokens: 256, enable_thinking: false, temp: 0.7, top_p: 0.8, top_k: 20, min_p: 0.0, penalty_present: 1.5)
 ```
 
 ### Streaming with Server
@@ -222,6 +227,22 @@ huggingface-cli download Qwen/Qwen3.5-35B-A3B-GGUF Qwen3.5-35B-A3B-Q4_K_M.gguf -
 LlamaCppEx.Server.stream(server, "Explain monads in simple terms", max_tokens: 1024)
 |> Enum.each(&IO.write/1)
 ```
+
+### Qwen3.5 enable_thinking benchmarks
+
+Measured on **MacBook Pro, Apple M4 Max (16-core, 64 GB)**, Metal backend, `n_gpu_layers: -1`, 512 output tokens, `temp: 0.6`.
+
+| Metric | Qwen3.5-27B (Q4_K_XL) | Qwen3.5-35B-A3B (Q6_K) |
+|---|---|---|
+| | Think ON / Think OFF | Think ON / Think OFF |
+| **Prompt tokens** | 65 / 66 | 65 / 66 |
+| **Output tokens** | 512 / 512 | 512 / 512 |
+| **TTFT** | 599 ms / 573 ms | 554 ms / 191 ms |
+| **Prompt eval** | 108.5 / 115.2 t/s | 117.3 / 345.5 t/s |
+| **Gen speed** | 17.5 / 17.3 t/s | 56.0 / 56.0 t/s |
+| **Total time** | 29.77 / 30.10 s | 9.69 / 9.33 s |
+
+The MoE model (35B-A3B) is ~3.2x faster at generation since only 3B parameters are active per token despite the 35B total. Thinking mode only affects the prompt template, not inference speed.
 
 ## Architecture
 

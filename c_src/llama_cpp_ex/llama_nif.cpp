@@ -709,6 +709,39 @@ std::string chat_apply_template(
 }
 FINE_NIF(chat_apply_template, 0);
 
+// --- Jinja chat template (via common library) ---
+
+std::string chat_apply_template_jinja(
+    ErlNifEnv* env,
+    fine::ResourcePtr<LlamaModel> model,
+    std::vector<std::tuple<std::string, std::string>> messages,
+    bool add_assistant,
+    bool enable_thinking,
+    std::vector<std::tuple<std::string, std::string>> extra_kwargs)
+{
+    common_chat_templates_inputs inputs;
+    inputs.add_generation_prompt = add_assistant;
+    inputs.use_jinja = true;
+    inputs.enable_thinking = enable_thinking;
+
+    // Build messages
+    for (const auto& msg : messages) {
+        common_chat_msg m;
+        m.role = std::get<0>(msg);
+        m.content = std::get<1>(msg);
+        inputs.messages.push_back(std::move(m));
+    }
+
+    // Extra kwargs
+    for (const auto& kv : extra_kwargs) {
+        inputs.chat_template_kwargs[std::get<0>(kv)] = std::get<1>(kv);
+    }
+
+    auto result = common_chat_templates_apply(model->chat_templates.get(), inputs);
+    return result.prompt;
+}
+FINE_NIF(chat_apply_template_jinja, 0);
+
 // --- Streaming generation ---
 
 fine::Ok<> generate_tokens(

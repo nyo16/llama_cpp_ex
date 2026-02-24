@@ -1,9 +1,11 @@
 defmodule LlamaCppEx.Chat do
   @moduledoc """
-  Chat template formatting using llama.cpp's built-in template engine.
+  Chat template formatting using llama.cpp's Jinja template engine.
 
   Converts a list of chat messages into a formatted prompt string
-  using the model's embedded chat template (or a custom one).
+  using the model's embedded chat template. Uses the full Jinja engine
+  from llama.cpp's common library, which supports `enable_thinking` and
+  arbitrary `chat_template_kwargs`.
 
   ## Examples
 
@@ -12,38 +14,32 @@ defmodule LlamaCppEx.Chat do
         %{role: "user", content: "Hi!"}
       ])
 
+      # Disable thinking (for Qwen3 and similar models)
+      {:ok, prompt} = LlamaCppEx.Chat.apply_template(model, messages,
+        enable_thinking: false
+      )
+
   """
 
   @type message :: %{role: String.t(), content: String.t()} | {String.t(), String.t()}
 
   @doc """
-  Applies a chat template to a list of messages, producing a formatted prompt string.
+  Applies the model's chat template to a list of messages using the Jinja engine.
 
   ## Options
 
-    * `:template` - Custom template string. Defaults to the model's embedded template.
     * `:add_assistant` - Whether to add the assistant turn prefix. Defaults to `true`.
+    * `:enable_thinking` - Whether to enable thinking/reasoning mode. Defaults to `true`.
+    * `:chat_template_kwargs` - Extra template variables as a list of `{key, value}` string tuples.
+      Defaults to `[]`.
 
   """
   @spec apply_template(LlamaCppEx.Model.t(), [message()], keyword()) ::
           {:ok, String.t()} | {:error, String.t()}
   def apply_template(%LlamaCppEx.Model{} = model, messages, opts \\ []) when is_list(messages) do
     add_assistant = Keyword.get(opts, :add_assistant, true)
-
-    template =
-      case Keyword.get(opts, :template) do
-        nil ->
-          case LlamaCppEx.Model.chat_template(model) do
-            nil ->
-              raise ArgumentError, "model has no embedded chat template, pass :template option"
-
-            tmpl ->
-              tmpl
-          end
-
-        tmpl ->
-          tmpl
-      end
+    enable_thinking = Keyword.get(opts, :enable_thinking, true)
+    extra_kwargs = Keyword.get(opts, :chat_template_kwargs, [])
 
     msg_tuples =
       Enum.map(messages, fn
@@ -51,6 +47,18 @@ defmodule LlamaCppEx.Chat do
         {role, content} -> {to_string(role), to_string(content)}
       end)
 
-    {:ok, LlamaCppEx.NIF.chat_apply_template(template, msg_tuples, add_assistant)}
+    kwargs_tuples =
+      Enum.map(extra_kwargs, fn {k, v} -> {to_string(k), to_string(v)} end)
+
+    result =
+      LlamaCppEx.NIF.chat_apply_template_jinja(
+        model.ref,
+        msg_tuples,
+        add_assistant,
+        enable_thinking,
+        kwargs_tuples
+      )
+
+    {:ok, result}
   end
 end

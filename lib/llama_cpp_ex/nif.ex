@@ -82,6 +82,16 @@ defmodule LlamaCppEx.NIF do
   def chat_apply_template(_template, _messages, _add_assistant),
     do: :erlang.nif_error(:not_loaded)
 
+  # Jinja chat template (via common library)
+  def chat_apply_template_jinja(
+        _model,
+        _messages,
+        _add_assistant,
+        _enable_thinking,
+        _extra_kwargs
+      ),
+      do: :erlang.nif_error(:not_loaded)
+
   # Streaming generation (sends messages to caller_pid tagged with ref)
   def generate_tokens(_ctx, _sampler, _prompt_tokens, _max_tokens, _caller_pid, _ref),
     do: :erlang.nif_error(:not_loaded)

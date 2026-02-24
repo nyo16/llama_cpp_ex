@@ -15,6 +15,8 @@ CXXFLAGS += -I$(ERTS_INCLUDE_DIR)
 CXXFLAGS += -I$(FINE_INCLUDE_DIR)
 CXXFLAGS += -I$(LLAMA_DIR)/include
 CXXFLAGS += -I$(LLAMA_DIR)/ggml/include
+CXXFLAGS += -I$(LLAMA_DIR)/common
+CXXFLAGS += -I$(LLAMA_DIR)/vendor
 
 # Linker
 LDFLAGS = -shared
@@ -100,7 +102,6 @@ $(NIF_SO): $(NIF_OBJ) $(LLAMA_BUILD)/.built
 		! -path '*/CMakeFiles/*' \
 		! -path '*/examples/*' \
 		! -path '*/tests/*' \
-		! -path '*/common/*' \
 		| sort); \
 	if [ "$(UNAME_S)" = "Linux" ]; then \
 		$(CXX) $(NIF_OBJ) -Wl,--start-group $$LIBS -Wl,--end-group $(LDFLAGS) -o $@; \

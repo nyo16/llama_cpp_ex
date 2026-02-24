@@ -2,6 +2,7 @@
 
 #include <fine.hpp>
 #include <llama.h>
+#include "chat.h"
 
 namespace llama_cpp_ex {
 
@@ -9,9 +10,15 @@ namespace llama_cpp_ex {
 class LlamaModel {
 public:
     llama_model* model;
+    common_chat_templates_ptr chat_templates;
 
-    explicit LlamaModel(llama_model* m) : model(m) {}
+    explicit LlamaModel(llama_model* m)
+        : model(m)
+        , chat_templates(common_chat_templates_init(m, ""))
+    {}
     ~LlamaModel() {
+        // Release chat_templates before freeing the model
+        chat_templates.reset();
         if (model) llama_model_free(model);
     }
 

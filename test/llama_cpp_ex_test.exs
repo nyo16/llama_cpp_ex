@@ -171,6 +171,35 @@ defmodule LlamaCppExTest do
         end
       end
 
+      test "apply_template with enable_thinking option", %{
+        model: model,
+        has_template: has_template
+      } do
+        if has_template do
+          messages = [
+            %{role: "user", content: "Hello"}
+          ]
+
+          {:ok, prompt_thinking} =
+            LlamaCppEx.Chat.apply_template(model, messages, enable_thinking: true)
+
+          {:ok, prompt_no_thinking} =
+            LlamaCppEx.Chat.apply_template(model, messages, enable_thinking: false)
+
+          # Both should be valid prompts
+          assert is_binary(prompt_thinking)
+          assert is_binary(prompt_no_thinking)
+          assert byte_size(prompt_thinking) > 0
+          assert byte_size(prompt_no_thinking) > 0
+
+          # For models that support enable_thinking (like Qwen3), the prompts
+          # will differ. For models that don't, they may be the same.
+          # Either way, both should contain the user message.
+          assert prompt_thinking =~ "Hello"
+          assert prompt_no_thinking =~ "Hello"
+        end
+      end
+
       test "chat generate", %{model: model, has_template: has_template} do
         if has_template do
           {:ok, reply} =

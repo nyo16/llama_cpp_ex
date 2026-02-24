@@ -26,6 +26,8 @@ defmodule LlamaCppEx.Server do
 
   use GenServer
 
+  require Logger
+
   alias LlamaCppEx.{Model, Context, Sampler, Tokenizer}
 
   defstruct [
@@ -626,6 +628,12 @@ defmodule LlamaCppEx.Server do
       if gen_duration_s > 0, do: slot.tokens_generated / gen_duration_s, else: 0.0
 
     mode = if slot.stream_pid, do: :stream, else: :generate
+
+    Logger.debug(
+      "slot #{seq_id} done: #{slot.n_prompt_tokens} prompt tokens (#{Float.round(prompt_eval_rate, 1)} t/s), " <>
+        "#{slot.tokens_generated} generated (#{Float.round(generation_rate, 1)} t/s), " <>
+        "ttft #{Float.round(ttft_ms, 1)}ms, total #{Float.round(duration_ms, 1)}ms"
+    )
 
     :telemetry.execute(
       [:llama_cpp_ex, :server, :request, :done],
