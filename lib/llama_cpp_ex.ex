@@ -27,7 +27,16 @@ defmodule LlamaCppEx do
 
   """
 
-  alias LlamaCppEx.{Model, Context, Sampler, Tokenizer, Chat, Embedding}
+  alias LlamaCppEx.{
+    Model,
+    Context,
+    Sampler,
+    Tokenizer,
+    Chat,
+    Embedding,
+    ChatCompletion,
+    ChatCompletionChunk
+  }
 
   @doc """
   Initializes the llama.cpp backend. Call once at application start.
@@ -63,6 +72,8 @@ defmodule LlamaCppEx do
     * `:min_p` - Min-P filtering. Defaults to `0.05`.
     * `:seed` - Random seed. Defaults to random.
     * `:penalty_repeat` - Repetition penalty. Defaults to `1.0`.
+    * `:penalty_freq` - Frequency penalty (0.0–2.0). Defaults to `0.0`.
+    * `:penalty_present` - Presence penalty (0.0–2.0). Defaults to `0.0`.
     * `:grammar` - GBNF grammar string for constrained generation.
     * `:grammar_root` - Root rule name for grammar. Defaults to `"root"`.
 
@@ -80,6 +91,8 @@ defmodule LlamaCppEx do
         :top_p,
         :min_p,
         :penalty_repeat,
+        :penalty_freq,
+        :penalty_present,
         :grammar,
         :grammar_root
       ])
@@ -130,6 +143,8 @@ defmodule LlamaCppEx do
         :top_p,
         :min_p,
         :penalty_repeat,
+        :penalty_freq,
+        :penalty_present,
         :grammar,
         :grammar_root
       ])
@@ -224,6 +239,270 @@ defmodule LlamaCppEx do
     {chat_opts, gen_opts} = Keyword.split(opts, [:template, :add_assistant])
     {:ok, prompt} = Chat.apply_template(model, messages, chat_opts)
     stream(model, prompt, gen_opts)
+  end
+
+  @doc """
+  Generates an OpenAI-compatible chat completion response.
+
+  Applies the chat template, runs generation, and returns a `%ChatCompletion{}`
+  struct with choices, usage counts, and finish reason.
+
+  ## Options
+
+  Accepts all options from `generate/3` plus:
+
+    * `:template` - Custom chat template string. Defaults to the model's embedded template.
+
+  ## Examples
+
+      {:ok, completion} = LlamaCppEx.chat_completion(model, [
+        %{role: "user", content: "What is Elixir?"}
+      ], max_tokens: 200)
+
+      completion.choices |> hd() |> Map.get(:message) |> Map.get(:content)
+
+  """
+  @spec chat_completion(Model.t(), [Chat.message()], keyword()) ::
+          {:ok, ChatCompletion.t()} | {:error, term()}
+  def chat_completion(%Model{} = model, messages, opts \\ []) when is_list(messages) do
+    {chat_opts, gen_opts} = Keyword.split(opts, [:template, :add_assistant])
+    max_tokens = Keyword.get(gen_opts, :max_tokens, 256)
+    n_ctx = Keyword.get(gen_opts, :n_ctx, 2048)
+    timeout = Keyword.get(gen_opts, :timeout, 60_000)
+
+    sampler_opts =
+      Keyword.take(gen_opts, [
+        :seed,
+        :temp,
+        :top_k,
+        :top_p,
+        :min_p,
+        :penalty_repeat,
+        :penalty_freq,
+        :penalty_present,
+        :grammar,
+        :grammar_root
+      ])
+
+    ctx_opts =
+      Keyword.take(gen_opts, [:n_threads, :n_threads_batch, :n_batch, :n_ubatch])
+
+    with {:ok, prompt} <- Chat.apply_template(model, messages, chat_opts),
+         {:ok, prompt_tokens} <- Tokenizer.encode(model, prompt) do
+      ctx_size = max(n_ctx, length(prompt_tokens) + max_tokens)
+      {:ok, ctx} = Context.create(model, Keyword.put(ctx_opts, :n_ctx, ctx_size))
+      {:ok, sampler} = Sampler.create(model, sampler_opts)
+
+      ref = make_ref()
+      parent = self()
+
+      spawn_link(fn ->
+        LlamaCppEx.NIF.generate_tokens(
+          ctx.ref,
+          sampler.ref,
+          prompt_tokens,
+          max_tokens,
+          parent,
+          ref
+        )
+      end)
+
+      {texts, finish_reason, completion_tokens} = collect_completion_tokens(ref, timeout)
+
+      completion = %ChatCompletion{
+        id: "chatcmpl-" <> random_hex(12),
+        object: "chat.completion",
+        created: System.os_time(:second),
+        model: Model.desc(model),
+        choices: [
+          %{
+            index: 0,
+            message: %{role: "assistant", content: Enum.join(texts)},
+            finish_reason: finish_reason
+          }
+        ],
+        usage: %{
+          prompt_tokens: length(prompt_tokens),
+          completion_tokens: completion_tokens,
+          total_tokens: length(prompt_tokens) + completion_tokens
+        }
+      }
+
+      {:ok, completion}
+    end
+  end
+
+  @doc """
+  Returns a lazy stream of OpenAI-compatible chat completion chunks.
+
+  Each element is a `%ChatCompletionChunk{}` struct. The first chunk contains
+  `delta: %{role: "assistant", content: ""}`. Subsequent chunks contain
+  `delta: %{content: "token_text"}`. The final chunk contains the `finish_reason`.
+
+  All chunks share the same `id` and `created` timestamp.
+
+  ## Options
+
+  Accepts same options as `chat_completion/3`.
+
+  ## Examples
+
+      model
+      |> LlamaCppEx.stream_chat_completion(messages, max_tokens: 200)
+      |> Enum.each(fn chunk ->
+        chunk.choices |> hd() |> get_in([:delta, :content]) |> IO.write()
+      end)
+
+  """
+  @spec stream_chat_completion(Model.t(), [Chat.message()], keyword()) :: Enumerable.t()
+  def stream_chat_completion(%Model{} = model, messages, opts \\ []) when is_list(messages) do
+    {chat_opts, gen_opts} = Keyword.split(opts, [:template, :add_assistant])
+    max_tokens = Keyword.get(gen_opts, :max_tokens, 256)
+    n_ctx = Keyword.get(gen_opts, :n_ctx, 2048)
+    timeout = Keyword.get(gen_opts, :timeout, 60_000)
+
+    sampler_opts =
+      Keyword.take(gen_opts, [
+        :seed,
+        :temp,
+        :top_k,
+        :top_p,
+        :min_p,
+        :penalty_repeat,
+        :penalty_freq,
+        :penalty_present,
+        :grammar,
+        :grammar_root
+      ])
+
+    ctx_opts =
+      Keyword.take(gen_opts, [:n_threads, :n_threads_batch, :n_batch, :n_ubatch])
+
+    Stream.resource(
+      fn ->
+        {:ok, prompt} = Chat.apply_template(model, messages, chat_opts)
+        {:ok, tokens} = Tokenizer.encode(model, prompt)
+        ctx_size = max(n_ctx, length(tokens) + max_tokens)
+        {:ok, ctx} = Context.create(model, Keyword.put(ctx_opts, :n_ctx, ctx_size))
+        {:ok, sampler} = Sampler.create(model, sampler_opts)
+
+        id = "chatcmpl-" <> random_hex(12)
+        created = System.os_time(:second)
+        model_name = Model.desc(model)
+
+        ref = make_ref()
+        parent = self()
+
+        gen_pid =
+          spawn_link(fn ->
+            LlamaCppEx.NIF.generate_tokens(
+              ctx.ref,
+              sampler.ref,
+              tokens,
+              max_tokens,
+              parent,
+              ref
+            )
+          end)
+
+        %{
+          ref: ref,
+          gen_pid: gen_pid,
+          timeout: timeout,
+          id: id,
+          created: created,
+          model: model_name,
+          phase: :first
+        }
+      end,
+      fn
+        %{phase: :first} = state ->
+          chunk = %ChatCompletionChunk{
+            id: state.id,
+            object: "chat.completion.chunk",
+            created: state.created,
+            model: state.model,
+            choices: [%{index: 0, delta: %{role: "assistant", content: ""}, finish_reason: nil}]
+          }
+
+          {[chunk], %{state | phase: :streaming}}
+
+        %{phase: :streaming, ref: ref, timeout: timeout} = state ->
+          receive do
+            {^ref, {:token, _id, text}} ->
+              chunk = %ChatCompletionChunk{
+                id: state.id,
+                object: "chat.completion.chunk",
+                created: state.created,
+                model: state.model,
+                choices: [%{index: 0, delta: %{content: text}, finish_reason: nil}]
+              }
+
+              {[chunk], state}
+
+            {^ref, :eog} ->
+              final_chunk = %ChatCompletionChunk{
+                id: state.id,
+                object: "chat.completion.chunk",
+                created: state.created,
+                model: state.model,
+                choices: [%{index: 0, delta: %{}, finish_reason: "stop"}]
+              }
+
+              {[final_chunk], %{state | phase: :done}}
+
+            {^ref, :done} ->
+              final_chunk = %ChatCompletionChunk{
+                id: state.id,
+                object: "chat.completion.chunk",
+                created: state.created,
+                model: state.model,
+                choices: [%{index: 0, delta: %{}, finish_reason: "length"}]
+              }
+
+              {[final_chunk], %{state | phase: :done}}
+
+            {^ref, {:error, _reason}} ->
+              {:halt, state}
+          after
+            timeout -> {:halt, state}
+          end
+
+        %{phase: :done} = state ->
+          {:halt, state}
+      end,
+      fn %{ref: ref, gen_pid: gen_pid} ->
+        Process.unlink(gen_pid)
+        Process.exit(gen_pid, :kill)
+        flush_stream_messages(ref)
+      end
+    )
+  end
+
+  defp collect_completion_tokens(ref, timeout) do
+    collect_completion_tokens(ref, timeout, [], 0)
+  end
+
+  defp collect_completion_tokens(ref, timeout, texts, count) do
+    receive do
+      {^ref, {:token, _id, text}} ->
+        collect_completion_tokens(ref, timeout, [text | texts], count + 1)
+
+      {^ref, :eog} ->
+        {Enum.reverse(texts), "stop", count}
+
+      {^ref, :done} ->
+        {Enum.reverse(texts), "length", count}
+
+      {^ref, {:error, _reason}} ->
+        {Enum.reverse(texts), "stop", count}
+    after
+      timeout -> {Enum.reverse(texts), "length", count}
+    end
+  end
+
+  defp random_hex(n) do
+    :crypto.strong_rand_bytes(n) |> Base.encode16(case: :lower)
   end
 
   @doc """

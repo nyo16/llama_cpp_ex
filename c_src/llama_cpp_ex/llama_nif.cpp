@@ -235,6 +235,8 @@ sampler_init(
     double top_p,
     double min_p,
     double penalty_repeat,
+    double penalty_freq,
+    double penalty_present,
     std::string grammar_str,
     std::string grammar_root)
 {
@@ -252,9 +254,10 @@ sampler_init(
     }
 
     // Add samplers in recommended order: penalties -> top_k -> top_p -> min_p -> temp -> dist/greedy
-    if (penalty_repeat != 1.0) {
+    if (penalty_repeat != 1.0 || penalty_freq != 0.0 || penalty_present != 0.0) {
         llama_sampler_chain_add(chain,
-            llama_sampler_init_penalties(64, static_cast<float>(penalty_repeat), 0.0f, 0.0f));
+            llama_sampler_init_penalties(64, static_cast<float>(penalty_repeat),
+                static_cast<float>(penalty_freq), static_cast<float>(penalty_present)));
     }
 
     if (top_k > 0) {

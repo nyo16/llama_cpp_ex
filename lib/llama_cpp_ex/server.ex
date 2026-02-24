@@ -48,14 +48,14 @@ defmodule LlamaCppEx.Server do
   ## Options
 
     * `:model_path` (required) - Path to the GGUF model file.
-    * `:n_gpu_layers` - GPU layers. Defaults to `0`.
+    * `:n_gpu_layers` - GPU layers. Defaults to `99`.
     * `:n_ctx` - Total context size (shared across slots). Defaults to `8192`.
     * `:n_parallel` - Number of concurrent slots. Defaults to `4`.
     * `:n_batch` - Batch size. Defaults to `n_ctx`.
     * `:chunk_size` - Max prefill tokens per slot per tick. Defaults to `512`.
     * `:max_queue` - Max queued requests. `0` for unlimited. Defaults to `0`.
     * Sampling options: `:temp`, `:top_k`, `:top_p`, `:min_p`, `:seed`, `:penalty_repeat`,
-      `:grammar`, `:grammar_root`.
+      `:penalty_freq`, `:penalty_present`, `:grammar`, `:grammar_root`.
     * GenServer options like `:name`.
 
   """
@@ -133,7 +133,7 @@ defmodule LlamaCppEx.Server do
   @impl true
   def init(opts) do
     model_path = Keyword.fetch!(opts, :model_path)
-    n_gpu_layers = Keyword.get(opts, :n_gpu_layers, 0)
+    n_gpu_layers = Keyword.get(opts, :n_gpu_layers, 99)
     n_parallel = Keyword.get(opts, :n_parallel, 4)
     n_ctx = Keyword.get(opts, :n_ctx, 8192)
     n_batch = Keyword.get(opts, :n_batch, n_ctx)
@@ -147,6 +147,8 @@ defmodule LlamaCppEx.Server do
         :top_p,
         :min_p,
         :penalty_repeat,
+        :penalty_freq,
+        :penalty_present,
         :grammar,
         :grammar_root
       ])

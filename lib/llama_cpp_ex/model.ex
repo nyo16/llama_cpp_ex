@@ -14,7 +14,7 @@ defmodule LlamaCppEx.Model do
   ## Options
 
     * `:n_gpu_layers` - Number of layers to offload to GPU. Use `-1` for all layers.
-      Defaults to `0` (CPU only).
+      Defaults to `99` (offload all layers).
     * `:use_mmap` - Whether to memory-map the model file. Defaults to `true`.
 
   ## Examples
@@ -24,7 +24,7 @@ defmodule LlamaCppEx.Model do
   """
   @spec load(String.t(), keyword()) :: {:ok, t()} | {:error, String.t()}
   def load(path, opts \\ []) do
-    n_gpu_layers = Keyword.get(opts, :n_gpu_layers, 0)
+    n_gpu_layers = Keyword.get(opts, :n_gpu_layers, 99)
     use_mmap = Keyword.get(opts, :use_mmap, true)
 
     case LlamaCppEx.NIF.model_load(path, n_gpu_layers, use_mmap) do

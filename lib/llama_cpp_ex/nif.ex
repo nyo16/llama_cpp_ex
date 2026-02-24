@@ -57,6 +57,8 @@ defmodule LlamaCppEx.NIF do
         _top_p,
         _min_p,
         _penalty_repeat,
+        _penalty_freq,
+        _penalty_present,
         _grammar_str,
         _grammar_root
       ),
