@@ -63,7 +63,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          submodules: recursive
+          ref: master
       - uses: erlef/setup-beam@v1
         with:
           otp-version: '27.0'
@@ -75,5 +75,4 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add checksum.exs
-          git commit -m "Update checksum.exs for ${{ github.ref_name }}"
-          git push origin HEAD:master
+          git diff --staged --quiet && echo "No changes" || (git commit -m "Update checksum.exs for ${{ github.ref_name }}" && git push origin master)
