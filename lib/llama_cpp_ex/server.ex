@@ -155,8 +155,11 @@ defmodule LlamaCppEx.Server do
         :grammar_root
       ])
 
+    model_opts =
+      Keyword.take(opts, [:main_gpu, :split_mode, :tensor_split, :use_mlock, :use_direct_io])
+
     :ok = LlamaCppEx.init()
-    {:ok, model} = Model.load(model_path, n_gpu_layers: n_gpu_layers)
+    {:ok, model} = Model.load(model_path, [n_gpu_layers: n_gpu_layers] ++ model_opts)
 
     {:ok, ctx} =
       Context.create(model,

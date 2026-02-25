@@ -12,7 +12,19 @@ defmodule LlamaCppEx.NIF do
   def backend_free, do: :erlang.nif_error(:not_loaded)
 
   # Model
-  def model_load(_path, _n_gpu_layers, _use_mmap), do: :erlang.nif_error(:not_loaded)
+  def model_load(
+        _path,
+        _n_gpu_layers,
+        _use_mmap,
+        _main_gpu,
+        _split_mode,
+        _tensor_split,
+        _use_mlock,
+        _use_direct_io,
+        _vocab_only
+      ),
+      do: :erlang.nif_error(:not_loaded)
+
   def model_n_ctx_train(_model), do: :erlang.nif_error(:not_loaded)
   def model_n_embd(_model), do: :erlang.nif_error(:not_loaded)
   def model_desc(_model), do: :erlang.nif_error(:not_loaded)

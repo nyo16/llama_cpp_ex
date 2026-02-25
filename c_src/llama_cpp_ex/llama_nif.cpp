@@ -32,10 +32,24 @@ FINE_NIF(backend_free, 0);
 // --- Model ---
 
 std::variant<fine::Ok<fine::ResourcePtr<LlamaModel>>, fine::Error<std::string>>
-model_load(ErlNifEnv* env, std::string path, int64_t n_gpu_layers, bool use_mmap) {
+model_load(ErlNifEnv* env, std::string path, int64_t n_gpu_layers, bool use_mmap,
+           int64_t main_gpu, int64_t split_mode, std::vector<double> tensor_split,
+           bool use_mlock, bool use_direct_io, bool vocab_only) {
     auto params = llama_model_default_params();
     params.n_gpu_layers = static_cast<int32_t>(n_gpu_layers);
     params.use_mmap = use_mmap;
+    params.main_gpu = static_cast<int32_t>(main_gpu);
+    params.split_mode = static_cast<enum llama_split_mode>(split_mode);
+    params.use_mlock = use_mlock;
+    params.use_direct_io = use_direct_io;
+    params.vocab_only = vocab_only;
+
+    std::vector<float> ts_float;
+    if (!tensor_split.empty()) {
+        ts_float.reserve(tensor_split.size());
+        for (auto v : tensor_split) ts_float.push_back(static_cast<float>(v));
+        params.tensor_split = ts_float.data();
+    }
 
     llama_model* model = llama_model_load_from_file(path.c_str(), params);
     if (!model) {
