@@ -11,7 +11,7 @@ defmodule LlamaCppEx.MixProject do
       elixir: "~> 1.15",
       start_permanent: Mix.env() == :prod,
       deps: deps(),
-      compilers: [:elixir_make] ++ Mix.compilers(),
+      compilers: Mix.compilers() ++ [:elixir_make],
       make_env: &make_env/0,
       make_clean: ["clean"],
       make_precompiler: {:nif, LlamaCppEx.Precompiler},
