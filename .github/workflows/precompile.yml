@@ -30,6 +30,8 @@ jobs:
             backend: cpu
 
     runs-on: ${{ matrix.os }}
+    permissions:
+      contents: write
     steps:
       - uses: actions/checkout@v4
         with:
@@ -42,32 +44,19 @@ jobs:
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y cmake
       - run: mix deps.get
-      - run: mix elixir_make.precompile
+      - name: Create precompiled library
+        run: |
+          export ELIXIR_MAKE_CACHE_DIR=$(pwd)/cache
+          mkdir -p "${ELIXIR_MAKE_CACHE_DIR}"
+          mix elixir_make.precompile
         env:
           LLAMA_BACKEND: ${{ matrix.backend }}
-      - uses: actions/upload-artifact@v4
-        with:
-          name: nif-${{ matrix.target }}-otp${{ matrix.otp }}
-          path: |
-            ~/.cache/elixir_make/*.tar.gz
-            ~/.cache/elixir_make/*.sha256
-
-  release:
-    needs: precompile
-    runs-on: ubuntu-22.04
-    permissions:
-      contents: write
-    steps:
-      - uses: actions/download-artifact@v4
-        with:
-          merge-multiple: true
-          path: artifacts/
       - uses: softprops/action-gh-release@v2
         with:
-          files: artifacts/*.tar.gz
+          files: cache/*.tar.gz
 
   checksum:
-    needs: release
+    needs: precompile
     runs-on: ubuntu-22.04
     permissions:
       contents: write
