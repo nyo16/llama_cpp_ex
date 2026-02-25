@@ -1,3 +1,39 @@
+defmodule LlamaCppEx.Precompiler do
+  @moduledoc false
+
+  @all_targets ["aarch64-apple-darwin", "x86_64-linux-gnu"]
+
+  def all_supported_targets(:fetch), do: @all_targets
+
+  def all_supported_targets(:compile) do
+    case current_target() do
+      {:ok, target} -> [target]
+      _ -> []
+    end
+  end
+
+  def current_target do
+    system_arch = to_string(:erlang.system_info(:system_architecture))
+
+    cond do
+      system_arch =~ ~r/aarch64.*apple.*darwin/ -> {:ok, "aarch64-apple-darwin"}
+      system_arch =~ ~r/x86_64.*linux.*gnu/ -> {:ok, "x86_64-linux-gnu"}
+      true -> {:error, "unsupported target: #{system_arch}"}
+    end
+  end
+
+  def build_native(args), do: ElixirMake.Precompiler.mix_compile(args)
+
+  def precompile(args, _target) do
+    case ElixirMake.Precompiler.mix_compile(args) do
+      {:ok, _} -> :ok
+      error -> error
+    end
+  end
+
+  def unavailable_target(_target), do: :compile
+end
+
 defmodule LlamaCppEx.MixProject do
   use Mix.Project
 
