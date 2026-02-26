@@ -13,6 +13,60 @@ defmodule LlamaCppExTest do
     assert :ok = LlamaCppEx.init()
   end
 
+  test "load_model returns error for missing file" do
+    :ok = LlamaCppEx.init()
+    assert {:error, msg} = LlamaCppEx.load_model("/nonexistent/model.gguf")
+    assert is_binary(msg)
+  end
+
+  describe "ChatCompletion struct" do
+    test "creates with all fields" do
+      completion = %LlamaCppEx.ChatCompletion{
+        id: "chatcmpl-abc123",
+        object: "chat.completion",
+        created: 1_700_000_000,
+        model: "test-model",
+        choices: [
+          %{index: 0, message: %{role: "assistant", content: "Hi"}, finish_reason: "stop"}
+        ],
+        usage: %{prompt_tokens: 5, completion_tokens: 1, total_tokens: 6}
+      }
+
+      assert completion.id == "chatcmpl-abc123"
+      assert completion.object == "chat.completion"
+      assert hd(completion.choices).message.content == "Hi"
+      assert completion.usage.total_tokens == 6
+    end
+  end
+
+  describe "ChatCompletionChunk struct" do
+    test "creates with delta content" do
+      chunk = %LlamaCppEx.ChatCompletionChunk{
+        id: "chatcmpl-abc123",
+        object: "chat.completion.chunk",
+        created: 1_700_000_000,
+        model: "test-model",
+        choices: [%{index: 0, delta: %{content: "Hello"}, finish_reason: nil}]
+      }
+
+      assert chunk.object == "chat.completion.chunk"
+      assert hd(chunk.choices).delta.content == "Hello"
+      assert hd(chunk.choices).finish_reason == nil
+    end
+
+    test "creates with finish_reason" do
+      chunk = %LlamaCppEx.ChatCompletionChunk{
+        id: "chatcmpl-abc123",
+        object: "chat.completion.chunk",
+        created: 1_700_000_000,
+        model: "test-model",
+        choices: [%{index: 0, delta: %{}, finish_reason: "stop"}]
+      }
+
+      assert hd(chunk.choices).finish_reason == "stop"
+    end
+  end
+
   if @model_path && File.exists?(@model_path) do
     describe "model loading" do
       setup do
@@ -27,11 +81,6 @@ defmodule LlamaCppExTest do
         assert is_binary(LlamaCppEx.Model.desc(model))
         assert LlamaCppEx.Model.size(model) > 0
         assert LlamaCppEx.Model.n_params(model) > 0
-      end
-
-      test "load_model returns error for missing file" do
-        assert {:error, msg} = LlamaCppEx.load_model("/nonexistent/model.gguf")
-        assert is_binary(msg)
       end
     end
 

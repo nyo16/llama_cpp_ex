@@ -1,5 +1,17 @@
 # Changelog
 
+## v0.4.1
+
+### Improved
+
+- **Error handling** — `Chat.apply_template/3`, `Tokenizer.encode/3`, and `Tokenizer.decode/2` now return `{:error, reason}` instead of crashing when NIFs raise.
+- **Telemetry documentation** — Server moduledoc documents all telemetry events, measurements, and metadata.
+- **Typespecs** — Added `@spec` to `Server.start_link/1`.
+
+### Changed
+
+- **llama.cpp submodule** — Updated to latest upstream (b8157).
+
 ## v0.4.0
 
 ### Added

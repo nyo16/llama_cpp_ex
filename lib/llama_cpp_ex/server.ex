@@ -22,6 +22,46 @@ defmodule LlamaCppEx.Server do
       LlamaCppEx.Server.stream(server, "Tell me a story", max_tokens: 200)
       |> Enum.each(&IO.write/1)
 
+  ## Telemetry
+
+  The server emits the following telemetry events:
+
+  ### `[:llama_cpp_ex, :server, :tick]`
+
+  Emitted after each batch forward pass.
+
+  Measurements:
+
+    * `:batch_size` - Total tokens in the batch.
+    * `:decode_tokens` - Number of decode (generation) tokens.
+    * `:prefill_tokens` - Number of prefill (prompt) tokens.
+    * `:active_slots` - Slots currently prefilling or generating.
+    * `:queue_depth` - Requests waiting for a slot.
+    * `:eval_ms` - Forward pass wall time in milliseconds.
+
+  Metadata:
+
+    * `:server` - PID of the server process.
+
+  ### `[:llama_cpp_ex, :server, :request, :done]`
+
+  Emitted when a request (generate or stream) completes.
+
+  Measurements:
+
+    * `:prompt_tokens` - Number of prompt tokens.
+    * `:generated_tokens` - Number of tokens generated.
+    * `:duration_ms` - Total request duration in milliseconds.
+    * `:ttft_ms` - Time to first token in milliseconds.
+    * `:prompt_eval_rate` - Prompt evaluation speed (tokens/sec).
+    * `:generation_rate` - Generation speed (tokens/sec).
+
+  Metadata:
+
+    * `:server` - PID of the server process.
+    * `:seq_id` - Slot sequence ID (integer).
+    * `:mode` - `:generate` or `:stream`.
+
   """
 
   use GenServer
@@ -61,6 +101,7 @@ defmodule LlamaCppEx.Server do
     * GenServer options like `:name`.
 
   """
+  @spec start_link(keyword()) :: GenServer.on_start()
   def start_link(opts) do
     {server_opts, gen_opts} = Keyword.split(opts, [:name])
     GenServer.start_link(__MODULE__, gen_opts, server_opts)

@@ -50,15 +50,19 @@ defmodule LlamaCppEx.Chat do
     kwargs_tuples =
       Enum.map(extra_kwargs, fn {k, v} -> {to_string(k), to_string(v)} end)
 
-    result =
-      LlamaCppEx.NIF.chat_apply_template_jinja(
-        model.ref,
-        msg_tuples,
-        add_assistant,
-        enable_thinking,
-        kwargs_tuples
-      )
+    try do
+      result =
+        LlamaCppEx.NIF.chat_apply_template_jinja(
+          model.ref,
+          msg_tuples,
+          add_assistant,
+          enable_thinking,
+          kwargs_tuples
+        )
 
-    {:ok, result}
+      {:ok, result}
+    rescue
+      e in ErlangError -> {:error, "chat template failed: #{inspect(e.original)}"}
+    end
   end
 end

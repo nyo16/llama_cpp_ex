@@ -12,19 +12,24 @@ defmodule LlamaCppEx.Tokenizer do
     * `:parse_special` - Parse special token text (e.g., `<|im_start|>`). Defaults to `true`.
 
   """
-  @spec encode(LlamaCppEx.Model.t(), String.t(), keyword()) :: {:ok, [integer()]}
+  @spec encode(LlamaCppEx.Model.t(), String.t(), keyword()) ::
+          {:ok, [integer()]} | {:error, String.t()}
   def encode(%LlamaCppEx.Model{ref: ref}, text, opts \\ []) do
     add_special = Keyword.get(opts, :add_special, true)
     parse_special = Keyword.get(opts, :parse_special, true)
     {:ok, LlamaCppEx.NIF.tokenize(ref, text, add_special, parse_special)}
+  rescue
+    e in ErlangError -> {:error, "tokenize failed: #{inspect(e.original)}"}
   end
 
   @doc """
   Decodes a list of token IDs back into text.
   """
-  @spec decode(LlamaCppEx.Model.t(), [integer()]) :: {:ok, String.t()}
+  @spec decode(LlamaCppEx.Model.t(), [integer()]) :: {:ok, String.t()} | {:error, String.t()}
   def decode(%LlamaCppEx.Model{ref: ref}, tokens) when is_list(tokens) do
     {:ok, LlamaCppEx.NIF.detokenize(ref, tokens)}
+  rescue
+    e in ErlangError -> {:error, "detokenize failed: #{inspect(e.original)}"}
   end
 
   @doc """
