@@ -1,5 +1,11 @@
 # Changelog
 
+## v0.4.2
+
+### Changed
+
+- **llama.cpp submodule** — Updated to latest upstream (b8179).
+
 ## v0.4.1
 
 ### Improved
