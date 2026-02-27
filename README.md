@@ -1,5 +1,7 @@
 # LlamaCppEx
 
+[![Precompile NIFs](https://github.com/nyo16/llama_cpp_ex/actions/workflows/precompile.yml/badge.svg)](https://github.com/nyo16/llama_cpp_ex/actions/workflows/precompile.yml)
+
 Elixir bindings for [llama.cpp](https://github.com/ggml-org/llama.cpp) — run LLMs locally with Metal, CUDA, Vulkan, or CPU acceleration.
 
 Built with C++ NIFs using [fine](https://github.com/elixir-nx/fine) for ergonomic resource management and [elixir_make](https://hex.pm/packages/elixir_make) for the build system.
