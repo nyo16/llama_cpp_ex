@@ -1,5 +1,15 @@
 # Changelog
 
+## v0.4.3
+
+### Changed
+
+- **llama.cpp submodule** — Updated to latest upstream (b8185).
+  - Vulkan: improve partial offloading performance on AMD
+  - CUDA: cap grid.y at 65535 in non-contiguous dequantize/convert kernels
+  - ggml-cpu: optimise s390x multiply extend instructions
+  - Vendors: update cpp-httplib to 0.35.0, miniaudio to 0.11.24
+
 ## v0.4.2
 
 ### Changed
