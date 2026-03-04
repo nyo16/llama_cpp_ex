@@ -1,5 +1,18 @@
 # Changelog
 
+## v0.4.4
+
+### Changed
+
+- **llama.cpp submodule** — Updated to latest upstream (b8198).
+  - ggml: fix `ggml_is_contiguous_n` for ne == 1
+  - ggml: use simple `std::thread` in AMX without OpenMP
+  - KleidiAI: add SME fp16 compute path for q4_0 GEMM on aarch64
+  - OpenCL: add optimized q4_1 mm kernel for Adreno
+  - Vulkan: tune MMVQ for Intel Windows
+  - WebGPU: fix workgroup dispatch limit for large batch sizes
+  - Fix locale-dependent float printing in GGUF metadata
+
 ## v0.4.3
 
 ### Changed
