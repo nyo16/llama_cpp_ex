@@ -1,5 +1,19 @@
 # Changelog
 
+## v0.5.0
+
+### Added
+
+- **Structured output via JSON Schema** — New `:json_schema` option on `generate/3`, `stream/3`, `chat/3`, `stream_chat/3`, `chat_completion/3`, and `stream_chat_completion/3`. Pass a JSON Schema map and the model output will be constrained to match it.
+- **`LlamaCppEx.Grammar`** — New module with `from_json_schema/1` and `from_json_schema!/1` for converting JSON Schema maps to GBNF grammar strings using llama.cpp's built-in converter.
+- **`LlamaCppEx.Schema`** — New module with `to_json_schema/1` for converting Ecto schema modules to JSON Schema maps. Requires `{:ecto, "~> 3.0"}` as an optional dependency.
+- **NIF: `json_schema_to_grammar_nif/1`** — Exposes llama.cpp's `json_schema_to_grammar()` function.
+
+### Changed
+
+- **Elixir requirement** bumped to `~> 1.18` (for `JSON.encode!/1`).
+- **Optional dependency** — `{:ecto, "~> 3.0", optional: true}` added to deps.
+
 ## v0.4.4
 
 ### Changed

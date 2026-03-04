@@ -44,7 +44,7 @@ defmodule LlamaCppEx.MixProject do
     [
       app: :llama_cpp_ex,
       version: @version,
-      elixir: "~> 1.15",
+      elixir: "~> 1.18",
       start_permanent: Mix.env() == :prod,
       deps: deps(),
       compilers: Mix.compilers() ++ [:elixir_make],
@@ -75,6 +75,7 @@ defmodule LlamaCppEx.MixProject do
       {:elixir_make, "~> 0.8", runtime: false},
       {:fine, "~> 0.1", runtime: false},
       {:telemetry, "~> 1.0"},
+      {:ecto, "~> 3.0", optional: true},
       {:ex_doc, "~> 0.34", only: :dev, runtime: false},
       {:benchee, "~> 1.0", only: :bench, runtime: false}
     ]
@@ -127,6 +128,8 @@ defmodule LlamaCppEx.MixProject do
           LlamaCppEx.Tokenizer,
           LlamaCppEx.Chat,
           LlamaCppEx.Embedding,
+          LlamaCppEx.Grammar,
+          LlamaCppEx.Schema,
           LlamaCppEx.Server
         ],
         Internal: [LlamaCppEx.NIF]

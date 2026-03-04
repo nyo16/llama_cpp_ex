@@ -16,6 +16,8 @@ Built with C++ NIFs using [fine](https://github.com/elixir-nx/fine) for ergonomi
 - Configurable sampling: temperature, top-k, top-p, min-p, repetition penalty, frequency & presence penalty
 - Embedding generation with L2 normalization
 - Grammar-constrained generation (GBNF)
+- Structured output via JSON Schema (auto-converted to GBNF grammar)
+- Optional Ecto schema to JSON Schema conversion
 - Continuous batching server for concurrent inference
 - Telemetry integration for observability
 
@@ -88,6 +90,57 @@ model
 ], max_tokens: 500)
 |> Enum.each(&IO.write/1)
 ```
+
+## Structured Output (JSON Schema)
+
+Force the model to output valid JSON matching a schema:
+
+```elixir
+schema = %{
+  "type" => "object",
+  "properties" => %{
+    "name" => %{"type" => "string"},
+    "age" => %{"type" => "integer"}
+  },
+  "required" => ["name", "age"]
+}
+
+{:ok, json} = LlamaCppEx.generate(model, "Generate a person:", json_schema: schema, temp: 0.0)
+# => "{\"name\": \"Alice\", \"age\": 30}"
+
+# Works with chat too
+{:ok, json} = LlamaCppEx.chat(model, [
+  %{role: "user", content: "Generate a person named Bob who is 25."}
+], json_schema: schema, temp: 0.0)
+```
+
+You can also convert the schema manually and use the `:grammar` option directly:
+
+```elixir
+{:ok, gbnf} = LlamaCppEx.Grammar.from_json_schema(schema)
+{:ok, json} = LlamaCppEx.generate(model, "Generate a person:", grammar: gbnf, temp: 0.0)
+```
+
+### Ecto Schema Integration
+
+If you use Ecto, you can convert schema modules to JSON Schema automatically:
+
+```elixir
+defmodule MyApp.Person do
+  use Ecto.Schema
+
+  embedded_schema do
+    field :name, :string
+    field :age, :integer
+    field :active, :boolean
+  end
+end
+
+schema = LlamaCppEx.Schema.to_json_schema(MyApp.Person)
+{:ok, json} = LlamaCppEx.generate(model, "Generate a person:", json_schema: schema, temp: 0.0)
+```
+
+Requires `{:ecto, "~> 3.0"}` in your deps (optional dependency).
 
 ## Lower-level API
 
