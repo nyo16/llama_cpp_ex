@@ -5,6 +5,10 @@ defmodule LlamaCppEx.Grammar do
   Uses llama.cpp's built-in `json_schema_to_grammar()` to convert a JSON Schema
   into a GBNF grammar string that can be used with the `:grammar` option.
 
+  In most cases you don't need to call this module directly — pass `:json_schema`
+  to `LlamaCppEx.generate/3`, `LlamaCppEx.chat/3`, or any other generate function
+  and the conversion happens automatically.
+
   ## Examples
 
       schema = %{
@@ -13,11 +17,16 @@ defmodule LlamaCppEx.Grammar do
           "name" => %{"type" => "string"},
           "age" => %{"type" => "integer"}
         },
-        "required" => ["name", "age"]
+        "required" => ["name", "age"],
+        "additionalProperties" => false
       }
 
       {:ok, gbnf} = LlamaCppEx.Grammar.from_json_schema(schema)
+      # Use with the :grammar option
+      {:ok, sampler} = LlamaCppEx.Sampler.create(model, grammar: gbnf, temp: 0.0)
 
+  Supports all JSON Schema types: `object`, `array`, `string`, `number`,
+  `integer`, `boolean`, `null`, `enum`, `oneOf`, `anyOf`, `allOf`, `$ref`, etc.
   """
 
   @doc """

@@ -4,15 +4,30 @@
 
 ### Added
 
-- **Structured output via JSON Schema** — New `:json_schema` option on `generate/3`, `stream/3`, `chat/3`, `stream_chat/3`, `chat_completion/3`, and `stream_chat_completion/3`. Pass a JSON Schema map and the model output will be constrained to match it.
-- **`LlamaCppEx.Grammar`** — New module with `from_json_schema/1` and `from_json_schema!/1` for converting JSON Schema maps to GBNF grammar strings using llama.cpp's built-in converter.
-- **`LlamaCppEx.Schema`** — New module with `to_json_schema/1` for converting Ecto schema modules to JSON Schema maps. Requires `{:ecto, "~> 3.0"}` as an optional dependency.
-- **NIF: `json_schema_to_grammar_nif/1`** — Exposes llama.cpp's `json_schema_to_grammar()` function.
+- **Structured output via JSON Schema** — New `:json_schema` option on `generate/3`, `stream/3`, `chat/3`, `stream_chat/3`, `chat_completion/3`, and `stream_chat_completion/3`. Pass a JSON Schema map and the model output is automatically constrained to valid JSON matching the schema. Uses llama.cpp's built-in `json_schema_to_grammar()` under the hood.
+
+  ```elixir
+  schema = %{
+    "type" => "object",
+    "properties" => %{"name" => %{"type" => "string"}, "age" => %{"type" => "integer"}},
+    "required" => ["name", "age"],
+    "additionalProperties" => false
+  }
+  {:ok, json} = LlamaCppEx.chat(model, messages, json_schema: schema, temp: 0.0)
+  ```
+
+- **`LlamaCppEx.Grammar`** — New module for JSON Schema to GBNF conversion.
+  - `from_json_schema/1` — returns `{:ok, gbnf_string}` or `{:error, reason}`
+  - `from_json_schema!/1` — returns the GBNF string or raises
+
+- **`LlamaCppEx.Schema`** — New module for converting Ecto schema modules to JSON Schema maps. Maps all standard Ecto types (`:string`, `:integer`, `:float`, `:boolean`, `:date`, `{:array, inner}`, etc.) and supports nested `embeds_one`/`embeds_many`. Automatically excludes `:id` and timestamp fields.
+
+- **NIF: `json_schema_to_grammar_nif/1`** — Exposes llama.cpp's `json_schema_to_grammar()` via `nlohmann::ordered_json`.
 
 ### Changed
 
-- **Elixir requirement** bumped to `~> 1.18` (for `JSON.encode!/1`).
-- **Optional dependency** — `{:ecto, "~> 3.0", optional: true}` added to deps.
+- **Elixir requirement** bumped to `~> 1.18` (for built-in `JSON.encode!/1`).
+- **Dependencies** — added `{:ecto, "~> 3.0", optional: true}` for optional Ecto schema integration.
 
 ## v0.4.4
 

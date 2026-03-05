@@ -77,8 +77,9 @@ defmodule LlamaCppEx do
     * `:penalty_present` - Presence penalty (0.0–2.0). Defaults to `0.0`.
     * `:grammar` - GBNF grammar string for constrained generation.
     * `:grammar_root` - Root rule name for grammar. Defaults to `"root"`.
-    * `:json_schema` - JSON Schema map for structured output. Converted to GBNF grammar
-      automatically. Cannot be used together with `:grammar`.
+    * `:json_schema` - JSON Schema map for structured output. Automatically converted
+      to a GBNF grammar. Cannot be used together with `:grammar`. Tip: set
+      `"additionalProperties" => false` for tighter grammars.
 
   """
   @spec generate(Model.t(), String.t(), keyword()) :: {:ok, String.t()} | {:error, String.t()}

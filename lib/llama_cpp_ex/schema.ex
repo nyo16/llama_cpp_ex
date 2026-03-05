@@ -2,8 +2,28 @@ defmodule LlamaCppEx.Schema do
   @moduledoc """
   Converts Ecto schema modules to JSON Schema maps for structured output.
 
-  Requires `ecto` as an optional dependency. If Ecto is not available,
-  calling these functions will raise a compile-time or runtime error.
+  Requires `{:ecto, "~> 3.0"}` as an optional dependency. If Ecto is not
+  available, calling these functions will raise at runtime.
+
+  ## Type Mapping
+
+  | Ecto type | JSON Schema |
+  |-----------|-------------|
+  | `:string`, `:binary` | `{"type": "string"}` |
+  | `:integer`, `:id` | `{"type": "integer"}` |
+  | `:float`, `:decimal` | `{"type": "number"}` |
+  | `:boolean` | `{"type": "boolean"}` |
+  | `:map` | `{"type": "object"}` |
+  | `{:array, inner}` | `{"type": "array", "items": ...}` |
+  | `:date` | `{"type": "string", "format": "date"}` |
+  | `:utc_datetime`, etc. | `{"type": "string", "format": "date-time"}` |
+  | `embeds_one` | nested object |
+  | `embeds_many` | array of nested objects |
+
+  ## Excluded Fields
+
+  The following fields are automatically excluded: `:id`, `:inserted_at`,
+  `:updated_at`, and virtual fields.
 
   ## Examples
 
@@ -19,7 +39,10 @@ defmodule LlamaCppEx.Schema do
       end
 
       schema = LlamaCppEx.Schema.to_json_schema(MyApp.Person)
-      {:ok, gbnf} = LlamaCppEx.Grammar.from_json_schema(schema)
+      # => %{"type" => "object", "properties" => %{"name" => ..., "age" => ..., "email" => ...}, ...}
+
+      # Use directly with generate/chat
+      {:ok, json} = LlamaCppEx.chat(model, messages, json_schema: schema, temp: 0.0)
 
   """
 
