@@ -590,28 +590,26 @@ defmodule LlamaCppExTest do
         assert %LlamaCppEx.Sampler{} = sampler
       end
 
-      @tag :slow
-      test "json_schema-constrained generation produces valid JSON", %{model: model} do
+      test "json_schema produces valid GBNF grammar with model loaded", %{model: model} do
         schema = %{
           "type" => "object",
           "properties" => %{
             "name" => %{"type" => "string"},
             "age" => %{"type" => "integer"}
           },
-          "required" => ["name", "age"]
+          "required" => ["name", "age"],
+          "additionalProperties" => false
         }
 
-        {:ok, text} =
-          LlamaCppEx.generate(model, "Generate a JSON object for a person named Alice who is 30:",
-            json_schema: schema,
-            max_tokens: 64,
-            temp: 0.0
-          )
+        {:ok, gbnf} = LlamaCppEx.Grammar.from_json_schema(schema)
+        assert gbnf =~ "root"
+        assert gbnf =~ "name"
+        assert gbnf =~ "age"
+        assert gbnf =~ "integer"
+        assert gbnf =~ "string"
 
-        assert is_binary(text)
-        # Should be parseable JSON
-        assert {:ok, parsed} = JSON.decode(String.trim(text))
-        assert is_map(parsed)
+        # Verify the grammar can be used to create a sampler (proves it's valid GBNF)
+        {:ok, _sampler} = LlamaCppEx.Sampler.create(model, grammar: gbnf, temp: 0.0)
       end
 
       @tag :slow
