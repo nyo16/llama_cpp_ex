@@ -1,6 +1,8 @@
 #include "llama_nif.h"
 #include <fine.hpp>
 #include <llama.h>
+#include <nlohmann/json.hpp>
+#include "json-schema-to-grammar.h"
 #include <string>
 #include <vector>
 #include <algorithm>
@@ -944,6 +946,20 @@ generate(
     return fine::Ok(result);
 }
 FINE_NIF(generate, ERL_NIF_DIRTY_JOB_CPU_BOUND);
+
+// --- JSON Schema to Grammar ---
+
+std::variant<fine::Ok<std::string>, fine::Error<std::string>>
+json_schema_to_grammar_nif(ErlNifEnv* env, std::string json_str) {
+    try {
+        auto schema = nlohmann::ordered_json::parse(json_str);
+        std::string grammar = json_schema_to_grammar(schema);
+        return fine::Ok(grammar);
+    } catch (const std::exception& e) {
+        return fine::Error(std::string(e.what()));
+    }
+}
+FINE_NIF(json_schema_to_grammar_nif, 0);
 
 // --- Init ---
 

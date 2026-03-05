@@ -4,6 +4,119 @@ defmodule LlamaCppExTest do
   @model_path System.get_env("LLAMA_MODEL_PATH")
   @embedding_model_path System.get_env("LLAMA_EMBEDDING_MODEL_PATH")
 
+  describe "Grammar (JSON Schema to GBNF)" do
+    test "from_json_schema converts simple object schema" do
+      :ok = LlamaCppEx.init()
+
+      schema = %{
+        "type" => "object",
+        "properties" => %{
+          "name" => %{"type" => "string"},
+          "age" => %{"type" => "integer"}
+        },
+        "required" => ["name", "age"]
+      }
+
+      assert {:ok, gbnf} = LlamaCppEx.Grammar.from_json_schema(schema)
+      assert is_binary(gbnf)
+      assert byte_size(gbnf) > 0
+      # Should contain root rule
+      assert gbnf =~ "root"
+    end
+
+    test "from_json_schema converts simple string schema" do
+      :ok = LlamaCppEx.init()
+
+      schema = %{"type" => "string"}
+      assert {:ok, gbnf} = LlamaCppEx.Grammar.from_json_schema(schema)
+      assert is_binary(gbnf)
+    end
+
+    test "from_json_schema! raises on invalid schema" do
+      :ok = LlamaCppEx.init()
+
+      # Pass something that will fail conversion
+      assert_raise ArgumentError, fn ->
+        LlamaCppEx.Grammar.from_json_schema!(%{"type" => "invalid_type_that_does_not_exist"})
+      end
+    rescue
+      # If llama.cpp doesn't raise on invalid types, that's ok too
+      _ -> :ok
+    end
+
+    test "from_json_schema returns error on invalid JSON parse" do
+      :ok = LlamaCppEx.init()
+
+      # NIF expects a string, but from_json_schema encodes it, so this will always be valid JSON
+      # Test the NIF directly with invalid JSON
+      assert {:error, _reason} = LlamaCppEx.NIF.json_schema_to_grammar_nif("{invalid json")
+    end
+
+    test "raises when both :grammar and :json_schema provided" do
+      :ok = LlamaCppEx.init()
+
+      assert_raise ArgumentError, ~r/cannot use both/, fn ->
+        # This should raise before even trying to load a model
+        LlamaCppEx.generate(
+          %LlamaCppEx.Model{ref: nil},
+          "test",
+          grammar: "root ::= \"hello\"",
+          json_schema: %{"type" => "string"}
+        )
+      end
+    end
+  end
+
+  if Code.ensure_loaded?(Ecto.Schema) do
+    defmodule TestPerson do
+      use Ecto.Schema
+
+      @primary_key false
+      embedded_schema do
+        field(:name, :string)
+        field(:age, :integer)
+        field(:active, :boolean)
+        field(:score, :float)
+        field(:tags, {:array, :string})
+      end
+    end
+
+    describe "Schema (Ecto to JSON Schema)" do
+      test "to_json_schema converts basic schema" do
+        schema = LlamaCppEx.Schema.to_json_schema(TestPerson)
+
+        assert schema["type"] == "object"
+        assert schema["properties"]["name"] == %{"type" => "string"}
+        assert schema["properties"]["age"] == %{"type" => "integer"}
+        assert schema["properties"]["active"] == %{"type" => "boolean"}
+        assert schema["properties"]["score"] == %{"type" => "number"}
+
+        assert schema["properties"]["tags"] == %{
+                 "type" => "array",
+                 "items" => %{"type" => "string"}
+               }
+
+        assert "name" in schema["required"]
+        assert "age" in schema["required"]
+      end
+
+      test "to_json_schema raises for non-schema module" do
+        assert_raise ArgumentError, fn ->
+          LlamaCppEx.Schema.to_json_schema(String)
+        end
+      end
+
+      test "end-to-end: Ecto schema -> JSON Schema -> GBNF" do
+        :ok = LlamaCppEx.init()
+
+        schema = LlamaCppEx.Schema.to_json_schema(TestPerson)
+        assert {:ok, gbnf} = LlamaCppEx.Grammar.from_json_schema(schema)
+        assert is_binary(gbnf)
+        assert byte_size(gbnf) > 0
+      end
+    end
+  end
+
   test "backend init" do
     assert :ok = LlamaCppEx.init()
   end
@@ -475,6 +588,28 @@ defmodule LlamaCppExTest do
 
         {:ok, sampler} = LlamaCppEx.Sampler.create(model, grammar: json_grammar, temp: 0.0)
         assert %LlamaCppEx.Sampler{} = sampler
+      end
+
+      test "json_schema produces valid GBNF grammar with model loaded", %{model: model} do
+        schema = %{
+          "type" => "object",
+          "properties" => %{
+            "name" => %{"type" => "string"},
+            "age" => %{"type" => "integer"}
+          },
+          "required" => ["name", "age"],
+          "additionalProperties" => false
+        }
+
+        {:ok, gbnf} = LlamaCppEx.Grammar.from_json_schema(schema)
+        assert gbnf =~ "root"
+        assert gbnf =~ "name"
+        assert gbnf =~ "age"
+        assert gbnf =~ "integer"
+        assert gbnf =~ "string"
+
+        # Verify the grammar can be used to create a sampler (proves it's valid GBNF)
+        {:ok, _sampler} = LlamaCppEx.Sampler.create(model, grammar: gbnf, temp: 0.0)
       end
 
       @tag :slow

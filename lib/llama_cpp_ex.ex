@@ -34,6 +34,7 @@ defmodule LlamaCppEx do
     Tokenizer,
     Chat,
     Embedding,
+    Grammar,
     ChatCompletion,
     ChatCompletionChunk
   }
@@ -76,10 +77,14 @@ defmodule LlamaCppEx do
     * `:penalty_present` - Presence penalty (0.0–2.0). Defaults to `0.0`.
     * `:grammar` - GBNF grammar string for constrained generation.
     * `:grammar_root` - Root rule name for grammar. Defaults to `"root"`.
+    * `:json_schema` - JSON Schema map for structured output. Automatically converted
+      to a GBNF grammar. Cannot be used together with `:grammar`. Tip: set
+      `"additionalProperties" => false` for tighter grammars.
 
   """
   @spec generate(Model.t(), String.t(), keyword()) :: {:ok, String.t()} | {:error, String.t()}
   def generate(%Model{} = model, prompt, opts \\ []) when is_binary(prompt) do
+    opts = resolve_grammar_opts(opts)
     max_tokens = Keyword.get(opts, :max_tokens, 256)
     n_ctx = Keyword.get(opts, :n_ctx, 2048)
 
@@ -131,6 +136,7 @@ defmodule LlamaCppEx do
   """
   @spec stream(Model.t(), String.t(), keyword()) :: Enumerable.t()
   def stream(%Model{} = model, prompt, opts \\ []) when is_binary(prompt) do
+    opts = resolve_grammar_opts(opts)
     max_tokens = Keyword.get(opts, :max_tokens, 256)
     n_ctx = Keyword.get(opts, :n_ctx, 2048)
     timeout = Keyword.get(opts, :timeout, 60_000)
@@ -223,6 +229,8 @@ defmodule LlamaCppEx do
   """
   @spec chat(Model.t(), [Chat.message()], keyword()) :: {:ok, String.t()} | {:error, String.t()}
   def chat(%Model{} = model, messages, opts \\ []) when is_list(messages) do
+    opts = resolve_grammar_opts(opts)
+
     {chat_opts, gen_opts} =
       Keyword.split(opts, [:add_assistant, :enable_thinking, :chat_template_kwargs])
 
@@ -238,6 +246,8 @@ defmodule LlamaCppEx do
   """
   @spec stream_chat(Model.t(), [Chat.message()], keyword()) :: Enumerable.t()
   def stream_chat(%Model{} = model, messages, opts \\ []) when is_list(messages) do
+    opts = resolve_grammar_opts(opts)
+
     {chat_opts, gen_opts} =
       Keyword.split(opts, [:add_assistant, :enable_thinking, :chat_template_kwargs])
 
@@ -269,6 +279,8 @@ defmodule LlamaCppEx do
   @spec chat_completion(Model.t(), [Chat.message()], keyword()) ::
           {:ok, ChatCompletion.t()} | {:error, term()}
   def chat_completion(%Model{} = model, messages, opts \\ []) when is_list(messages) do
+    opts = resolve_grammar_opts(opts)
+
     {chat_opts, gen_opts} =
       Keyword.split(opts, [:add_assistant, :enable_thinking, :chat_template_kwargs])
 
@@ -362,6 +374,8 @@ defmodule LlamaCppEx do
   """
   @spec stream_chat_completion(Model.t(), [Chat.message()], keyword()) :: Enumerable.t()
   def stream_chat_completion(%Model{} = model, messages, opts \\ []) when is_list(messages) do
+    opts = resolve_grammar_opts(opts)
+
     {chat_opts, gen_opts} =
       Keyword.split(opts, [:add_assistant, :enable_thinking, :chat_template_kwargs])
 
@@ -511,6 +525,23 @@ defmodule LlamaCppEx do
 
   defp random_hex(n) do
     :crypto.strong_rand_bytes(n) |> Base.encode16(case: :lower)
+  end
+
+  defp resolve_grammar_opts(opts) do
+    grammar = Keyword.get(opts, :grammar)
+    json_schema = Keyword.get(opts, :json_schema)
+
+    cond do
+      grammar && json_schema ->
+        raise ArgumentError, "cannot use both :grammar and :json_schema options"
+
+      json_schema ->
+        gbnf = Grammar.from_json_schema!(json_schema)
+        opts |> Keyword.delete(:json_schema) |> Keyword.put(:grammar, gbnf)
+
+      true ->
+        opts
+    end
   end
 
   @doc """

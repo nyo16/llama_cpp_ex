@@ -16,6 +16,8 @@ Built with C++ NIFs using [fine](https://github.com/elixir-nx/fine) for ergonomi
 - Configurable sampling: temperature, top-k, top-p, min-p, repetition penalty, frequency & presence penalty
 - Embedding generation with L2 normalization
 - Grammar-constrained generation (GBNF)
+- Structured output via JSON Schema (auto-converted to GBNF grammar)
+- Optional Ecto schema to JSON Schema conversion
 - Continuous batching server for concurrent inference
 - Telemetry integration for observability
 
@@ -26,7 +28,7 @@ Add `llama_cpp_ex` to your list of dependencies in `mix.exs`:
 ```elixir
 def deps do
   [
-    {:llama_cpp_ex, "~> 0.4.1"}
+    {:llama_cpp_ex, "~> 0.5.0"}
   ]
 end
 ```
@@ -88,6 +90,87 @@ model
 ], max_tokens: 500)
 |> Enum.each(&IO.write/1)
 ```
+
+## Structured Output (JSON Schema)
+
+Constrain model output to valid JSON matching a schema. Pass `:json_schema` to any generate or chat function — the schema is automatically converted to a GBNF grammar via llama.cpp's built-in converter.
+
+```elixir
+schema = %{
+  "type" => "object",
+  "properties" => %{
+    "name" => %{"type" => "string"},
+    "age" => %{"type" => "integer"},
+    "hobbies" => %{"type" => "array", "items" => %{"type" => "string"}}
+  },
+  "required" => ["name", "age", "hobbies"],
+  "additionalProperties" => false
+}
+
+# Works with generate
+{:ok, json} = LlamaCppEx.generate(model, "Generate a person:",
+  json_schema: schema, temp: 0.0)
+# => "{\"name\": \"Alice\", \"age\": 30, \"hobbies\": [\"reading\", \"hiking\"]}"
+
+# Works with chat
+{:ok, json} = LlamaCppEx.chat(model, [
+  %{role: "user", content: "Generate a person named Bob who is 25."}
+], json_schema: schema, temp: 0.0)
+
+# Works with streaming
+model
+|> LlamaCppEx.stream("Generate a person:", json_schema: schema, temp: 0.0)
+|> Enum.each(&IO.write/1)
+
+# Works with chat completions
+{:ok, completion} = LlamaCppEx.chat_completion(model, [
+  %{role: "user", content: "Generate a person."}
+], json_schema: schema, temp: 0.0)
+```
+
+> **Tip:** Set `"additionalProperties" => false` in your schema to produce a tighter grammar
+> that avoids potential issues with the grammar sampler.
+
+### Manual Grammar Conversion
+
+You can also convert the schema to GBNF manually for more control:
+
+```elixir
+{:ok, gbnf} = LlamaCppEx.Grammar.from_json_schema(schema)
+IO.puts(gbnf)
+# root ::= "{" space name-kv "," space age-kv "," space hobbies-kv "}" space
+# ...
+
+# Use the grammar directly
+{:ok, json} = LlamaCppEx.generate(model, "Generate a person:", grammar: gbnf, temp: 0.0)
+```
+
+### Ecto Schema Integration
+
+Convert Ecto schema modules to JSON Schema automatically (requires `{:ecto, "~> 3.0"}` — optional dependency):
+
+```elixir
+defmodule MyApp.Person do
+  use Ecto.Schema
+
+  embedded_schema do
+    field :name, :string
+    field :age, :integer
+    field :active, :boolean
+    field :tags, {:array, :string}
+  end
+end
+
+# Ecto schema -> JSON Schema -> constrained generation
+schema = LlamaCppEx.Schema.to_json_schema(MyApp.Person)
+# => %{"type" => "object", "properties" => %{"name" => %{"type" => "string"}, ...}, ...}
+
+{:ok, json} = LlamaCppEx.chat(model, [
+  %{role: "user", content: "Generate a person."}
+], json_schema: schema, temp: 0.0)
+```
+
+Supported Ecto types: `:string`, `:integer`, `:float`, `:decimal`, `:boolean`, `:map`, `{:array, inner}`, `:date`, `:utc_datetime`, `:naive_datetime`, and embedded schemas (`embeds_one`/`embeds_many`). Fields `:id`, `:inserted_at`, and `:updated_at` are excluded automatically.
 
 ## Lower-level API
 

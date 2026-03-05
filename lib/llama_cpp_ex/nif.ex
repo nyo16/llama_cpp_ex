@@ -123,4 +123,7 @@ defmodule LlamaCppEx.NIF do
   # Continuous batching
   def batch_eval(_ctx, _entries), do: :erlang.nif_error(:not_loaded)
   def sampler_sample_at(_sampler, _ctx, _idx), do: :erlang.nif_error(:not_loaded)
+
+  # JSON Schema to Grammar
+  def json_schema_to_grammar_nif(_json_str), do: :erlang.nif_error(:not_loaded)
 end
