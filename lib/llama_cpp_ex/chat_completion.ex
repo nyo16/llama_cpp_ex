@@ -16,7 +16,11 @@ defmodule LlamaCppEx.ChatCompletion do
 
   @type choice :: %{
           index: integer(),
-          message: %{role: String.t(), content: String.t()},
+          message: %{
+            role: String.t(),
+            content: String.t(),
+            reasoning_content: String.t() | nil
+          },
           finish_reason: String.t()
         }
 
