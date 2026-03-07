@@ -329,9 +329,15 @@ defmodule LlamaCppEx do
       {texts, finish_reason, completion_tokens} = collect_completion_tokens(ref, timeout)
 
       raw_text = Enum.join(texts)
-      {reasoning_content, content} = Thinking.parse(raw_text)
+      enable_thinking = Keyword.get(chat_opts, :enable_thinking, false)
 
-      reasoning_content = if reasoning_content == "", do: nil, else: reasoning_content
+      {reasoning_content, content} =
+        if enable_thinking do
+          {rc, c} = Thinking.parse(raw_text)
+          {if(rc == "", do: nil, else: rc), c}
+        else
+          {nil, raw_text}
+        end
 
       completion = %ChatCompletion{
         id: "chatcmpl-" <> random_hex(12),
@@ -437,6 +443,8 @@ defmodule LlamaCppEx do
             )
           end)
 
+        enable_thinking = Keyword.get(chat_opts, :enable_thinking, false)
+
         %{
           ref: ref,
           gen_pid: gen_pid,
@@ -445,8 +453,9 @@ defmodule LlamaCppEx do
           created: created,
           model: model_name,
           phase: :first,
+          enable_thinking: enable_thinking,
           thinking_parser:
-            Thinking.stream_parser(thinking: Keyword.get(chat_opts, :enable_thinking, false))
+            if(enable_thinking, do: Thinking.stream_parser(thinking: true), else: nil)
         }
       end,
       fn
@@ -464,33 +473,45 @@ defmodule LlamaCppEx do
         %{phase: :streaming, ref: ref, timeout: timeout} = state ->
           receive do
             {^ref, {:token, _id, text}} ->
-              {events, new_parser} = Thinking.feed(state.thinking_parser, text)
-              state = %{state | thinking_parser: new_parser}
+              if state.enable_thinking do
+                {events, new_parser} = Thinking.feed(state.thinking_parser, text)
+                state = %{state | thinking_parser: new_parser}
 
-              chunks =
-                Enum.map(events, fn
-                  {:thinking, t} ->
-                    %ChatCompletionChunk{
-                      id: state.id,
-                      object: "chat.completion.chunk",
-                      created: state.created,
-                      model: state.model,
-                      choices: [
-                        %{index: 0, delta: %{reasoning_content: t}, finish_reason: nil}
-                      ]
-                    }
+                chunks =
+                  Enum.map(events, fn
+                    {:thinking, t} ->
+                      %ChatCompletionChunk{
+                        id: state.id,
+                        object: "chat.completion.chunk",
+                        created: state.created,
+                        model: state.model,
+                        choices: [
+                          %{index: 0, delta: %{reasoning_content: t}, finish_reason: nil}
+                        ]
+                      }
 
-                  {:content, t} ->
-                    %ChatCompletionChunk{
-                      id: state.id,
-                      object: "chat.completion.chunk",
-                      created: state.created,
-                      model: state.model,
-                      choices: [%{index: 0, delta: %{content: t}, finish_reason: nil}]
-                    }
-                end)
+                    {:content, t} ->
+                      %ChatCompletionChunk{
+                        id: state.id,
+                        object: "chat.completion.chunk",
+                        created: state.created,
+                        model: state.model,
+                        choices: [%{index: 0, delta: %{content: t}, finish_reason: nil}]
+                      }
+                  end)
 
-              {chunks, state}
+                {chunks, state}
+              else
+                chunk = %ChatCompletionChunk{
+                  id: state.id,
+                  object: "chat.completion.chunk",
+                  created: state.created,
+                  model: state.model,
+                  choices: [%{index: 0, delta: %{content: text}, finish_reason: nil}]
+                }
+
+                {[chunk], state}
+              end
 
             {^ref, :eog} ->
               final_chunk = %ChatCompletionChunk{
