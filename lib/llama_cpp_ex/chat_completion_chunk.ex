@@ -15,7 +15,11 @@ defmodule LlamaCppEx.ChatCompletionChunk do
 
   @type chunk_choice :: %{
           index: integer(),
-          delta: %{optional(:role) => String.t(), optional(:content) => String.t()},
+          delta: %{
+            optional(:role) => String.t(),
+            optional(:content) => String.t(),
+            optional(:reasoning_content) => String.t()
+          },
           finish_reason: String.t() | nil
         }
 
