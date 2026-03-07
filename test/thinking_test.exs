@@ -37,6 +37,16 @@ defmodule LlamaCppEx.ThinkingTest do
       input = "<think>line 1\nline 2\nline 3</think>final answer"
       assert {"line 1\nline 2\nline 3", "final answer"} = Thinking.parse(input)
     end
+
+    test "implicit thinking (template already opened <think>)" do
+      assert {"step by step reasoning", "The answer is 42"} =
+               Thinking.parse("step by step reasoning\n</think>\nThe answer is 42")
+    end
+
+    test "implicit thinking with trailing newline in reasoning" do
+      assert {"reasoning", "content"} =
+               Thinking.parse("reasoning\n</think>\ncontent")
+    end
   end
 
   describe "stream_parser/0 + feed/2" do
@@ -135,6 +145,53 @@ defmodule LlamaCppEx.ThinkingTest do
       assert events == [{:thinking, "reasoning"}, {:content, "answer"}]
 
       assert parser.state == :content
+    end
+  end
+
+  describe "stream_parser(thinking: true)" do
+    test "starts in thinking mode — no <think> tag needed" do
+      parser = Thinking.stream_parser(thinking: true)
+      assert parser.state == :thinking
+
+      {events, parser} = Thinking.feed(parser, "reasoning here")
+      assert events == [{:thinking, "reasoning here"}]
+
+      {events, _parser} = Thinking.feed(parser, "</think>the answer")
+      assert events == [{:content, "the answer"}]
+    end
+
+    test "handles </think> split across tokens" do
+      parser = Thinking.stream_parser(thinking: true)
+
+      {events, parser} = Thinking.feed(parser, "step 1</thi")
+      assert events == [{:thinking, "step 1"}]
+
+      {events, _parser} = Thinking.feed(parser, "nk>answer")
+      assert events == [{:content, "answer"}]
+    end
+
+    test "full implicit thinking flow" do
+      tokens = ["Let me ", "think", "...\n", "</", "think", ">\n", "42"]
+      parser = Thinking.stream_parser(thinking: true)
+
+      {all_events, _parser} =
+        Enum.reduce(tokens, {[], parser}, fn token, {acc, p} ->
+          {events, p} = Thinking.feed(p, token)
+          {acc ++ events, p}
+        end)
+
+      thinking_text =
+        all_events
+        |> Enum.filter(&match?({:thinking, _}, &1))
+        |> Enum.map_join(fn {:thinking, t} -> t end)
+
+      content_text =
+        all_events
+        |> Enum.filter(&match?({:content, _}, &1))
+        |> Enum.map_join(fn {:content, t} -> t end)
+
+      assert thinking_text == "Let me think...\n"
+      assert content_text == "\n42"
     end
   end
 end

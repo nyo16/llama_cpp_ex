@@ -445,7 +445,8 @@ defmodule LlamaCppEx do
           created: created,
           model: model_name,
           phase: :first,
-          thinking_parser: Thinking.stream_parser()
+          thinking_parser:
+            Thinking.stream_parser(thinking: Keyword.get(chat_opts, :enable_thinking, false))
         }
       end,
       fn

@@ -16,10 +16,17 @@ defmodule LlamaCppEx.Thinking do
   @doc """
   Splits completed text into `{reasoning_content, content}`.
 
+  Handles both explicit `<think>...</think>` wrapping and the common case where
+  the chat template already opened the `<think>` block (so generated text starts
+  directly with reasoning followed by `</think>`).
+
   ## Examples
 
       iex> LlamaCppEx.Thinking.parse("<think>I need to think</think>The answer is 42")
       {"I need to think", "The answer is 42"}
+
+      iex> LlamaCppEx.Thinking.parse("reasoning here\\n</think>\\nThe answer is 42")
+      {"reasoning here", "The answer is 42"}
 
       iex> LlamaCppEx.Thinking.parse("Just a response")
       {"", "Just a response"}
@@ -32,22 +39,43 @@ defmodule LlamaCppEx.Thinking do
   def parse(text) when is_binary(text) do
     case text do
       <<@think_open, rest::binary>> ->
-        case :binary.match(rest, @think_close) do
-          {pos, @think_close_len} ->
-            reasoning = binary_part(rest, 0, pos)
-
-            content =
-              binary_part(rest, pos + @think_close_len, byte_size(rest) - pos - @think_close_len)
-
-            {reasoning, String.trim_leading(content)}
-
-          :nomatch ->
-            # Unclosed think tag — treat entire content as reasoning
-            {rest, ""}
-        end
+        split_at_close(rest)
 
       _ ->
-        {"", text}
+        # Template may have already opened <think>, so generated text starts
+        # with reasoning directly followed by </think>
+        case :binary.match(text, @think_close) do
+          {pos, @think_close_len} ->
+            reasoning = binary_part(text, 0, pos)
+
+            content =
+              binary_part(
+                text,
+                pos + @think_close_len,
+                byte_size(text) - pos - @think_close_len
+              )
+
+            {String.trim_trailing(reasoning), String.trim_leading(content)}
+
+          :nomatch ->
+            {"", text}
+        end
+    end
+  end
+
+  defp split_at_close(rest) do
+    case :binary.match(rest, @think_close) do
+      {pos, @think_close_len} ->
+        reasoning = binary_part(rest, 0, pos)
+
+        content =
+          binary_part(rest, pos + @think_close_len, byte_size(rest) - pos - @think_close_len)
+
+        {String.trim_trailing(reasoning), String.trim_leading(content)}
+
+      :nomatch ->
+        # Unclosed think tag — treat entire content as reasoning
+        {rest, ""}
     end
   end
 
@@ -55,10 +83,21 @@ defmodule LlamaCppEx.Thinking do
   Creates a new streaming parser state.
 
   Use with `feed/2` to incrementally parse streamed tokens.
+
+  ## Options
+
+    * `:thinking` - When `true`, assumes the template already opened a
+      `<think>` block, so generated text starts in thinking mode. Defaults
+      to `false`.
+
   """
-  @spec stream_parser() :: map()
-  def stream_parser do
-    %{state: :init, buffer: ""}
+  @spec stream_parser(keyword()) :: map()
+  def stream_parser(opts \\ []) do
+    if Keyword.get(opts, :thinking, false) do
+      %{state: :thinking, buffer: ""}
+    else
+      %{state: :init, buffer: ""}
+    end
   end
 
   @doc """
