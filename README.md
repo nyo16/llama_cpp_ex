@@ -227,6 +227,9 @@ Measured on Apple M4 Max (64 GB), Metal backend (`n_gpu_layers: -1`).
 | Model | Quantization | Tokens/sec |
 |-------|-------------|------------|
 | Llama 3.2 3B Instruct | Q4_K_XL | 125.6 |
+| Ministral 3 3B Reasoning | Q4_K_XL | 113.0 |
+| Ministral 3 3B Instruct | Q4_K_XL | 104.3 |
+| GPT-OSS 20B | Q4_K_XL | 79.4 |
 | Qwen3.5-35B-A3B | Q6_K | 56.0 |
 | Qwen3.5-27B | Q4_K_XL | 17.5 |
 
