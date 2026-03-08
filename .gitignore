@@ -26,3 +26,4 @@ llama_cpp_ex-*.tar
 /priv/*.so
 /priv/*.dylib
 /priv/*.dll
+models/

@@ -1,5 +1,32 @@
 # Changelog
 
+## v0.6.0
+
+### Added
+
+- **Qwen 3.5 support** — llama.cpp updated to c5a778891 (35 commits since v0.5.0).
+- **`reasoning_content` in ChatCompletion** — `chat_completion/3` now splits `<think>...</think>` blocks from the response when `enable_thinking: true`. The choice message includes `reasoning_content` (the thinking text) and `content` (the final answer). Returns `nil` when thinking is not enabled or no thinking block is present.
+- **`reasoning_content` in ChatCompletionChunk** — `stream_chat_completion/3` emits chunks with `reasoning_content` in the delta while the model is thinking, then switches to `content` after `</think>`.
+- **`LlamaCppEx.Thinking`** — New module with `parse/1` for one-shot parsing and `stream_parser/1` + `feed/2` for streaming token-boundary-safe parsing of think blocks. Handles the real-world Qwen3/3.5 template behavior where `<think>` is opened by the template itself.
+
+### Changed
+
+- **llama.cpp submodule** — Updated from 7f5ee54 to c5a778891.
+  - ggml: add GATED_DELTA_NET op for Qwen 3.5 hybrid architecture
+  - model: update Qwen 3.5 model type detection
+  - convert: register Qwen 3.5 ForCausalLM for text only
+  - CUDA: use shared mem for ssm_conv, improve performance via fewer synchronizations
+  - Hexagon: add f32 ssm_conv, fp16 binary ops, Flash Attention optimizations
+  - OpenCL: add l2_norm, neg, exp, diag ops
+  - CPU: skip redundant ROPE cache updates, fix data race for debug asserts
+  - quants: add memsets and other fixes for IQ quants
+  - kv-cache: fix M-RoPE checkpoints, checkpoint every n tokens
+  - server: preserve Anthropic thinking blocks in conversion
+
+### Unchanged
+
+- `chat/3` and `stream_chat/3` continue returning raw text (no breaking change).
+
 ## v0.5.0
 
 ### Added

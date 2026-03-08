@@ -28,7 +28,7 @@ Add `llama_cpp_ex` to your list of dependencies in `mix.exs`:
 ```elixir
 def deps do
   [
-    {:llama_cpp_ex, "~> 0.5.0"}
+    {:llama_cpp_ex, "~> 0.6.0"}
   ]
 end
 ```
@@ -220,9 +220,20 @@ Multiple callers are batched into a single forward pass per tick, improving thro
 
 ## Benchmarks
 
-Measured on Apple M4 Max (64 GB) with Qwen3-4B Q4_K_M, Metal backend (`n_gpu_layers: -1`).
+Measured on Apple M4 Max (64 GB), Metal backend (`n_gpu_layers: -1`).
 
-### Single-sequence generation
+### Single-model generation speed
+
+| Model | Quantization | Tokens/sec |
+|-------|-------------|------------|
+| Llama 3.2 3B Instruct | Q4_K_XL | 125.6 |
+| Ministral 3 3B Reasoning | Q4_K_XL | 113.0 |
+| Ministral 3 3B Instruct | Q4_K_XL | 104.3 |
+| GPT-OSS 20B | Q4_K_XL | 79.4 |
+| Qwen3.5-35B-A3B | Q6_K | 56.0 |
+| Qwen3.5-27B | Q4_K_XL | 17.5 |
+
+### Single-sequence generation (Qwen3-4B Q4_K_M)
 
 | Prompt | 32 tokens | 128 tokens |
 |--------|-----------|------------|
@@ -230,7 +241,7 @@ Measured on Apple M4 Max (64 GB) with Qwen3-4B Q4_K_M, Metal backend (`n_gpu_lay
 | medium (100 tok) | 0.36s (2.79 ips) | 1.06s (0.94 ips) |
 | long (500 tok) | 0.65s (1.53 ips) | 1.29s (0.77 ips) |
 
-### Continuous batching throughput
+### Continuous batching throughput (Qwen3-4B Q4_K_M)
 
 ```
 max_tokens: 32, prompt: "short"
