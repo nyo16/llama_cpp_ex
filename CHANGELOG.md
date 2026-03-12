@@ -1,5 +1,25 @@
 # Changelog
 
+## v0.6.1
+
+### Changed
+
+- **llama.cpp submodule** — Updated from c5a778891 to fdb17643d (70 commits).
+  - model: add support for Phi4ForCausalLMV, Nemotron 3 Super, Qwen3VL reranker text
+  - ggml: add NVFP4 quantization type support
+  - llama: chunked fused GDN path, dynamic head_dim and n_rot for SWA
+  - metal: extend mul_mv_ext to BF16/Q2_K/Q3_K, fix q5_k register spill, add upscale, handle command buffer failures gracefully
+  - CUDA/HIP: GDN shared mem for HIP, fix loop unrolling in ssm-conv, display VRAM capacity on init
+  - Vulkan: add SGN and ELU ops, fix data races in coopmat1, skip zero size tensors in copies
+  - SYCL: Flash Attention support for fp32/fp16/Q4/Q5/Q8
+  - WebGPU: add REPEAT op, faster quant matrix operations
+  - KleidiAI: concurrent SME and NEON kernel execution
+  - ggml-cpu: add RVV repack GEMM/GEMV for quantization types
+  - server: kill switch when stuck, fix checkpoints and OAI completion stream index
+  - common: fix --n-cpu-moe/--cpu-moe for fused gate+up models, gracefully handle incomplete output
+  - vendor: update cpp-httplib to 0.37.0, miniaudio to 0.11.25
+  - llama-quant: fail early on missing imatrix, refactor type selection
+
 ## v0.6.0
 
 ### Added
