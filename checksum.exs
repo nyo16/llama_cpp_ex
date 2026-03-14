@@ -1,4 +1,4 @@
 %{
-  "llama_cpp_ex-nif-2.17-aarch64-apple-darwin-0.6.2.tar.gz" => "sha256:489e983afc516fb9ab1471ead6eb193abd98ef8573f279050c6f1fa49e55739f",
-  "llama_cpp_ex-nif-2.17-x86_64-linux-gnu-0.6.2.tar.gz" => "sha256:d0cbd9f2cb6d1ffd483f9209c03962d2d8afb3fd671fef282aba1c4eb1ef1103",
+  "llama_cpp_ex-nif-2.17-aarch64-apple-darwin-0.6.3.tar.gz" => "sha256:d19ce4fed1bfbe97887893a6f21a9c7b396b0130414dd2752afbe56ee0b90d47",
+  "llama_cpp_ex-nif-2.17-x86_64-linux-gnu-0.6.3.tar.gz" => "sha256:923f89a1cc2a2f09ac19facbf165f5ca746b23c587d88f0832cf29a65f18b235",
 }
