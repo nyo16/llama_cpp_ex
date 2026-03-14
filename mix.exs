@@ -115,9 +115,16 @@ defmodule LlamaCppEx.MixProject do
         "docs/adr/003-static-linking.md",
         "docs/adr/004-streaming-via-enif-send.md",
         "docs/adr/005-batching-architecture.md",
-        "docs/adr/006-continuous-batching.md"
+        "docs/adr/006-continuous-batching.md",
+        "examples/basic_generation.exs",
+        "examples/streaming.exs",
+        "examples/chat.exs",
+        "examples/structured_output.exs",
+        "examples/embeddings.exs",
+        "examples/server.exs"
       ],
       groups_for_extras: [
+        Examples: ~r/examples\/.*/,
         "Architecture Decision Records": ~r/docs\/adr\/.*/
       ],
       groups_for_modules: [
