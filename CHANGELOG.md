@@ -1,5 +1,28 @@
 # Changelog
 
+## v0.6.2
+
+### Fixed
+
+- **`Chat.apply_template/3`** — Now accepts string-keyed message maps (`%{"role" => ..., "content" => ...}`) in addition to atom-keyed maps and tuples.
+
+### Changed
+
+- **llama.cpp submodule** — Updated from fdb17643d to 463b6a963 (31 commits).
+  - tools: enable kvu in perplexity for hellaswag, winogrande, multiple-choice (#19954)
+  - graph: remove redundant GDN state transposes (#20443)
+  - llama: fix pooling assertion crash in chunked GDN detection path (#20468), disable graph reuse with pipeline parallelism (#20463)
+  - metal: fix l2 norm scale (#20493), avoid divisions in bin kernel (#20426)
+  - Vulkan: add GATED_DELTA_NET op support (#20334), fix l2_norm epsilon handling (#20350), fix OOB check in flash_attn_mask_opt (#20296), fix ErrorOutOfHostMemory on Intel GPU with --no-mmap (#20059)
+  - OpenCL: add cumsum op (#18981), use larger workgroup size for get_rows (#20316)
+  - HIP: compile debug builds with -O2 to avoid compiler bug (#20392)
+  - ggml-cpu: add RVV vec dot kernels for quantization types (#18859)
+  - server: reset counter related to kill-switch on client error (#20513), auto-select first loaded model for new conversations (#20403)
+  - common/parser: gracefully handle undetected tool parser (#20286), add GigaChatV3/3.1 models support (#19931)
+  - grammar: fix root symbol check (#19761)
+  - vendor: update cpp-httplib to 0.37.1 (#20390)
+  - convert: better mtp check and fix return (#20419)
+
 ## v0.6.1
 
 ### Changed

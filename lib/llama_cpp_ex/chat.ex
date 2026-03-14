@@ -44,6 +44,7 @@ defmodule LlamaCppEx.Chat do
     msg_tuples =
       Enum.map(messages, fn
         %{role: role, content: content} -> {to_string(role), to_string(content)}
+        %{"role" => role, "content" => content} -> {to_string(role), to_string(content)}
         {role, content} -> {to_string(role), to_string(content)}
       end)
 
