@@ -19,8 +19,8 @@ jobs:
         with:
           otp-version: '27.0'
           elixir-version: '1.18'
-      - name: Install cmake
-        run: sudo apt-get update && sudo apt-get install -y cmake
+      - name: Install build dependencies
+        run: sudo apt-get update && sudo apt-get install -y cmake libgomp1
       - run: mix deps.get
       - run: mix compile --warnings-as-errors
         env:

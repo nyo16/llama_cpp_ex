@@ -69,6 +69,10 @@ ifeq ($(UNAME_S),Darwin)
   endif
 else
   LDFLAGS += -lstdc++ -lm -lpthread
+  # ggml-cpu uses OpenMP on Linux when available
+  ifneq ($(shell $(CXX) -fopenmp -E - < /dev/null 2>/dev/null && echo yes),)
+    LDFLAGS += -lgomp
+  endif
 endif
 
 # CPU count for parallel builds
