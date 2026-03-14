@@ -1,6 +1,7 @@
 # LlamaCppEx
 
 [![Precompile NIFs](https://github.com/nyo16/llama_cpp_ex/actions/workflows/precompile.yml/badge.svg)](https://github.com/nyo16/llama_cpp_ex/actions/workflows/precompile.yml)
+[![CI](https://github.com/nyo16/llama_cpp_ex/actions/workflows/ci.yml/badge.svg)](https://github.com/nyo16/llama_cpp_ex/actions/workflows/ci.yml)
 
 Elixir bindings for [llama.cpp](https://github.com/ggml-org/llama.cpp) — run LLMs locally with Metal, CUDA, Vulkan, or CPU acceleration.
 
@@ -339,6 +340,30 @@ Measured on **MacBook Pro, Apple M4 Max (16-core, 64 GB)**, Metal backend, `n_gp
 | **Total time** | 29.77 / 30.10 s | 9.69 / 9.33 s |
 
 The MoE model (35B-A3B) is ~3.2x faster at generation since only 3B parameters are active per token despite the 35B total. Thinking mode only affects the prompt template, not inference speed.
+
+## Examples
+
+The `examples/` directory contains runnable scripts demonstrating key features:
+
+```bash
+# Basic text generation
+LLAMA_MODEL_PATH=/path/to/model.gguf mix run examples/basic_generation.exs
+
+# Streaming tokens to terminal
+LLAMA_MODEL_PATH=/path/to/model.gguf mix run examples/streaming.exs
+
+# Interactive multi-turn chat
+LLAMA_MODEL_PATH=/path/to/model.gguf mix run examples/chat.exs
+
+# JSON Schema constrained generation + Ecto integration
+LLAMA_MODEL_PATH=/path/to/model.gguf mix run examples/structured_output.exs
+
+# Embedding generation and cosine similarity
+LLAMA_EMBEDDING_MODEL_PATH=/path/to/embedding-model.gguf mix run examples/embeddings.exs
+
+# Continuous batching server with concurrent requests
+LLAMA_MODEL_PATH=/path/to/model.gguf mix run examples/server.exs
+```
 
 ## Architecture
 
