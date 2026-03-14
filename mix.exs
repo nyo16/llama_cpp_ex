@@ -77,6 +77,7 @@ defmodule LlamaCppEx.MixProject do
       {:telemetry, "~> 1.0"},
       {:ecto, "~> 3.0", optional: true},
       {:ex_doc, "~> 0.34", only: :dev, runtime: false},
+      {:dialyxir, "~> 1.4", only: :dev, runtime: false},
       {:benchee, "~> 1.0", only: :bench, runtime: false}
     ]
   end
@@ -114,7 +115,8 @@ defmodule LlamaCppEx.MixProject do
         "docs/adr/003-static-linking.md",
         "docs/adr/004-streaming-via-enif-send.md",
         "docs/adr/005-batching-architecture.md",
-        "docs/adr/006-continuous-batching.md"
+        "docs/adr/006-continuous-batching.md",
+        "docs/examples.md"
       ],
       groups_for_extras: [
         "Architecture Decision Records": ~r/docs\/adr\/.*/

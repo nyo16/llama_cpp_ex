@@ -67,8 +67,8 @@ defmodule LlamaCppEx.Schema do
     types = for field <- fields, into: %{}, do: {field, module.__schema__(:type, field)}
 
     # Exclude :id and timestamp fields
-    excluded = MapSet.new([:id, :inserted_at, :updated_at])
-    fields = Enum.reject(fields, &MapSet.member?(excluded, &1))
+    excluded = [:id, :inserted_at, :updated_at]
+    fields = Enum.reject(fields, &(&1 in excluded))
 
     # Exclude virtual fields (they won't appear in __schema__(:fields) anyway,
     # but filter by checking type is not nil)

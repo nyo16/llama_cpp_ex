@@ -1,0 +1,32 @@
+name: CI
+on:
+  push:
+    branches: [master]
+  pull_request:
+    branches: [master]
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+jobs:
+  test:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          submodules: recursive
+      - uses: erlef/setup-beam@v1
+        with:
+          otp-version: '27.0'
+          elixir-version: '1.18'
+      - name: Install build dependencies
+        run: sudo apt-get update && sudo apt-get install -y cmake libgomp1
+      - run: mix deps.get
+      - run: mix compile --warnings-as-errors
+        env:
+          LLAMA_BACKEND: cpu
+      - run: mix format --check-formatted
+      - run: mix test
+        env:
+          LLAMA_BACKEND: cpu
+      - run: mix dialyzer
