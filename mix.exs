@@ -77,6 +77,7 @@ defmodule LlamaCppEx.MixProject do
       {:telemetry, "~> 1.0"},
       {:ecto, "~> 3.0", optional: true},
       {:ex_doc, "~> 0.34", only: :dev, runtime: false},
+      {:dialyxir, "~> 1.4", only: :dev, runtime: false},
       {:benchee, "~> 1.0", only: :bench, runtime: false}
     ]
   end

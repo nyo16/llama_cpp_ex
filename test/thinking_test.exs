@@ -194,4 +194,63 @@ defmodule LlamaCppEx.ThinkingTest do
       assert content_text == "\n42"
     end
   end
+
+  describe "parse/1 edge cases" do
+    test "unicode content in thinking blocks" do
+      input = "<think>考えています 🤔</think>答えは42です"
+      assert {"考えています 🤔", "答えは42です"} = Thinking.parse(input)
+    end
+
+    test "unicode with implicit thinking (template opened <think>)" do
+      input = "Réfléchissons en français\n</think>\nLa réponse est 42"
+      assert {"Réfléchissons en français", "La réponse est 42"} = Thinking.parse(input)
+    end
+
+    test "nested <think> tags — only the first closing tag is matched" do
+      input = "<think>outer <think>inner</think> still thinking</think>content"
+      {reasoning, content} = Thinking.parse(input)
+      assert reasoning == "outer <think>inner"
+      assert content == "still thinking</think>content"
+    end
+
+    test "malformed closing tag is treated as plain text" do
+      input = "<think>reasoning</thin>still thinking</think>answer"
+      {reasoning, content} = Thinking.parse(input)
+      assert reasoning == "reasoning</thin>still thinking"
+      assert content == "answer"
+    end
+
+    test "very long thinking content" do
+      long_reasoning = String.duplicate("step ", 10_000)
+      input = "<think>#{long_reasoning}</think>done"
+      {reasoning, content} = Thinking.parse(input)
+      assert reasoning == String.trim_trailing(long_reasoning)
+      assert content == "done"
+    end
+  end
+
+  describe "feed/2 edge cases" do
+    test "unicode content in streaming" do
+      parser = Thinking.stream_parser()
+
+      {[], parser} = Thinking.feed(parser, "<think>")
+      {events, parser} = Thinking.feed(parser, "日本語で考える")
+      assert events == [{:thinking, "日本語で考える"}]
+
+      {events, _parser} = Thinking.feed(parser, "</think>答え")
+      assert events == [{:content, "答え"}]
+    end
+
+    test "very long streaming content" do
+      parser = Thinking.stream_parser()
+      {[], parser} = Thinking.feed(parser, "<think>")
+
+      long_text = String.duplicate("reasoning ", 5_000)
+      {events, parser} = Thinking.feed(parser, long_text)
+      assert [{:thinking, ^long_text}] = events
+
+      {events, _parser} = Thinking.feed(parser, "</think>done")
+      assert events == [{:content, "done"}]
+    end
+  end
 end

@@ -5,6 +5,8 @@ on:
 
 jobs:
   precompile:
+    env:
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
     strategy:
       matrix:
         include:
@@ -33,7 +35,7 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           submodules: recursive
       - uses: erlef/setup-beam@v1
@@ -58,10 +60,12 @@ jobs:
   checksum:
     needs: precompile
     runs-on: ubuntu-22.04
+    env:
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           ref: master
       - uses: erlef/setup-beam@v1
