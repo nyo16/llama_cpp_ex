@@ -288,7 +288,7 @@ defmodule LlamaCppExTest do
       test "stream with early halt (Enum.take)", %{model: model} do
         chunks =
           model
-          |> LlamaCppEx.stream("The capital of France is", max_tokens: 100, seed: 42)
+          |> LlamaCppEx.stream("Once upon a time", max_tokens: 100, seed: 42)
           |> Enum.take(3)
 
         assert length(chunks) == 3
