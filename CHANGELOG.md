@@ -1,5 +1,27 @@
 # Changelog
 
+## v0.6.4
+
+### Changed
+
+- **llama.cpp submodule** — Updated from 463b6a963 to b6c83aad5 (56 commits).
+  - **model**: Mistral Small 4 support (#20649), Nemotron-H NVFP4 tensors (#20561), Qwen3.5/Qwen3.5MoE NVFP4 tensors (#20506)
+  - **ggml**: OpenVINO backend (#15307), native AVX512-FP16 support for F16 operations (#20529), extend im2col f16 (#1434), guard against sumq2 being 0 in IQ4_NL (#20460)
+  - **CUDA**: GDN shared mem latency hiding (#20537), limit FA stream-k block count (#20586), RDNA4-specific MMVQ for bs=1 decode (#19478), FP32 cuBLAS for V100 to avoid overflows (#19959), fix data race in cpy kernel (#20507), avoid creating CUDA context during device init (#20595)
+  - **metal**: FA specialization for HSK=320, HSV=256 (#20549)
+  - **Vulkan**: fix flash attention dot product precision (#20589), use graphics queue on AMD (#20551)
+  - **HIP**: APU compatibility — soft error handling for hipMemAdviseSetCoarseGrain (#20536)
+  - **SYCL**: fix untransposed GDA recurrent state (#20583), enhance UPSCALE to support all UT cases (#20637)
+  - **OpenCL**: fix l2_norm (#20480)
+  - **server**: support refusal content for Responses API (#20285), fix wait in test_cancel_requests() (#20601), fix model selector locked to first loaded model (#20580)
+  - **tools/cli**: fix disable reasoning (#20606)
+  - **convert**: support mixed-precision ModelOpt NVFP4/FP8 quantization (#20539), support contiguous method on lora tensors (#20489)
+  - **kv-cache**: fix reading llama_kv_cell_ext during state read (#20273)
+  - **common**: fix iterator::end() dereference (#20445)
+  - **vendor**: cpp-httplib 0.37.2 → 0.38.0 (#20484, #20578)
+  - **webui**: model information dialog (#20600), MCP CORS proxy detection (#20167), code preview iframe isolation (#20477)
+  - **hexagon**: Q4_0 and MXFP4 repack fixes (#20527)
+
 ## v0.6.3
 
 ### Added
