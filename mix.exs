@@ -37,7 +37,7 @@ end
 defmodule LlamaCppEx.MixProject do
   use Mix.Project
 
-  @version "0.6.3"
+  @version "0.6.4"
   @source_url "https://github.com/nyo16/llama_cpp_ex"
 
   def project do
@@ -92,6 +92,7 @@ defmodule LlamaCppEx.MixProject do
       licenses: ["Apache-2.0"],
       links: %{
         "GitHub" => @source_url,
+        "Changelog" => "https://hexdocs.pm/llama_cpp_ex/changelog.html",
         "llama.cpp" => "https://github.com/ggml-org/llama.cpp"
       },
       files: ~w(
