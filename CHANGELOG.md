@@ -1,5 +1,25 @@
 # Changelog
 
+## v0.6.5
+
+### Changed
+
+- **llama.cpp submodule** — Updated from b6c83aad5 to 6729d4920 (26 commits).
+  - **model**: add control vector support where missing (#20653)
+  - **ggml**: bump version to 0.9.8 (ggml/1442), restore ggml_type_sizef() to avoid major version bump (ggml/1441)
+  - **ggml-cpu**: fix RVV checks in quants and repacking (#20682), fix unused changemask warning in repack (#20692)
+  - **ggml-blas**: set MKL threads from thread context (#20602)
+  - **Vulkan**: async and event fixes (#20518), disable MMVQ on Intel Windows driver (#20672), allow graphics queue only through env var (#20599)
+  - **HIP**: ignore return of hipMemAdvise (#20696)
+  - **hexagon**: add neg, exp, sigmoid, softplus, cont, repeat ops (#20701)
+  - **kleidiai**: fix MUL_MAT support for batched (3D) inputs (#20620)
+  - **server**: fix ctx checkpoint invalidation (#20671)
+  - **context**: fix graph not resetting when control vector changes (#20381)
+  - **llama**: re-enable manual LoRA adapter free (#19983)
+  - **common**: rework gpt-oss parser (#20393), add `--skip-chat-parsing` to force pure content parser (#20289)
+  - **webui**: fix duplicated messages on q param (#20715), improve tooltip wording for attachment requirements (#20688)
+  - **OpenCL**: no timeout for WaitAny in graph submission to avoid deadlocks on llvm-pipe backends (#20618)
+
 ## v0.6.4
 
 ### Changed
