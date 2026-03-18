@@ -1,5 +1,25 @@
 # Changelog
 
+## v0.6.2
+
+### Changed
+
+- **llama.cpp submodule** — Updated from fdb17643d to 6729d4920 (113 commits).
+  - model: add control vector support where missing, Mistral Small 4 support, Nemotron 3 Nano benchmarks
+  - ggml: bump version to 0.9.8, AVX512-FP16 support, new GATED_DELTA_NET op, native IM2COL F16
+  - CUDA: GDN hide memory latency, limit FA stream-k CUDA blocks, RDNA4 MMVQ table, cuBLAS V100 overflow fix
+  - Vulkan: async/event fixes, GATED_DELTA_NET op support, AMD graphics queue, Intel GPU fixes
+  - Metal: FA specialization HSK=320/HSV=256, fix l2 norm scale
+  - HIP: soft error handling for hipMemAdviseSetCoarseGrain
+  - SYCL: enhance UPSCALE, fix untransposed GDA recurrent state
+  - OpenCL: fix l2_norm, add cumsum op, larger workgroup for get_rows
+  - ggml-cpu: RVV vec dot kernels for quantization, fix RVV checks in quants/repacking
+  - server: ctx checkpoint fix, test_cancel_requests fix, refusal content for Responses API
+  - webui: model info dialog, MCP CORS proxy detection, duplicated messages fix
+  - convert: mixed-precision ModelOpt with NVFP4/FP8, contiguous lora tensors
+  - vendor: update cpp-httplib to 0.38.0
+  - OpenVINO backend added
+
 ## v0.6.1
 
 ### Changed
