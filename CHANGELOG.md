@@ -1,5 +1,26 @@
 # Changelog
 
+## v0.6.6
+
+### Changed
+
+- **llama.cpp submodule** — Updated from 6729d4920 to eac9c6ea8 (47 commits).
+  - **context**: zero output buffer on allocation (#20781)
+  - **model**: assert nextn_predict_layers to prevent underflow (#20783), fix Granite Hybrid type check for 7B.A1B (#20795)
+  - **jinja**: fix heap OOB read in value equality comparison (#20782)
+  - **common/parser**: fix nasty bug causing subtle corruption of generation prompt (#20825), fix out_of_range crash in throw path (#20777), add proper reasoning tag prefill reading (#20424), fix gpt-oss content removal (#20745)
+  - **chat**: handle tool calls with no required args in TAG_WITH_TAGGED format (#20764)
+  - **server**: fix router mode deadlock on child crash and TOCTOU race (#20763), add cached_tokens info to oaicompat responses (#19361), improve mtmd ctx checkpoints (#20726), become source of truth for sampling defaults (#20558)
+  - **vulkan**: change gated_delta_net to shard across subgroup (#20662), dequantize iq4_xs 4 at a time (#20657)
+  - **hip**: avoid compiler bug in RDNA code generation during debug builds on Windows (#20655)
+  - **hexagon**: add Matrix Extensions (HMX) for NPU backend (#20693)
+  - **CANN**: add BF16 support for core operators (#20152), handle in-place ROPE on non-contiguous f32 tensors (#20274), support flash attention for head dim not multiple of 16 (#20031)
+  - **ggml-cpu**: add always_inline to tinyBLAS_PPC accumulator saves (#20791)
+  - **ggml-webgpu**: ops support for qwen3.5 (SET, TRI_SOLVE, SSM_CONV, GATED_DELTA_NET) (#20687), add DIAG/TRI ops (#20664), update RMS_NORM/L2_NORM (#20665)
+  - **vocab**: assert array size of scores and toktypes (#20737)
+  - **convert**: support is_causal hyperparameter (#20746), make NVFP4/MXFP4 say correct type (#20730)
+  - **cmake**: fix build warning when kleidiai is enabled (#20457), guard KleidiAI DOWNLOAD_EXTRACT_TIMESTAMP for cmake < 3.24 (#20767)
+
 ## v0.6.5
 
 ### Changed

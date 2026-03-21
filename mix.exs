@@ -37,7 +37,7 @@ end
 defmodule LlamaCppEx.MixProject do
   use Mix.Project
 
-  @version "0.6.5"
+  @version "0.6.6"
   @source_url "https://github.com/nyo16/llama_cpp_ex"
 
   def project do
@@ -117,7 +117,8 @@ defmodule LlamaCppEx.MixProject do
         "docs/adr/004-streaming-via-enif-send.md",
         "docs/adr/005-batching-architecture.md",
         "docs/adr/006-continuous-batching.md",
-        "docs/examples.md"
+        "docs/examples.md",
+        "docs/release-guide.md"
       ],
       groups_for_extras: [
         "Architecture Decision Records": ~r/docs\/adr\/.*/
