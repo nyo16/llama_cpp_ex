@@ -3,10 +3,13 @@ on:
   push:
     tags: ['v*']
 
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+  ELIXIR_VERSION: "1.18"
+  OTP_VERSION: "27.0"
+
 jobs:
   precompile:
-    env:
-      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
     strategy:
       matrix:
         include:
@@ -60,8 +63,6 @@ jobs:
   checksum:
     needs: precompile
     runs-on: ubuntu-22.04
-    env:
-      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
     permissions:
       contents: write
     steps:
@@ -70,13 +71,86 @@ jobs:
           ref: master
       - uses: erlef/setup-beam@v1
         with:
-          otp-version: '27.0'
-          elixir-version: '1.18'
+          otp-version: ${{ env.OTP_VERSION }}
+          elixir-version: ${{ env.ELIXIR_VERSION }}
       - run: mix deps.get
       - run: mix elixir_make.checksum --all --ignore-unavailable
       - name: Commit checksum.exs
+        env:
+          TAG_NAME: ${{ github.ref_name }}
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add checksum.exs
-          git diff --staged --quiet && echo "No changes" || (git commit -m "Update checksum.exs for ${{ github.ref_name }}" && git push origin master)
+          git diff --staged --quiet && echo "No changes" || (git commit -m "Update checksum.exs for ${TAG_NAME}" && git push origin master)
+
+  test:
+    name: CI Checks
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          submodules: recursive
+
+      - uses: erlef/setup-beam@v1
+        with:
+          otp-version: ${{ env.OTP_VERSION }}
+          elixir-version: ${{ env.ELIXIR_VERSION }}
+
+      - name: Install build dependencies
+        run: sudo apt-get update && sudo apt-get install -y cmake libgomp1
+
+      - name: Cache deps & build
+        uses: actions/cache@v4
+        with:
+          path: |
+            deps
+            _build
+          key: ${{ runner.os }}-mix-${{ env.ELIXIR_VERSION }}-${{ env.OTP_VERSION }}-${{ hashFiles('mix.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-mix-${{ env.ELIXIR_VERSION }}-${{ env.OTP_VERSION }}-
+
+      - run: mix deps.get
+      - run: mix compile --warnings-as-errors
+        env:
+          LLAMA_BACKEND: cpu
+      - run: mix format --check-formatted
+      - run: mix test
+        env:
+          LLAMA_BACKEND: cpu
+      - run: mix dialyzer
+
+  publish:
+    name: Publish to Hex
+    runs-on: ubuntu-22.04
+    needs: [checksum, test]
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: master
+
+      - uses: erlef/setup-beam@v1
+        with:
+          otp-version: ${{ env.OTP_VERSION }}
+          elixir-version: ${{ env.ELIXIR_VERSION }}
+
+      - name: Set version from tag
+        run: |
+          TAG_VERSION="${GITHUB_REF#refs/tags/v}"
+          sed -i "s/@version \".*\"/@version \"${TAG_VERSION}\"/" mix.exs
+          grep '@version' mix.exs
+
+      - run: mix deps.get
+        env:
+          MIX_ENV: dev
+      - run: mix compile
+        env:
+          MIX_ENV: dev
+
+      - name: Publish to Hex
+        run: mix hex.publish --yes
+        env:
+          MIX_ENV: dev
+          HEX_API_KEY: ${{ secrets.HEX_API_KEY }}
