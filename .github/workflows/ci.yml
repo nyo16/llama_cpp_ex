@@ -17,7 +17,7 @@ jobs:
     name: Compile & Warnings
     runs-on: ubuntu-22.04
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v6
         with:
           submodules: recursive
 
@@ -30,7 +30,7 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y cmake libgomp1
 
       - name: Cache deps & build
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: |
             deps
@@ -48,7 +48,7 @@ jobs:
     name: Formatting
     runs-on: ubuntu-22.04
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v6
 
       - uses: erlef/setup-beam@v1
         with:
@@ -56,7 +56,7 @@ jobs:
           elixir-version: ${{ env.ELIXIR_VERSION }}
 
       - name: Cache deps
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: deps
           key: ${{ runner.os }}-deps-${{ env.ELIXIR_VERSION }}-${{ env.OTP_VERSION }}-${{ hashFiles('mix.lock') }}
@@ -71,7 +71,7 @@ jobs:
     runs-on: ubuntu-22.04
     needs: [compile]
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v6
         with:
           submodules: recursive
 
@@ -84,7 +84,7 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y cmake libgomp1
 
       - name: Cache deps & build
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: |
             deps
@@ -103,7 +103,7 @@ jobs:
     runs-on: ubuntu-22.04
     needs: [compile]
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v6
         with:
           submodules: recursive
 
@@ -116,7 +116,7 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y cmake libgomp1
 
       - name: Cache deps & build
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: |
             deps
@@ -126,7 +126,7 @@ jobs:
             ${{ runner.os }}-mix-${{ env.ELIXIR_VERSION }}-${{ env.OTP_VERSION }}-
 
       - name: Cache PLTs
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: priv/plts
           key: ${{ runner.os }}-plt-${{ env.ELIXIR_VERSION }}-${{ env.OTP_VERSION }}-${{ hashFiles('mix.lock') }}
