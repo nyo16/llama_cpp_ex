@@ -1,5 +1,26 @@
 # Changelog
 
+## v0.6.7
+
+### Changed
+
+- **llama.cpp submodule** — Updated from eac9c6ea8 to 1772701f9 (30 commits).
+  - **rpc**: RCE patch (#20908), prevent division by zero in deserialize_tensor (#20712)
+  - **memory**: fix seq_id bounds in llama_memory_recurrent::state_read_meta() (#20887)
+  - **server**: use httplib dynamic threads (#20817), allow router to report child instances sleep status (#20849), fix Host header (#20843)
+  - **metal**: add CONV_3D (#19927)
+  - **common/autoparser**: detect reasoning markers when enable_thinking changes system prompt (#20859)
+  - **common/grammar**: fix grammar parsing issues to prevent stack overflow and hangs (#18604)
+  - **context**: use n_embd_out for pooled embedding extraction (#20840)
+  - **jinja**: refactor token advancement (#20864)
+  - **CUDA**: fix BF16 FA compilation (#20865), native bf16 flash attention for vec kernel (#20525), increase output elements per-thread block for small K-dimension (#20635)
+  - **CANN**: add RoPE cache preload before ACL graph capture (#20747)
+  - **opencl**: add q6_K gemm and gemv kernels for Adreno (#20089), add flattened Q4_K mv and general Q4_K mm (#20773)
+  - **openvino**: explicit memset in buffer_context allocation (#20857)
+  - **mtmd**: add dynamic high-resolution image preprocessing for InternVL model (#20847), fix LightOnOCR image preprocessing (#20877)
+  - **ggml**: support bf16 and quantized type (#20803)
+  - **webui**: improve chat form positioning (#20901), fix --webui-config-file settings not applied on load (#20823)
+
 ## v0.6.6
 
 ### Changed
