@@ -1,5 +1,18 @@
 # Changelog
 
+## v0.6.8
+
+### Changed
+
+- **llama.cpp submodule** — Updated from 1772701f9 to 9f102a140 (15 commits).
+  - **models**: move the token embedding norms to the first layer (#20943)
+  - **ggml-backend**: re-enable graph reuse with pipeline parallelism (#20927)
+  - **metal**: add FLOOR, CEIL, ROUND, TRUNC unary ops (#20930), add FA instantiations for HSK=512, HSV=512 (#20902)
+  - **common**: add standard Hugging Face cache support (#20775), add a WARNING for HF cache migration (#20935), fix get_gguf_split_info (#20946), replace wrap_for_generation with a prefix convenience function (#20912)
+  - **hexagon**: general DMA and Binary Op fixes for large strides (#20918)
+  - **llama-fit**: fix regex pattern for gate_up tensors (#20910)
+  - **vendor**: update cpp-httplib to 0.39.0 (#20933)
+
 ## v0.6.7
 
 ### Changed
