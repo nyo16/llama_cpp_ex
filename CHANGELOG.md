@@ -1,5 +1,21 @@
 # Changelog
 
+## v0.6.9
+
+### Changed
+
+- **llama.cpp submodule** — Updated from 9f102a140 to 1743d9805 (38 commits).
+  - **model**: F2LLM-v2 support, allow causal_attn and pooling_type on all architectures (#20973)
+  - **convert**: register Qwen3Model architecture (#20967), support Qwen3.5/Qwen3.5 Moe NVFP4 and add input scales (#20505), add RuGPT3XL support (#21011)
+  - **ggml-cuda**: add NVFP4 dp4a kernel (#20644), support F32 kernel type for CONV_TRANSPOSE_2D (#17094)
+  - **hip**: use fnuz fp8 for conversion on CDNA3 (#21040)
+  - **opencl**: allow large buffer for Adreno (#20997)
+  - **jinja**: fix macro with kwargs (#20960)
+  - **common**: make LLAMA_CACHE the one cache for everything (#21009), fix split model migration (#21019), fix verbosity setup (#20989), add getpwuid fallback for HF cache (#21035), filter out imatrix when finding models (#21023)
+  - **llama**: fix llama-model-saver (#20503)
+  - **mtmd**: add DeepSeekOCR support (#17400), refactor image preprocessing (#21031), fix quant and im2col ops on Metal for deepseek-ocr (#21027)
+  - **imatrix**: fix crash with --show-statistics and zero counts (#19532)
+
 ## v0.6.8
 
 ### Changed
