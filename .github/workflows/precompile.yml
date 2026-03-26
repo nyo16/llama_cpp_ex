@@ -56,9 +56,13 @@ jobs:
           mix elixir_make.precompile
         env:
           LLAMA_BACKEND: ${{ matrix.backend }}
-      - uses: softprops/action-gh-release@v2
-        with:
-          files: cache/*.tar.gz
+      - name: Upload release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG_NAME: ${{ github.ref_name }}
+        run: |
+          gh release create "$TAG_NAME" --generate-notes cache/*.tar.gz || \
+          gh release upload "$TAG_NAME" cache/*.tar.gz --clobber
 
   checksum:
     needs: precompile
