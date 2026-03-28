@@ -1,5 +1,17 @@
 # Changelog
 
+## v0.6.10
+
+### Changed
+
+- **llama.cpp submodule** — Updated from 5c1a7b835 to 82b703f8b (7 commits).
+  - **vendor**: update cpp-httplib to 0.40.0 (#21100)
+  - **vulkan**: add noncontiguous GLU support (#21081)
+  - **common/parser**: fix reasoning whitespace bugs + extra parser tests (#21085)
+  - **cli**: add /glob command (#21084)
+  - **webui**: conversation forking + branching improvements (#21021)
+  - **docker**: fix and enable ARM64 image build (#20929)
+
 ## v0.6.9
 
 ### Changed
