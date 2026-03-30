@@ -1,5 +1,23 @@
 # Changelog
 
+## v0.6.11
+
+### Changed
+
+- **llama.cpp submodule** — Updated from 82b703f8b to 08f21453a (21 commits).
+  - **opencl**: add q4_K gemm and gemv kernels for Adreno (#20919)
+  - **CUDA**: fix CUB's argsort when nrows % block_size == 0 (#21181), optimize MOE GEMV kernel for BS > 1 (#20905)
+  - **jinja**: handle empty expressions correctly (#20913)
+  - **common/parser**: fix handling of tool definition with missing properties key (#21128), add reasoning_format = none support to gpt-oss (#21094)
+  - **common/json-schema**: fix non-capturing groups in pattern converter (#21124)
+  - **common**: add character class support to glob_match (#21111)
+  - **server**: wrap headers for mcp proxy (#21072), fix processing of multiple back-to-back mtmd chunks (#21107)
+  - **model**: add missing ROPE_FACTORS_LONG/SHORT for MiniCPM (#21150)
+  - **llama-model-loader**: print warning when using overrides with mmap (#20978)
+  - **hexagon**: dma optimizations (#21137)
+  - **SYCL**: enhance build script to use half cores to avoid OS hang (#21093)
+  - **rpc**: fix misleading error log (#21184)
+
 ## v0.6.10
 
 ### Changed
