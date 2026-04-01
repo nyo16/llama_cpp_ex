@@ -1,5 +1,26 @@
 # Changelog
 
+## v0.6.12
+
+### Changed
+
+- **llama.cpp submodule** — Updated from 08f21453a to 95a6ebabb (37 commits).
+  - **CUDA**: add FA support for head dim 512 (#20998), fix FA kernel selection logic (#21271), add generic NVFP4 MMQ kernel (#21074), fix kernel selection for mmvq mmid kernel (#21238)
+  - **opencl**: fix leak in Adreno q8_0 path (#21212)
+  - **ggml**: bump to 0.9.10 (ggml/1454), fix RWKV ops thread assignment (#21226)
+  - **ggml-cpu**: fix fallback for RVV kernels without zvfh (#21157)
+  - **ggml-webgpu**: quantized buffers to u32 + wider browser/device support (#21046), port AOT operators to JIT (#20728)
+  - **kleidiai**: add CPU feature detection to CI run script (#20394)
+  - **hexagon**: improve RMS_NORM and DIV accuracy (#21251)
+  - **SYCL**: support nvfp4 in mul_mat (#21227), enhance fattn perf (#21185)
+  - **CANN**: fix multi-thread set_tensor race conditions (#20151)
+  - **memory**: respect unified KV cache in hybrid memory for eval tasks (#21224)
+  - **llama**: rotate activations for better quantization (#21038), refactor llama_model_quantize_params to pure C interface (#20346)
+  - **common**: gpt-oss handle builtin/unsolicited tool calls (#21213), cleanup logs and modernize progress bar (#21215), disable backend sampling if reasoning budget enabled (#21209), add bounds check to prevent segfault on failed model load (#21082), move up common_init() and fix Windows UTF-8 logs (#21176)
+  - **server**: bypass API key validation for WebUI static assets (#21269), no more gzip compression for webui (#21073), cleanup dual representation to openai-compat (#21090)
+  - **fix**: tool call parsing for LFM2/LFM2.5 (#21242), correct misspellings (#21217), use lower-case proxy headers (#21235), include API key in CORS proxy for MCP (#21193)
+  - **vendor**: update BoringSSL to 0.20260327.0 (#21211)
+
 ## v0.6.11
 
 ### Changed
