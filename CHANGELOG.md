@@ -1,5 +1,27 @@
 # Changelog
 
+## v0.6.13
+
+### Changed
+
+- **llama.cpp submodule** — Updated from 95a6ebabb to 50e0ad08f (32 commits).
+  - **server**: save and clear idle slots on new task (`--clear-idle`) (#20993)
+  - **common/parser**: fix call ID detection (Mistral parser mostly) + atomicity for tag-json parsers (#21230)
+  - **common**: fix tool call type detection for nullable and enum schemas (#21327), add commentary rules for gpt-oss-20b (#21286)
+  - **chat**: avoid including json in chat.h (#21306), add Granite 4.0 chat template (#20804), Gemma4 tool response support
+  - **jinja**: coerce input for string-specific filters (#21370)
+  - **vocab**: fix Gemma4 tokenizer (#21343)
+  - **ggml**: bump to 0.9.11 (ggml/1456)
+  - **ggml-webgpu**: add vectorized flash attention (#20709)
+  - **ggml-zendnn**: add MUL_MAT_ID op support for MoE models (#21315)
+  - **rpc**: reuse compute graph buffers (#21299)
+  - **kv-cache**: do not quantize SWA KV cache (#21277)
+  - **SYCL**: fix llama_kv_cache hang when kv_cache is huge: 5GB (#21283)
+  - **hexagon**: add cumsum op support (#21246)
+  - **model/mtmd**: fix gguf conversion for audio/vision mmproj (#21309)
+  - **tests**: add unit test coverage for llama_tensor_get_type (#20112), allow exporting graph ops from HF file without downloading weights (#21182)
+  - **fix**: remove stale assert (#21369), fix gemma 4 template (#21326)
+
 ## v0.6.12
 
 ### Changed
