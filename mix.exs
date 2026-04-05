@@ -119,7 +119,10 @@ defmodule LlamaCppEx.MixProject do
         "docs/adr/004-streaming-via-enif-send.md",
         "docs/adr/005-batching-architecture.md",
         "docs/adr/006-continuous-batching.md",
+        "docs/adr/007-prefix-caching.md",
+        "docs/adr/008-batching-strategies.md",
         "docs/examples.md",
+        "docs/performance.md",
         "docs/release-guide.md"
       ],
       groups_for_extras: [
@@ -136,7 +139,14 @@ defmodule LlamaCppEx.MixProject do
           LlamaCppEx.Embedding,
           LlamaCppEx.Grammar,
           LlamaCppEx.Schema,
-          LlamaCppEx.Server
+          LlamaCppEx.Server,
+          LlamaCppEx.Hub
+        ],
+        "Batching Strategies": [
+          LlamaCppEx.Server.BatchStrategy,
+          LlamaCppEx.Server.Strategy.DecodeMaximal,
+          LlamaCppEx.Server.Strategy.PrefillPriority,
+          LlamaCppEx.Server.Strategy.Balanced
         ],
         Internal: [LlamaCppEx.NIF]
       ]

@@ -10,6 +10,7 @@ Built with C++ NIFs using [fine](https://github.com/elixir-nx/fine) for ergonomi
 ## Features
 
 - Load and run GGUF models directly from Elixir
+- **HuggingFace Hub integration** — search, list, and download GGUF models
 - GPU acceleration: Metal (macOS), CUDA (NVIDIA), Vulkan, or CPU
 - Streaming token generation via lazy `Stream`
 - Jinja chat templates with `enable_thinking` support (Qwen3, Qwen3.5, etc.)
@@ -20,6 +21,9 @@ Built with C++ NIFs using [fine](https://github.com/elixir-nx/fine) for ergonomi
 - Structured output via JSON Schema (auto-converted to GBNF grammar)
 - Optional Ecto schema to JSON Schema conversion
 - Continuous batching server for concurrent inference
+- **Prefix caching** — same-slot KV cache reuse for multi-turn chat (1.23x faster)
+- **Pluggable batching strategies** — DecodeMaximal, PrefillPriority, Balanced
+- **Pre-tokenized API** — tokenize outside the GenServer for lower contention
 - Telemetry integration for observability
 
 ## Installation
@@ -91,6 +95,33 @@ model
 ], max_tokens: 500)
 |> Enum.each(&IO.write/1)
 ```
+
+## HuggingFace Hub
+
+Download GGUF models directly from HuggingFace Hub. Requires the optional `:req` dependency:
+
+```elixir
+{:req, "~> 0.5"}
+```
+
+```elixir
+# Search for GGUF models
+{:ok, models} = LlamaCppEx.Hub.search("qwen3 gguf", limit: 5)
+
+# List GGUF files in a repository
+{:ok, files} = LlamaCppEx.Hub.list_gguf_files("Qwen/Qwen3-0.6B-GGUF")
+
+# Download (cached locally in ~/.cache/llama_cpp_ex/models/)
+{:ok, path} = LlamaCppEx.Hub.download("Qwen/Qwen3-0.6B-GGUF", "Qwen3-0.6B-Q8_0.gguf")
+
+# Or download + load in one step
+{:ok, model} = LlamaCppEx.load_model_from_hub(
+  "Qwen/Qwen3-0.6B-GGUF", "Qwen3-0.6B-Q8_0.gguf",
+  n_gpu_layers: -1
+)
+```
+
+For private/gated models, set `HF_TOKEN` or pass `token: "hf_..."`. Set `LLAMA_OFFLINE=1` for offline-only cached access.
 
 ## Structured Output (JSON Schema)
 
@@ -218,6 +249,47 @@ LlamaCppEx.Server.stream(server, "Tell me a story", max_tokens: 200)
 ```
 
 Multiple callers are batched into a single forward pass per tick, improving throughput under load.
+
+### Prefix Caching
+
+The server caches KV state between requests on the same slot. Multi-turn chat benefits automatically — the system prompt and prior turns aren't recomputed:
+
+```elixir
+{:ok, server} = LlamaCppEx.Server.start_link(
+  model_path: "model.gguf",
+  n_parallel: 4,
+  cache_prompt: true  # default
+)
+```
+
+Benchmark: **1.23x faster** for multi-turn conversations (487ms vs 597ms per 4-turn exchange).
+
+### Batching Strategies
+
+Choose how the token budget is split between generation and prompt processing:
+
+```elixir
+# Default: generation latency optimized
+batch_strategy: LlamaCppEx.Server.Strategy.DecodeMaximal
+
+# Throughput optimized (batch processing)
+batch_strategy: LlamaCppEx.Server.Strategy.PrefillPriority
+
+# Fair split (mixed workloads)
+batch_strategy: LlamaCppEx.Server.Strategy.Balanced
+```
+
+### Pre-Tokenized API
+
+Tokenize outside the GenServer to reduce contention under concurrent load:
+
+```elixir
+model = LlamaCppEx.Server.get_model(server)
+{:ok, tokens} = LlamaCppEx.Tokenizer.encode(model, prompt)
+{:ok, text} = LlamaCppEx.Server.generate_tokens(server, tokens, max_tokens: 100)
+```
+
+See [Performance Guide](docs/performance.md) for detailed tuning advice.
 
 ## Benchmarks
 
