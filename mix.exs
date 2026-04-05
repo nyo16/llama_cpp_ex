@@ -56,7 +56,7 @@ defmodule LlamaCppEx.MixProject do
       make_precompiler_filename: "llama_cpp_ex_nif",
       make_precompiler_priv_paths: ["llama_cpp_ex_nif.so"],
       make_precompiler_nif_versions: [versions: ["2.17", "2.18"]],
-      make_force_build: System.get_env("LLAMA_BACKEND") in ["cuda", "vulkan"],
+      make_force_build: System.get_env("LLAMA_BACKEND") != nil,
       description: description(),
       package: package(),
       name: "LlamaCppEx",
