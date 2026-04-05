@@ -1,6 +1,6 @@
 # Performance Guide
 
-This guide covers server tuning, prefix caching, batching strategies, and optimization patterns for llama_cpp_ex.
+This guide covers llama.cpp optimization parameters, server tuning, prefix caching, batching strategies, and optimization patterns for llama_cpp_ex.
 
 ## Server Configuration
 
@@ -14,6 +14,13 @@ The `LlamaCppEx.Server` manages a pool of concurrent inference slots with contin
 | `chunk_size` | 512 | Maximum prefill tokens per slot per tick |
 | `cache_prompt` | false | Enable same-slot KV cache reuse |
 | `batch_strategy` | DecodeMaximal | Batch building strategy module |
+| `type_k` | `:f16` | KV cache K quantization type |
+| `type_v` | `:f16` | KV cache V quantization type |
+| `flash_attn` | `:auto` | Flash Attention mode |
+| `offload_kqv` | `true` | Offload KQV ops to GPU |
+| `op_offload` | `true` | Offload host tensor ops to device |
+
+All options are also available on `LlamaCppEx.Context.create/2` and pass through from `LlamaCppEx.generate/3`, `LlamaCppEx.chat/3`, etc.
 
 ### Context Size (`n_ctx`)
 
@@ -42,6 +49,271 @@ Controls how many prompt tokens are processed per slot per tick during prefill. 
 - **Default (512)**: Good balance for interactive use
 - **Larger (1024–2048)**: Faster prefill, but may stall generation for other slots
 - **Smaller (128–256)**: Smoother generation at the cost of slower prefill
+
+## KV Cache Quantization
+
+By default, the KV cache uses F16 (half-precision float). You can quantize it to reduce memory usage by 2-4x, allowing larger context windows or more concurrent slots with the same hardware.
+
+### Available Types
+
+| Type | Memory vs F16 | Quality | Use Case |
+|---|---|---|---|
+| `:f32` | 2x more | Highest | Debugging, reference |
+| `:f16` | Baseline | Excellent | Default — recommended for most use |
+| `:bf16` | Same as F16 | Excellent | BFloat16 hardware support |
+| `:q8_0` | **2x less** | Near-lossless | **Recommended** — best memory/quality tradeoff |
+| `:q5_1` | ~3x less | Good | Aggressive savings with acceptable quality |
+| `:q5_0` | ~3x less | Good | Slightly less quality than q5_1 |
+| `:q4_1` | **4x less** | Acceptable | Maximum context length |
+| `:q4_0` | **4x less** | Lower | Only when memory is critical |
+
+### Usage
+
+```elixir
+# Standalone context — Q8_0 (recommended for most users)
+{:ok, ctx} = LlamaCppEx.Context.create(model,
+  n_ctx: 32768,
+  type_k: :q8_0,
+  type_v: :q8_0
+)
+
+# With the Server
+{:ok, server} = LlamaCppEx.Server.start_link(
+  model_path: "model.gguf",
+  n_parallel: 8,
+  n_ctx: 32768,
+  type_k: :q8_0,
+  type_v: :q8_0
+)
+
+# High-level API
+{:ok, text} = LlamaCppEx.generate(model, "Hello",
+  max_tokens: 256,
+  type_k: :q8_0,
+  type_v: :q8_0
+)
+
+# Aggressive — Q4_0 for maximum context
+{:ok, ctx} = LlamaCppEx.Context.create(model,
+  n_ctx: 131072,
+  type_k: :q4_0,
+  type_v: :q4_0
+)
+```
+
+### Quality Validation
+
+We tested Q8_0 against F16 with 10 deterministic prompts (temp: 0.0) covering arithmetic, factual recall, sequence completion, and more. **All 10 produced bit-for-bit identical output.** See `test/kv_quantization_test.exs` for the full regression suite.
+
+| Test Case | F16 vs Q8_0 |
+|---|---|
+| Arithmetic (2+2) | IDENTICAL |
+| Counting (1-5) | IDENTICAL |
+| Capital city (Paris) | IDENTICAL |
+| Largest ocean (Pacific) | IDENTICAL |
+| Opposite (hot→cold) | IDENTICAL |
+| Sequence (2,4,6,8→10) | IDENTICAL |
+| Color (sky→blue) | IDENTICAL |
+| Continent (Japan→Asia) | IDENTICAL |
+| Multiplication (10×5) | IDENTICAL |
+| Chemistry (H2O) | IDENTICAL |
+
+Run the regression tests yourself:
+
+```bash
+LLAMA_MODEL_PATH=model.gguf mix test test/kv_quantization_test.exs --include slow
+```
+
+### When to Use Each Type
+
+- **Interactive chat**: `:q8_0` — saves memory with no perceptible quality loss
+- **Long document processing**: `:q8_0` or `:q5_1` — fit more context
+- **Many concurrent users**: `:q8_0` — double the slots with same memory
+- **Research / precision-critical**: `:f16` (default) — maximum precision
+- **Maximum context length**: `:q4_0` — 4x memory savings, test quality for your use case
+
+## Flash Attention
+
+Flash Attention computes attention more efficiently, using less memory and running faster, especially for long sequences. llama.cpp enables it automatically when supported.
+
+### Usage
+
+```elixir
+# Auto (default) — llama.cpp decides based on hardware
+{:ok, ctx} = LlamaCppEx.Context.create(model, flash_attn: :auto)
+
+# Force enable — error if hardware doesn't support it
+{:ok, ctx} = LlamaCppEx.Context.create(model, flash_attn: :enabled)
+
+# Force disable — useful for debugging or comparing performance
+{:ok, ctx} = LlamaCppEx.Context.create(model, flash_attn: :disabled)
+
+# With Server
+{:ok, server} = LlamaCppEx.Server.start_link(
+  model_path: "model.gguf",
+  flash_attn: :enabled
+)
+
+# With high-level API
+{:ok, text} = LlamaCppEx.generate(model, "Hello",
+  max_tokens: 256,
+  flash_attn: :enabled
+)
+```
+
+### When to Use
+
+- `:auto` (default) — let llama.cpp decide. Works well in most cases.
+- `:enabled` — force on when you know your hardware supports it (Metal on Apple Silicon, CUDA compute capability 7.0+). Can improve prefill speed significantly.
+- `:disabled` — for debugging if you suspect flash attention is causing issues, or for benchmarking the difference.
+
+## GPU Offload Control
+
+Two flags control how operations are distributed between CPU and GPU:
+
+```elixir
+{:ok, ctx} = LlamaCppEx.Context.create(model,
+  offload_kqv: true,   # Offload KQV attention ops + KV cache to GPU (default: true)
+  op_offload: true      # Offload host tensor operations to device (default: true)
+)
+```
+
+- **`offload_kqv: false`** — keep KQV operations on CPU. Useful when GPU memory is tight and you'd rather use it for model weights.
+- **`op_offload: false`** — disable general operation offloading. Rarely needed.
+
+For most users, the defaults (`true` for both) are optimal.
+
+## RoPE Context Extension
+
+Extend the model's context window beyond its training length using Rotary Position Embedding (RoPE) scaling.
+
+### Linear Scaling
+
+Simple frequency scaling. Works well for moderate extensions (2-4x):
+
+```elixir
+# Extend 4K training context to 16K
+{:ok, ctx} = LlamaCppEx.Context.create(model,
+  n_ctx: 16384,
+  rope_scaling_type: :linear,
+  rope_freq_scale: 0.25  # 4x extension (1/4 = 0.25)
+)
+```
+
+### YaRN Scaling
+
+Better quality for larger extensions. Recommended for 4x+ extensions:
+
+```elixir
+# Extend to 32K with YaRN
+{:ok, ctx} = LlamaCppEx.Context.create(model,
+  n_ctx: 32768,
+  rope_scaling_type: :yarn,
+  rope_freq_base: 1_000_000.0
+)
+
+# Full YaRN parameter control
+{:ok, ctx} = LlamaCppEx.Context.create(model,
+  n_ctx: 65536,
+  rope_scaling_type: :yarn,
+  yarn_ext_factor: 1.0,
+  yarn_attn_factor: 1.0,
+  yarn_beta_fast: 32.0,
+  yarn_beta_slow: 1.0,
+  yarn_orig_ctx: 4096
+)
+```
+
+### LongRoPE
+
+For models trained with LongRoPE (some newer models):
+
+```elixir
+{:ok, ctx} = LlamaCppEx.Context.create(model,
+  n_ctx: 131072,
+  rope_scaling_type: :longrope
+)
+```
+
+### Custom Frequency Base
+
+Override the RoPE base frequency directly. Some models use high base frequencies (e.g., 500,000 or 1,000,000) for long context:
+
+```elixir
+{:ok, ctx} = LlamaCppEx.Context.create(model,
+  n_ctx: 32768,
+  rope_freq_base: 500_000.0  # Override model's default
+)
+```
+
+### Note
+
+Context extension always involves a quality tradeoff. The model was trained on a specific context length, and extending beyond it degrades output quality progressively. Test with your specific model and use case. Many modern models (Qwen3, Llama 3.1+) already support long contexts natively and don't need RoPE scaling.
+
+## Attention Type
+
+Control whether the model uses causal or non-causal attention. This primarily matters for embedding models:
+
+```elixir
+# For embedding models — non-causal attention gives better embeddings
+{:ok, ctx} = LlamaCppEx.Context.create(model,
+  embeddings: true,
+  attention_type: :non_causal
+)
+
+# For text generation — causal (default, model decides)
+{:ok, ctx} = LlamaCppEx.Context.create(model,
+  attention_type: :causal
+)
+```
+
+## Model Loading Options
+
+Additional options when loading models:
+
+```elixir
+{:ok, model} = LlamaCppEx.load_model("model.gguf",
+  n_gpu_layers: -1,       # Offload all layers to GPU
+  use_mmap: true,          # Memory-map file (default, faster loading)
+  use_mlock: true,         # Pin in RAM (prevent swapping)
+  use_direct_io: false,    # Bypass page cache
+  check_tensors: true      # Validate tensor data (debugging)
+)
+```
+
+## Complete Optimization Example
+
+Here's a production-ready server configuration combining multiple optimizations:
+
+```elixir
+{:ok, server} = LlamaCppEx.Server.start_link(
+  model_path: "model.gguf",
+  n_gpu_layers: -1,
+
+  # Concurrency
+  n_parallel: 8,
+  n_ctx: 32768,
+
+  # KV cache quantization — 2x memory savings
+  type_k: :q8_0,
+  type_v: :q8_0,
+
+  # Flash attention — faster prefill
+  flash_attn: :enabled,
+
+  # Prefix caching — skip redundant prefill for multi-turn chat
+  cache_prompt: true,
+
+  # Strategy — latency-optimized for interactive use
+  batch_strategy: LlamaCppEx.Server.Strategy.DecodeMaximal,
+
+  # Sampling
+  temp: 0.7,
+  top_p: 0.9
+)
+```
+
+This gives you: 8 concurrent users, 4K tokens per user, quantized KV cache, flash attention, and prefix caching — all working together.
 
 ## Prefix Caching
 
