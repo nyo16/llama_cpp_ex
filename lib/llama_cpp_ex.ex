@@ -40,6 +40,29 @@ defmodule LlamaCppEx do
     Thinking
   }
 
+  @context_opt_keys [
+    :n_threads,
+    :n_threads_batch,
+    :n_batch,
+    :n_ubatch,
+    :type_k,
+    :type_v,
+    :flash_attn,
+    :offload_kqv,
+    :op_offload,
+    :rope_scaling_type,
+    :rope_freq_base,
+    :rope_freq_scale,
+    :yarn_ext_factor,
+    :yarn_attn_factor,
+    :yarn_beta_fast,
+    :yarn_beta_slow,
+    :yarn_orig_ctx,
+    :attention_type,
+    :no_perf,
+    :swa_full
+  ]
+
   @doc """
   Initializes the llama.cpp backend. Call once at application start.
   """
@@ -56,6 +79,40 @@ defmodule LlamaCppEx do
   @spec load_model(String.t(), keyword()) :: {:ok, Model.t()} | {:error, String.t()}
   def load_model(path, opts \\ []) do
     Model.load(path, opts)
+  end
+
+  @doc """
+  Downloads a GGUF model from HuggingFace Hub and loads it.
+
+  Requires the optional `:req` dependency.
+
+  ## Examples
+
+      :ok = LlamaCppEx.init()
+      {:ok, model} = LlamaCppEx.load_model_from_hub(
+        "Qwen/Qwen3-4B-GGUF",
+        "qwen3-4b-q4_k_m.gguf",
+        n_gpu_layers: -1
+      )
+
+  ## Options
+
+  Accepts all options from `load_model/2` plus:
+
+    * `:cache_dir` - Local cache directory for downloaded models.
+    * `:token` - HuggingFace API token for private repos.
+    * `:progress` - Download progress callback.
+    * `:revision` - Git revision (branch, tag, commit). Defaults to `"main"`.
+
+  """
+  @spec load_model_from_hub(String.t(), String.t(), keyword()) ::
+          {:ok, Model.t()} | {:error, String.t()}
+  def load_model_from_hub(repo_id, filename, opts \\ []) do
+    {hub_opts, model_opts} = Keyword.split(opts, [:cache_dir, :token, :progress, :revision])
+
+    with {:ok, path} <- LlamaCppEx.Hub.download(repo_id, filename, hub_opts) do
+      load_model(path, model_opts)
+    end
   end
 
   @doc """
@@ -157,7 +214,7 @@ defmodule LlamaCppEx do
       ])
 
     ctx_opts =
-      Keyword.take(opts, [:n_threads, :n_threads_batch, :n_batch, :n_ubatch])
+      Keyword.take(opts, @context_opt_keys)
 
     Stream.resource(
       fn ->
@@ -304,7 +361,7 @@ defmodule LlamaCppEx do
       ])
 
     ctx_opts =
-      Keyword.take(gen_opts, [:n_threads, :n_threads_batch, :n_batch, :n_ubatch])
+      Keyword.take(gen_opts, @context_opt_keys)
 
     with {:ok, prompt} <- Chat.apply_template(model, messages, chat_opts),
          {:ok, prompt_tokens} <- Tokenizer.encode(model, prompt) do
@@ -414,7 +471,7 @@ defmodule LlamaCppEx do
       ])
 
     ctx_opts =
-      Keyword.take(gen_opts, [:n_threads, :n_threads_batch, :n_batch, :n_ubatch])
+      Keyword.take(gen_opts, @context_opt_keys)
 
     Stream.resource(
       fn ->
