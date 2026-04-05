@@ -24,9 +24,6 @@ Built with C++ NIFs using [fine](https://github.com/elixir-nx/fine) for ergonomi
 - **Prefix caching** — same-slot KV cache reuse for multi-turn chat (1.23x faster)
 - **Pluggable batching strategies** — DecodeMaximal, PrefillPriority, Balanced
 - **Pre-tokenized API** — tokenize outside the GenServer for lower contention
-- **KV cache quantization** — Q8_0/Q4_0 for 2-4x memory savings
-- **Flash attention control** — auto/enabled/disabled
-- **RoPE context extension** — linear, YaRN, LongRoPE scaling
 - Telemetry integration for observability
 
 ## Installation

@@ -14,11 +14,6 @@ The `LlamaCppEx.Server` manages a pool of concurrent inference slots with contin
 | `chunk_size` | 512 | Maximum prefill tokens per slot per tick |
 | `cache_prompt` | false | Enable same-slot KV cache reuse |
 | `batch_strategy` | DecodeMaximal | Batch building strategy module |
-| `type_k` | :f16 | KV cache K quantization (see below) |
-| `type_v` | :f16 | KV cache V quantization (see below) |
-| `flash_attn` | :auto | Flash Attention mode |
-| `offload_kqv` | true | Offload KQV ops to GPU |
-| `op_offload` | true | Offload host tensor ops to device |
 
 ### Context Size (`n_ctx`)
 
@@ -47,74 +42,6 @@ Controls how many prompt tokens are processed per slot per tick during prefill. 
 - **Default (512)**: Good balance for interactive use
 - **Larger (1024–2048)**: Faster prefill, but may stall generation for other slots
 - **Smaller (128–256)**: Smoother generation at the cost of slower prefill
-
-## KV Cache Quantization
-
-By default, the KV cache uses F16 (half-precision). Quantizing it to Q8_0 or Q4_0 reduces memory by 2-4x, allowing larger contexts or more parallel slots:
-
-```elixir
-# Q8_0: ~2x memory savings, minimal quality loss
-{:ok, ctx} = LlamaCppEx.Context.create(model,
-  n_ctx: 32768,
-  type_k: :q8_0,
-  type_v: :q8_0
-)
-
-# Q4_0: ~4x memory savings, some quality loss
-{:ok, ctx} = LlamaCppEx.Context.create(model,
-  n_ctx: 65536,
-  type_k: :q4_0,
-  type_v: :q4_0
-)
-```
-
-Available types: `:f32`, `:f16` (default), `:bf16`, `:q8_0`, `:q5_1`, `:q5_0`, `:q4_1`, `:q4_0`.
-
-**Recommendation:** `:q8_0` is the best balance of memory savings and quality. Use `:q4_0` only when you need maximum context length and can tolerate some quality degradation.
-
-Works with the Server too:
-
-```elixir
-{:ok, server} = LlamaCppEx.Server.start_link(
-  model_path: "model.gguf",
-  n_parallel: 8,
-  n_ctx: 32768,
-  type_k: :q8_0,
-  type_v: :q8_0
-)
-```
-
-## Flash Attention
-
-Flash Attention is enabled automatically when the hardware supports it (`:auto` default). You can explicitly control it:
-
-```elixir
-# Force enable (error if unsupported)
-{:ok, ctx} = LlamaCppEx.Context.create(model, flash_attn: :enabled)
-
-# Force disable (useful for debugging or compatibility)
-{:ok, ctx} = LlamaCppEx.Context.create(model, flash_attn: :disabled)
-```
-
-## RoPE Context Extension
-
-Extend the context window beyond the model's training length using RoPE scaling:
-
-```elixir
-# Linear scaling (simple, slight quality loss)
-{:ok, ctx} = LlamaCppEx.Context.create(model,
-  n_ctx: 16384,
-  rope_scaling_type: :linear,
-  rope_freq_scale: 0.5  # 2x extension
-)
-
-# YaRN scaling (better quality for large extensions)
-{:ok, ctx} = LlamaCppEx.Context.create(model,
-  n_ctx: 32768,
-  rope_scaling_type: :yarn,
-  rope_freq_base: 1_000_000.0
-)
-```
 
 ## Prefix Caching
 

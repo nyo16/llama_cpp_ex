@@ -12,14 +12,7 @@
 
 - **HuggingFace Hub integration** — New `LlamaCppEx.Hub` module with `search/2` (find GGUF models), `list_gguf_files/2` (with file sizes via tree API), `download/3` (with local caching, ETag support, offline mode via `LLAMA_OFFLINE=1`), and `get_model_info/2`. Authentication via `HF_TOKEN` or `HUGGING_FACE_HUB_TOKEN` env vars. New `LlamaCppEx.load_model_from_hub/3` convenience wrapper. Requires optional `:req` dependency.
 
-- **llama.cpp optimization parameters** — Expose 17 context params and 1 model param:
-  KV cache quantization (`type_k`, `type_v` — `:f16`, `:q8_0`, `:q4_0`, etc.),
-  flash attention control (`flash_attn` — `:auto`, `:enabled`, `:disabled`),
-  GPU offload (`offload_kqv`, `op_offload`),
-  RoPE context extension (`rope_scaling_type`, `rope_freq_base/scale`, YaRN params),
-  attention type, performance flags. All use llama.cpp defaults when not specified.
-
-- **Performance guide** — New `docs/performance.md` with server tuning, KV cache quantization, flash attention, RoPE scaling, prefix caching patterns, strategy selection guide, and optimization recipes.
+- **Performance guide** — New `docs/performance.md` with server tuning, prefix caching patterns, strategy selection guide, and optimization recipes.
 
 - **Benchee benchmarks** — New `bench/prefix_cache.exs`, `bench/strategies.exs`, `bench/tokenize_overhead.exs` for measuring prefix cache impact, strategy comparison, and tokenization overhead.
 
