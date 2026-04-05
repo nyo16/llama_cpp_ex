@@ -59,6 +59,40 @@ defmodule LlamaCppEx do
   end
 
   @doc """
+  Downloads a GGUF model from HuggingFace Hub and loads it.
+
+  Requires the optional `:req` dependency.
+
+  ## Examples
+
+      :ok = LlamaCppEx.init()
+      {:ok, model} = LlamaCppEx.load_model_from_hub(
+        "Qwen/Qwen3-4B-GGUF",
+        "qwen3-4b-q4_k_m.gguf",
+        n_gpu_layers: -1
+      )
+
+  ## Options
+
+  Accepts all options from `load_model/2` plus:
+
+    * `:cache_dir` - Local cache directory for downloaded models.
+    * `:token` - HuggingFace API token for private repos.
+    * `:progress` - Download progress callback.
+    * `:revision` - Git revision (branch, tag, commit). Defaults to `"main"`.
+
+  """
+  @spec load_model_from_hub(String.t(), String.t(), keyword()) ::
+          {:ok, Model.t()} | {:error, String.t()}
+  def load_model_from_hub(repo_id, filename, opts \\ []) do
+    {hub_opts, model_opts} = Keyword.split(opts, [:cache_dir, :token, :progress, :revision])
+
+    with {:ok, path} <- LlamaCppEx.Hub.download(repo_id, filename, hub_opts) do
+      load_model(path, model_opts)
+    end
+  end
+
+  @doc """
   Generates text from a prompt.
 
   Creates a temporary context and sampler, tokenizes the prompt, runs generation,
