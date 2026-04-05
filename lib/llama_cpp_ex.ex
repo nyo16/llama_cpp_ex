@@ -40,6 +40,29 @@ defmodule LlamaCppEx do
     Thinking
   }
 
+  @context_opt_keys [
+    :n_threads,
+    :n_threads_batch,
+    :n_batch,
+    :n_ubatch,
+    :type_k,
+    :type_v,
+    :flash_attn,
+    :offload_kqv,
+    :op_offload,
+    :rope_scaling_type,
+    :rope_freq_base,
+    :rope_freq_scale,
+    :yarn_ext_factor,
+    :yarn_attn_factor,
+    :yarn_beta_fast,
+    :yarn_beta_slow,
+    :yarn_orig_ctx,
+    :attention_type,
+    :no_perf,
+    :swa_full
+  ]
+
   @doc """
   Initializes the llama.cpp backend. Call once at application start.
   """
@@ -191,7 +214,7 @@ defmodule LlamaCppEx do
       ])
 
     ctx_opts =
-      Keyword.take(opts, [:n_threads, :n_threads_batch, :n_batch, :n_ubatch])
+      Keyword.take(opts, @context_opt_keys)
 
     Stream.resource(
       fn ->
@@ -338,7 +361,7 @@ defmodule LlamaCppEx do
       ])
 
     ctx_opts =
-      Keyword.take(gen_opts, [:n_threads, :n_threads_batch, :n_batch, :n_ubatch])
+      Keyword.take(gen_opts, @context_opt_keys)
 
     with {:ok, prompt} <- Chat.apply_template(model, messages, chat_opts),
          {:ok, prompt_tokens} <- Tokenizer.encode(model, prompt) do
@@ -448,7 +471,7 @@ defmodule LlamaCppEx do
       ])
 
     ctx_opts =
-      Keyword.take(gen_opts, [:n_threads, :n_threads_batch, :n_batch, :n_ubatch])
+      Keyword.take(gen_opts, @context_opt_keys)
 
     Stream.resource(
       fn ->

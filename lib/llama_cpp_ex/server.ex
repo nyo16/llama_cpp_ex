@@ -276,16 +276,42 @@ defmodule LlamaCppEx.Server do
       ])
 
     model_opts =
-      Keyword.take(opts, [:main_gpu, :split_mode, :tensor_split, :use_mlock, :use_direct_io])
+      Keyword.take(opts, [
+        :main_gpu,
+        :split_mode,
+        :tensor_split,
+        :use_mlock,
+        :use_direct_io,
+        :check_tensors
+      ])
+
+    context_opts =
+      Keyword.take(opts, [
+        :type_k,
+        :type_v,
+        :flash_attn,
+        :offload_kqv,
+        :op_offload,
+        :rope_scaling_type,
+        :rope_freq_base,
+        :rope_freq_scale,
+        :yarn_ext_factor,
+        :yarn_attn_factor,
+        :yarn_beta_fast,
+        :yarn_beta_slow,
+        :yarn_orig_ctx,
+        :attention_type,
+        :no_perf,
+        :swa_full
+      ])
 
     :ok = LlamaCppEx.init()
     {:ok, model} = Model.load(model_path, [n_gpu_layers: n_gpu_layers] ++ model_opts)
 
     {:ok, ctx} =
-      Context.create(model,
-        n_ctx: n_ctx,
-        n_batch: n_batch,
-        n_seq_max: n_parallel
+      Context.create(
+        model,
+        [n_ctx: n_ctx, n_batch: n_batch, n_seq_max: n_parallel] ++ context_opts
       )
 
     slots =

@@ -36,7 +36,7 @@ FINE_NIF(backend_free, 0);
 std::variant<fine::Ok<fine::ResourcePtr<LlamaModel>>, fine::Error<std::string>>
 model_load(ErlNifEnv* env, std::string path, int64_t n_gpu_layers, bool use_mmap,
            int64_t main_gpu, int64_t split_mode, std::vector<double> tensor_split,
-           bool use_mlock, bool use_direct_io, bool vocab_only) {
+           bool use_mlock, bool use_direct_io, bool vocab_only, bool check_tensors) {
     auto params = llama_model_default_params();
     params.n_gpu_layers = static_cast<int32_t>(n_gpu_layers);
     params.use_mmap = use_mmap;
@@ -45,6 +45,7 @@ model_load(ErlNifEnv* env, std::string path, int64_t n_gpu_layers, bool use_mmap
     params.use_mlock = use_mlock;
     params.use_direct_io = use_direct_io;
     params.vocab_only = vocab_only;
+    params.check_tensors = check_tensors;
 
     std::vector<float> ts_float;
     if (!tensor_split.empty()) {
@@ -205,7 +206,27 @@ context_create(
     int64_t n_threads_batch,
     bool embeddings,
     int64_t pooling_type,
-    int64_t n_seq_max)
+    int64_t n_seq_max,
+    // KV cache quantization
+    int64_t type_k,
+    int64_t type_v,
+    // Flash attention & GPU offload
+    int64_t flash_attn,
+    bool offload_kqv,
+    bool op_offload,
+    // RoPE scaling
+    int64_t rope_scaling_type,
+    double rope_freq_base,
+    double rope_freq_scale,
+    double yarn_ext_factor,
+    double yarn_attn_factor,
+    double yarn_beta_fast,
+    double yarn_beta_slow,
+    int64_t yarn_orig_ctx,
+    // Misc
+    int64_t attention_type,
+    bool no_perf,
+    bool swa_full)
 {
     auto params = llama_context_default_params();
     params.n_ctx           = static_cast<uint32_t>(n_ctx);
@@ -219,6 +240,30 @@ context_create(
     if (n_seq_max > 0) {
         params.n_seq_max = static_cast<uint32_t>(n_seq_max);
     }
+
+    // KV cache quantization
+    params.type_k = static_cast<enum ggml_type>(type_k);
+    params.type_v = static_cast<enum ggml_type>(type_v);
+
+    // Flash attention & GPU offload
+    params.flash_attn_type = static_cast<enum llama_flash_attn_type>(flash_attn);
+    params.offload_kqv     = offload_kqv;
+    params.op_offload      = op_offload;
+
+    // RoPE scaling
+    params.rope_scaling_type = static_cast<enum llama_rope_scaling_type>(rope_scaling_type);
+    params.rope_freq_base    = static_cast<float>(rope_freq_base);
+    params.rope_freq_scale   = static_cast<float>(rope_freq_scale);
+    params.yarn_ext_factor   = static_cast<float>(yarn_ext_factor);
+    params.yarn_attn_factor  = static_cast<float>(yarn_attn_factor);
+    params.yarn_beta_fast    = static_cast<float>(yarn_beta_fast);
+    params.yarn_beta_slow    = static_cast<float>(yarn_beta_slow);
+    params.yarn_orig_ctx     = static_cast<uint32_t>(yarn_orig_ctx);
+
+    // Misc
+    params.attention_type = static_cast<enum llama_attention_type>(attention_type);
+    params.no_perf        = no_perf;
+    params.swa_full       = swa_full;
 
     // For embedding models, n_ubatch must equal n_batch
     if (embeddings) {

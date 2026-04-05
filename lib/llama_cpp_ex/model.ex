@@ -25,6 +25,7 @@ defmodule LlamaCppEx.Model do
     * `:use_direct_io` - Bypass page cache when loading (takes precedence over mmap).
       Defaults to `false`.
     * `:vocab_only` - Load vocabulary and metadata only, skip weights. Defaults to `false`.
+    * `:check_tensors` - Validate model tensor data on load. Defaults to `false`.
 
   ## Examples
 
@@ -43,6 +44,7 @@ defmodule LlamaCppEx.Model do
     use_mlock = Keyword.get(opts, :use_mlock, false)
     use_direct_io = Keyword.get(opts, :use_direct_io, false)
     vocab_only = Keyword.get(opts, :vocab_only, false)
+    check_tensors = Keyword.get(opts, :check_tensors, false)
 
     case LlamaCppEx.NIF.model_load(
            path,
@@ -53,7 +55,8 @@ defmodule LlamaCppEx.Model do
            tensor_split,
            use_mlock,
            use_direct_io,
-           vocab_only
+           vocab_only,
+           check_tensors
          ) do
       {:ok, ref} -> {:ok, %__MODULE__{ref: ref}}
       {:error, _} = error -> error
