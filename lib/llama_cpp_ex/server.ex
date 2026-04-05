@@ -55,6 +55,8 @@ defmodule LlamaCppEx.Server do
     * `:ttft_ms` - Time to first token in milliseconds.
     * `:prompt_eval_rate` - Prompt evaluation speed (tokens/sec).
     * `:generation_rate` - Generation speed (tokens/sec).
+    * `:prefix_cache_tokens` - Number of prompt tokens skipped via prefix cache.
+    * `:prefix_cache_ratio` - Ratio of cached to total prompt tokens (0.0–1.0).
 
   Metadata:
 
@@ -98,6 +100,10 @@ defmodule LlamaCppEx.Server do
     * `:n_batch` - Batch size. Defaults to `n_ctx`.
     * `:chunk_size` - Max prefill tokens per slot per tick. Defaults to `512`.
     * `:max_queue` - Max queued requests. `0` for unlimited. Defaults to `0`.
+    * `:cache_prompt` - Retain KV cache between requests on the same slot for
+      prefix reuse. Defaults to `false`. Set to `true` for multi-turn chat.
+    * `:batch_strategy` - Batch building strategy module. Defaults to
+      `LlamaCppEx.Server.Strategy.DecodeMaximal`. See `LlamaCppEx.Server.BatchStrategy`.
     * Sampling options: `:temp`, `:top_k`, `:top_p`, `:min_p`, `:seed`, `:penalty_repeat`,
       `:penalty_freq`, `:penalty_present`, `:grammar`, `:grammar_root`.
     * GenServer options like `:name`.
