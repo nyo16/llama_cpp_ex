@@ -1,5 +1,17 @@
 # Changelog
 
+## v0.6.14
+
+### Changed
+
+- **llama.cpp submodule** — Updated from 50e0ad08f to b8635075f (7 commits).
+  - **common**: add Gemma 4 specialized parser (#21418), respect specified tag fallback when tag is empty (#21413)
+  - **llama-model**: read `final_logit_softcapping` for Gemma 4 (#21390)
+  - **llama**: add custom newline split for Gemma 4 (#21406)
+  - **server**: fix undefined timing measurement errors in server context (#21201)
+  - **ggml-webgpu**: move from parameter buffer pool to single buffer with offsets (#21278)
+  - **ci**: add Windows Vulkan backend testing on Intel (#21292)
+
 ## v0.6.13
 
 ### Changed
