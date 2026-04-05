@@ -353,42 +353,26 @@ defmodule LlamaCppEx.Hub do
   end
 
   defp do_stream_download(url, dest, headers) do
-    file = File.open!(dest, [:write, :binary])
+    # Use Req with output to file — handles redirects correctly
+    case Req.get(url, headers: headers, max_redirects: 10, into: File.stream!(dest, [:write])) do
+      {:ok, %{status: 200} = resp} ->
+        etag = get_header(resp, "etag")
+        {:ok, etag}
 
-    req_opts = [
-      headers: headers,
-      into: fn {:data, data}, {req, resp} ->
-        IO.binwrite(file, data)
-        {:cont, {req, resp}}
-      end,
-      max_redirects: 5,
-      retry: :transient,
-      retry_delay: fn n -> n * 1000 end
-    ]
+      {:ok, %{status: 401}} ->
+        {:error, "authentication required — set HF_TOKEN or pass :token option"}
 
-    try do
-      case Req.get(url, req_opts) do
-        {:ok, %{status: 200} = resp} ->
-          etag = get_header(resp, "etag")
-          {:ok, etag}
+      {:ok, %{status: 403}} ->
+        {:error, "access denied — this may be a gated model requiring access approval"}
 
-        {:ok, %{status: 401}} ->
-          {:error, "authentication required — set HF_TOKEN or pass :token option"}
+      {:ok, %{status: 404}} ->
+        {:error, "file not found: #{url}"}
 
-        {:ok, %{status: 403}} ->
-          {:error, "access denied — this may be a gated model requiring access approval"}
+      {:ok, %{status: status}} ->
+        {:error, "download failed with status #{status}"}
 
-        {:ok, %{status: 404}} ->
-          {:error, "file not found: #{url}"}
-
-        {:ok, %{status: status}} ->
-          {:error, "download failed with status #{status}"}
-
-        {:error, exception} ->
-          {:error, "network error: #{Exception.message(exception)}"}
-      end
-    after
-      File.close(file)
+      {:error, exception} ->
+        {:error, "network error: #{Exception.message(exception)}"}
     end
   end
 

@@ -4,10 +4,10 @@ IO.puts("Tokenization Overhead Benchmark")
 IO.puts("  Comparing text API vs pre-tokenized API")
 IO.puts("")
 
-server = Bench.Helpers.start_server(n_parallel: 1, n_ctx: 4096)
+server = Bench.Helpers.start_server(n_parallel: 1, n_ctx: 8192, cache_prompt: false)
 model = LlamaCppEx.Server.get_model(server)
 
-prompts = Bench.Helpers.prompts()
+prompts = Map.take(Bench.Helpers.prompts(), ["short", "medium"])
 
 # Pre-tokenize all prompts
 tokenized =

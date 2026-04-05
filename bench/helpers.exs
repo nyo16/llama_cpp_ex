@@ -36,7 +36,7 @@ defmodule Bench.Helpers do
     %{
       "short" => "The capital of France is",
       "medium" => String.duplicate("The quick brown fox jumps over the lazy dog. ", 10),
-      "long" => String.duplicate("The quick brown fox jumps over the lazy dog. ", 50)
+      "long" => String.duplicate("The quick brown fox jumps over the lazy dog. ", 20)
     }
   end
 
