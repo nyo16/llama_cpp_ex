@@ -258,7 +258,7 @@ The server caches KV state between requests on the same slot. Multi-turn chat be
 {:ok, server} = LlamaCppEx.Server.start_link(
   model_path: "model.gguf",
   n_parallel: 4,
-  cache_prompt: true  # default
+  cache_prompt: true  # opt-in (default: false)
 )
 ```
 

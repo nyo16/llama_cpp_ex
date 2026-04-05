@@ -79,7 +79,7 @@ defmodule LlamaCppEx.Server do
     n_parallel: 4,
     n_batch: 2048,
     chunk_size: 512,
-    cache_prompt: true,
+    cache_prompt: false,
     batch_strategy: LlamaCppEx.Server.Strategy.DecodeMaximal,
     tick_scheduled: false
   ]
@@ -252,7 +252,7 @@ defmodule LlamaCppEx.Server do
     n_ctx = Keyword.get(opts, :n_ctx, 8192)
     n_batch = Keyword.get(opts, :n_batch, n_ctx)
     chunk_size = Keyword.get(opts, :chunk_size, 512)
-    cache_prompt = Keyword.get(opts, :cache_prompt, true)
+    cache_prompt = Keyword.get(opts, :cache_prompt, false)
     batch_strategy = Keyword.get(opts, :batch_strategy, LlamaCppEx.Server.Strategy.DecodeMaximal)
 
     sampler_opts =

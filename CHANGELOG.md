@@ -4,7 +4,7 @@
 
 ### Added
 
-- **Prefix caching** — Same-slot KV cache reuse for multi-turn chat. When a new request shares a prefix with the slot's previous request, the common prefix is skipped during prefill. 1.23x faster for multi-turn conversations. Controlled by `cache_prompt` option (default `true`). Includes prefix-affinity slot selection. See [ADR 007](docs/adr/007-prefix-caching.md).
+- **Prefix caching** — Same-slot KV cache reuse for multi-turn chat. When a new request shares a prefix with the slot's previous request, the common prefix is skipped during prefill. 1.23x faster for multi-turn conversations. Controlled by `cache_prompt` option (default `false`, opt-in). Includes prefix-affinity slot selection. See [ADR 007](docs/adr/007-prefix-caching.md).
 
 - **Pluggable batching strategies** — Extracted batch building into `BatchStrategy` behaviour with three built-in strategies: `DecodeMaximal` (default, generation-latency optimized), `PrefillPriority` (throughput optimized), `Balanced` (fair split). Custom strategies can implement the behaviour. See [ADR 008](docs/adr/008-batching-strategies.md).
 

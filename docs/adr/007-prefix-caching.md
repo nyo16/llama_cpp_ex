@@ -22,8 +22,8 @@ Additionally, **prefix-affinity slot selection**: when acquiring an idle slot, p
 
 ### Configuration
 
-- `cache_prompt: true` (default) — enable same-slot KV reuse
-- `cache_prompt: false` — disable, identical to pre-caching behavior
+- `cache_prompt: false` (default) — identical to pre-caching behavior
+- `cache_prompt: true` — enable same-slot KV reuse (opt-in)
 
 ### Telemetry
 

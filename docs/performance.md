@@ -12,7 +12,7 @@ The `LlamaCppEx.Server` manages a pool of concurrent inference slots with contin
 | `n_ctx` | 8192 | Total KV cache size shared across all slots |
 | `n_batch` | n_ctx | Maximum tokens per forward pass |
 | `chunk_size` | 512 | Maximum prefill tokens per slot per tick |
-| `cache_prompt` | true | Enable same-slot KV cache reuse |
+| `cache_prompt` | false | Enable same-slot KV cache reuse |
 | `batch_strategy` | DecodeMaximal | Batch building strategy module |
 
 ### Context Size (`n_ctx`)
@@ -45,7 +45,7 @@ Controls how many prompt tokens are processed per slot per tick during prefill. 
 
 ## Prefix Caching
 
-When `cache_prompt: true` (default), the server retains the KV cache after a slot completes a request. On the next request, it detects the longest common prefix with the cached tokens and skips re-computing that portion.
+When `cache_prompt: true`, the server retains the KV cache after a slot completes a request. On the next request, it detects the longest common prefix with the cached tokens and skips re-computing that portion.
 
 ### When It Helps
 

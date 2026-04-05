@@ -295,7 +295,7 @@ sequenceDiagram
 
 ### Prefix Caching
 
-When `cache_prompt: true` (default), the server retains KV cache after a slot finishes. The next request on that slot gets automatic prefix detection:
+When `cache_prompt: true`, the server retains KV cache after a slot finishes. The next request on that slot gets automatic prefix detection:
 
 ```
 Request 1: [system_prompt, user_turn_1]  → full prefill
