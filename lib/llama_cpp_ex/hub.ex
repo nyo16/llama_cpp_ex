@@ -354,7 +354,7 @@ defmodule LlamaCppEx.Hub do
 
   defp do_stream_download(url, dest, headers) do
     # Use Req with output to file — handles redirects correctly
-    case Req.get(url, headers: headers, max_redirects: 10, into: File.stream!(dest, [:write])) do
+    case Req.get(url, headers: headers, max_redirects: 10, into: File.stream!(dest)) do
       {:ok, %{status: 200} = resp} ->
         etag = get_header(resp, "etag")
         {:ok, etag}

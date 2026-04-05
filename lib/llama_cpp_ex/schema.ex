@@ -75,11 +75,11 @@ defmodule LlamaCppEx.Schema do
     fields = Enum.filter(fields, fn f -> types[f] != nil end)
 
     # Build properties and handle embeds
-    embeds_one = module.__schema__(:embeds) |> MapSet.new()
+    embeds = module.__schema__(:embeds)
 
     {properties, required} =
       Enum.reduce(fields, {%{}, []}, fn field, {props, req} ->
-        if MapSet.member?(embeds_one, field) do
+        if field in embeds do
           embed_schema = module.__schema__(:embed, field)
           embed_mod = embed_schema.related
 
