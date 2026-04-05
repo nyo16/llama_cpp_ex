@@ -289,7 +289,37 @@ model = LlamaCppEx.Server.get_model(server)
 {:ok, text} = LlamaCppEx.Server.generate_tokens(server, tokens, max_tokens: 100)
 ```
 
-See [Performance Guide](docs/performance.md) for detailed tuning advice.
+### llama.cpp Optimizations
+
+Pass llama.cpp optimization parameters directly:
+
+```elixir
+{:ok, server} = LlamaCppEx.Server.start_link(
+  model_path: "model.gguf",
+  n_parallel: 8,
+  n_ctx: 32768,
+
+  # KV cache quantization — 2x memory savings, identical output
+  type_k: :q8_0,
+  type_v: :q8_0,
+
+  # Flash attention — faster prefill
+  flash_attn: :enabled
+)
+```
+
+These also work with the high-level API:
+
+```elixir
+{:ok, text} = LlamaCppEx.generate(model, "Hello",
+  max_tokens: 256,
+  type_k: :q8_0,
+  type_v: :q8_0,
+  flash_attn: :enabled
+)
+```
+
+See [Performance Guide](docs/performance.md) for all available parameters including RoPE context extension, GPU offload control, attention type, and more.
 
 ## Benchmarks
 
