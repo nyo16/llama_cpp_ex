@@ -10,7 +10,7 @@ LLAMA_BUILD = $(BUILD)/llama_build
 
 # Compiler
 CXX      ?= c++
-CXXFLAGS  = -std=c++17 -O2 -fPIC -fvisibility=hidden -Wall -Wno-unused-parameter
+CXXFLAGS  = -std=c++17 -O2 -fPIC -fvisibility=hidden -Wall -Wno-unused-parameter -Wno-unused-function
 CXXFLAGS += -I$(ERTS_INCLUDE_DIR)
 CXXFLAGS += -I$(FINE_INCLUDE_DIR)
 CXXFLAGS += -I$(LLAMA_DIR)/include
