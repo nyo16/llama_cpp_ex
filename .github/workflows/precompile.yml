@@ -48,6 +48,11 @@ jobs:
       - name: Install cmake (Linux)
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y cmake
+      - name: Set version from tag
+        run: |
+          TAG_VERSION="${GITHUB_REF#refs/tags/v}"
+          sed -i'' -e "s/@version \".*\"/@version \"${TAG_VERSION}\"/" mix.exs
+          grep '@version' mix.exs
       - run: mix deps.get
       - name: Create precompiled library
         run: |
@@ -77,6 +82,11 @@ jobs:
         with:
           otp-version: ${{ env.OTP_VERSION }}
           elixir-version: ${{ env.ELIXIR_VERSION }}
+      - name: Set version from tag
+        run: |
+          TAG_VERSION="${GITHUB_REF#refs/tags/v}"
+          sed -i "s/@version \".*\"/@version \"${TAG_VERSION}\"/" mix.exs
+          grep '@version' mix.exs
       - run: mix deps.get
       - run: mix elixir_make.checksum --all --ignore-unavailable
       - name: Commit checksum.exs
