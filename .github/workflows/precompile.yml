@@ -110,18 +110,23 @@ jobs:
           path: |
             deps
             _build
-          key: ${{ runner.os }}-mix-${{ env.ELIXIR_VERSION }}-${{ env.OTP_VERSION }}-${{ hashFiles('mix.lock') }}
+          key: ${{ runner.os }}-mix-${{ env.ELIXIR_VERSION }}-${{ env.OTP_VERSION }}-${{ hashFiles('mix.lock', 'c_src/**/*.cpp', 'c_src/**/*.h') }}
           restore-keys: |
             ${{ runner.os }}-mix-${{ env.ELIXIR_VERSION }}-${{ env.OTP_VERSION }}-
 
       - run: mix deps.get
-      - run: mix compile --warnings-as-errors
+      - run: mix format --check-formatted
+      - run: mix clean && mix compile --warnings-as-errors
         env:
           LLAMA_BACKEND: cpu
-      - run: mix format --check-formatted
+          MIX_ENV: test
       - run: mix test
         env:
           LLAMA_BACKEND: cpu
+      - run: mix clean && mix compile
+        env:
+          LLAMA_BACKEND: cpu
+          MIX_ENV: dev
       - run: mix dialyzer
 
   publish:
