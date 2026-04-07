@@ -1,5 +1,23 @@
 # Changelog
 
+## v0.7.2
+
+### Fixed
+
+- **NIF signature mismatch on precompiled builds** — When `LLAMA_BACKEND` is set, the build now forces compilation from source instead of downloading a precompiled NIF that may have a stale function signature. (#23)
+- **Precompile workflow CI failures** — The CI Checks job in the precompile workflow used a stale cached NIF (arity 9 vs 10 for `model_load`) because the cache key didn't include C source hashes and `mix compile` ran under the wrong `MIX_ENV`. Aligned with `ci.yml` by adding `c_src/**` to the cache key, compiling for `MIX_ENV=test`, and running `mix clean` before compile.
+- **Precompile archive version mismatch** — The precompile and checksum jobs now set `@version` from the git tag (via `sed`), matching what the publish job already did. Previously, archives were named with the old version from `mix.exs`, causing the publish job to fail when looking for archives matching the tag version.
+
+## v0.7.1
+
+### Added
+
+- **Full llama.cpp optimization parameters** — Exposed 17 new context parameters and 1 model parameter:
+  - KV cache quantization: `type_k`, `type_v` (f16, q8_0, q4_0, etc.) for 2-4x memory savings
+  - Flash attention & GPU offload: `flash_attn`, `offload_kqv`, `op_offload`
+  - RoPE scaling: `rope_scaling_type`, `rope_freq_base`, `rope_freq_scale`, YaRN parameters
+  - Misc: `attention_type`, `no_perf`, `swa_full`, `check_tensors`
+
 ## v0.7.0
 
 ### Added
