@@ -1,5 +1,29 @@
 # Changelog
 
+## v0.7.4
+
+### Changed
+
+- **llama.cpp submodule** — Updated from d12cc3d1c to 073bb2c20 (42 commits).
+  - **model**: make Gemma 4 shared-KV tail attn_k tensors optional on load (#21739), fix multimodal padding token for gemma3n/gemma4 (#21625)
+  - **mtmd**: add MERaLiON-2 multimodal audio support (#21756), support dots.ocr (#17575)
+  - **common**: better align to the updated official gemma4 template (#21704), enable reasoning budget sampler for gemma4 (#21697), add callback interface for download progress (#21735), fix when loading cached HF models with unavailable API (#21670), mark `--split-mode tensor` as experimental (#21684), add fluidity to the progress bar (#21671), fix ambiguous grammar rule in gemma4 (#21661), simplify autoparser tagged parser rules (#21216), skip non-primary GGUF split files when selecting model (#21633)
+  - **server**: ignore `--alias` when using `--models-preset` (#21380), fix grammar commandline args (#21543)
+  - **jinja**: support `ensure_ascii=true`, string repetition and int/float self-filtering (#21623)
+  - **vocab**: add gemma4 tokenizer tests, fix edge case (#21534)
+  - **structured output**: fix broken structured output when using `$refs` in json_schema (#21699)
+  - **ggml**: backend-agnostic tensor parallelism (experimental) (#19378), fix missing GGML_TYPE_Q1_0 cases (#21716), check return value of CUB calls in argsort and top-k (#21676)
+  - **CUDA**: fuse muls (#21665), also store `node->src` ne/nb for graph equality (#21736)
+  - **Metal**: add missing mm-id specializations for q1_0 (#21662)
+  - **Vulkan**: support Q1_0 (#21539), unify type macros to use Vx instead of _VECx (#21605)
+  - **SYCL**: add flash-attn support for head size 512 (#21654)
+  - **HIP**: add CDNA4 (gfx950) architecture support for MI350X/MI355X (#21570)
+  - **OpenCL**: add basic support for q5_k (#21593)
+  - **WebGPU**: support non-square subgroup matrix configs for Intel GPUs (#21669), address quantization precision and backend lifecycle management (#21521)
+  - **hexagon**: add support for linux on snapdragon (#21707), improved Op queuing, buffer and cache management (#21705)
+  - **TP**: fix Qwen 3 Next data split (#21732)
+  - **webui**: static build output improvements (#21667), add "Send message on Enter" setting (#21577), add option to pre-encode conversation for faster next turns (#21034), fix Model Selector choice sync (#21628)
+
 ## v0.7.3
 
 ### Changed
