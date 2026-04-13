@@ -1,5 +1,131 @@
 # Changelog
 
+## v0.7.4
+
+### Changed
+
+- **llama.cpp submodule** — Updated from d12cc3d1c to 073bb2c20 (42 commits).
+  - **model**: make Gemma 4 shared-KV tail attn_k tensors optional on load (#21739), fix multimodal padding token for gemma3n/gemma4 (#21625)
+  - **mtmd**: add MERaLiON-2 multimodal audio support (#21756), support dots.ocr (#17575)
+  - **common**: better align to the updated official gemma4 template (#21704), enable reasoning budget sampler for gemma4 (#21697), add callback interface for download progress (#21735), fix when loading cached HF models with unavailable API (#21670), mark `--split-mode tensor` as experimental (#21684), add fluidity to the progress bar (#21671), fix ambiguous grammar rule in gemma4 (#21661), simplify autoparser tagged parser rules (#21216), skip non-primary GGUF split files when selecting model (#21633)
+  - **server**: ignore `--alias` when using `--models-preset` (#21380), fix grammar commandline args (#21543)
+  - **jinja**: support `ensure_ascii=true`, string repetition and int/float self-filtering (#21623)
+  - **vocab**: add gemma4 tokenizer tests, fix edge case (#21534)
+  - **structured output**: fix broken structured output when using `$refs` in json_schema (#21699)
+  - **ggml**: backend-agnostic tensor parallelism (experimental) (#19378), fix missing GGML_TYPE_Q1_0 cases (#21716), check return value of CUB calls in argsort and top-k (#21676)
+  - **CUDA**: fuse muls (#21665), also store `node->src` ne/nb for graph equality (#21736)
+  - **Metal**: add missing mm-id specializations for q1_0 (#21662)
+  - **Vulkan**: support Q1_0 (#21539), unify type macros to use Vx instead of _VECx (#21605)
+  - **SYCL**: add flash-attn support for head size 512 (#21654)
+  - **HIP**: add CDNA4 (gfx950) architecture support for MI350X/MI355X (#21570)
+  - **OpenCL**: add basic support for q5_k (#21593)
+  - **WebGPU**: support non-square subgroup matrix configs for Intel GPUs (#21669), address quantization precision and backend lifecycle management (#21521)
+  - **hexagon**: add support for linux on snapdragon (#21707), improved Op queuing, buffer and cache management (#21705)
+  - **TP**: fix Qwen 3 Next data split (#21732)
+  - **webui**: static build output improvements (#21667), add "Send message on Enter" setting (#21577), add option to pre-encode conversation for faster next turns (#21034), fix Model Selector choice sync (#21628)
+
+## v0.7.3
+
+### Changed
+
+- **llama.cpp submodule** — Updated from b8635075f to d12cc3d1c (55 commits).
+  - **model**: add HunyuanOCR support (#21395), support step3-vl-10b (#21287)
+  - **llama**: remove per-arch tensor name lists (#21531), correct platform-independent loading of BOOL metadata (#21428)
+  - **server**: respect the ignore eos flag (#21203), fix model params not propagated (#21509), fix restore for checkpoints with `pos_min == 0` (#21510), handle unsuccessful sink.write in chunked stream provider (#21478), fix logging of build + system info (#21460)
+  - **kv-cache**: extend cache quantization checks (#21586), support attention rotation for heterogeneous iSWA (#21513)
+  - **vocab**: remove `</s>` eog token for gemma4 (#21492), add byte token handling to BPE detokenizer for Gemma4 (#21488)
+  - **gemma**: perform per-layer projections in the first layer (#21612)
+  - **unicode**: add custom Qwen2 regex handler to fix segfault on long input (#21257)
+  - **parser**: fix MiniMax handling (#21573)
+  - **convert**: set `add bos == True` for Gemma 4 (#21500), fix `block_ff_dim` retrieval for lfm2 (#21508)
+  - **ggml**: add Q1_0 1-bit quantization support (CPU) (#21273), deprecate `GGML_OP_ADD1` (#21363), free `ctx_copy` in `ggml_opt_free` to plug per-training-session leak (#21592)
+  - **metal**: Q1_0 backend (#21528)
+  - **CUDA**: also store `node->src->data` ptrs for equality check (#21635), check for buffer overlap before fusing (#21566), make cuda graphs props check faster (#21472), write an optimized `flash_attn_stream_k_fixup` kernel (#21159), `ds_read_b128` for q4_0 and q4_1 mmq kernels (#21168), fix CDNA2 compute capability constant for gfx90a/MI210 (#21519)
+  - **SYCL**: Add Q8_0 reorder optimization (~3x tg speedup on Intel Arc) (#21527), handle other FA case (#21377)
+  - **Vulkan**: add FA dequant for q4_1, q5_0, q5_1, iq4_nl (#21029), Linux output error string for errno on fork failure (#20904)
+  - **WebGPU**: query for adapter support when registering backend (#21579), parameterize submission size and add iOS specific limits (#21533), add support of `MUL_MAT_ID` (#21147)
+  - **hexagon**: slight optimization for argsort output init (#21463)
+  - **webui**: store reasoning_content so it is sent back in subsequent requests (#21249), fix syntax highlighting lost after streaming (#21206), detect streaming state in reasoning content blocks (#21549), fix RTL text rendering (#21382), send both `backend_sampling == false/true` (#18781)
+  - **cli**: fix stripping of `\n` in multiline input (#21485)
+  - **llama-bench**: add `-fitc` and `-fitt` arguments (#21304)
+  - **devops/ci**: provide KleidiAI-enabled ARM release artifact (#21259), lower cuda12 floor to 12.8.1 for broader host compatibility (#21438), fix vulkan workflow referencing non-existent action (#21442), use default RISE RISC-V Runners (#21263)
+
+## v0.7.2
+
+### Fixed
+
+- **NIF signature mismatch on precompiled builds** — When `LLAMA_BACKEND` is set, the build now forces compilation from source instead of downloading a precompiled NIF that may have a stale function signature. (#23)
+- **Precompile workflow CI failures** — The CI Checks job in the precompile workflow used a stale cached NIF (arity 9 vs 10 for `model_load`) because the cache key didn't include C source hashes and `mix compile` ran under the wrong `MIX_ENV`. Aligned with `ci.yml` by adding `c_src/**` to the cache key, compiling for `MIX_ENV=test`, and running `mix clean` before compile.
+- **Precompile archive version mismatch** — The precompile and checksum jobs now set `@version` from the git tag (via `sed`), matching what the publish job already did. Previously, archives were named with the old version from `mix.exs`, causing the publish job to fail when looking for archives matching the tag version.
+
+## v0.7.1
+
+### Added
+
+- **Full llama.cpp optimization parameters** — Exposed 17 new context parameters and 1 model parameter:
+  - KV cache quantization: `type_k`, `type_v` (f16, q8_0, q4_0, etc.) for 2-4x memory savings
+  - Flash attention & GPU offload: `flash_attn`, `offload_kqv`, `op_offload`
+  - RoPE scaling: `rope_scaling_type`, `rope_freq_base`, `rope_freq_scale`, YaRN parameters
+  - Misc: `attention_type`, `no_perf`, `swa_full`, `check_tensors`
+
+## v0.7.0
+
+### Added
+
+- **Prefix caching** — Same-slot KV cache reuse for multi-turn chat. When a new request shares a prefix with the slot's previous request, the common prefix is skipped during prefill. 1.23x faster for multi-turn conversations. Controlled by `cache_prompt` option (default `false`, opt-in). Includes prefix-affinity slot selection. See [ADR 007](docs/adr/007-prefix-caching.md).
+
+- **Pluggable batching strategies** — Extracted batch building into `BatchStrategy` behaviour with three built-in strategies: `DecodeMaximal` (default, generation-latency optimized), `PrefillPriority` (throughput optimized), `Balanced` (fair split). Custom strategies can implement the behaviour. See [ADR 008](docs/adr/008-batching-strategies.md).
+
+- **Pre-tokenized API** — `Server.generate_tokens/3`, `Server.stream_tokens/3`, and `Server.get_model/1` allow callers to tokenize outside the GenServer, reducing mailbox contention under concurrent load.
+
+- **HuggingFace Hub integration** — New `LlamaCppEx.Hub` module with `search/2` (find GGUF models), `list_gguf_files/2` (with file sizes via tree API), `download/3` (with local caching, ETag support, offline mode via `LLAMA_OFFLINE=1`), and `get_model_info/2`. Authentication via `HF_TOKEN` or `HUGGING_FACE_HUB_TOKEN` env vars. New `LlamaCppEx.load_model_from_hub/3` convenience wrapper. Requires optional `:req` dependency.
+
+- **Performance guide** — New `docs/performance.md` with server tuning, prefix caching patterns, strategy selection guide, and optimization recipes.
+
+- **Benchee benchmarks** — New `bench/prefix_cache.exs`, `bench/strategies.exs`, `bench/tokenize_overhead.exs` for measuring prefix cache impact, strategy comparison, and tokenization overhead.
+
+### Changed
+
+- **Graceful batch_eval error handling** — The server now fails active slots with error replies instead of crashing the GenServer when `batch_eval` returns an error (e.g., KV cache overflow).
+
+### Fixed
+
+- **CI warning suppression** — Suppress `-Wunused-function` warnings from vendored llama.cpp jinja headers (`runtime.h`, `lexer.h`).
+
+## v0.6.14
+
+### Changed
+
+- **llama.cpp submodule** — Updated from 50e0ad08f to b8635075f (7 commits).
+  - **common**: add Gemma 4 specialized parser (#21418), respect specified tag fallback when tag is empty (#21413)
+  - **llama-model**: read `final_logit_softcapping` for Gemma 4 (#21390)
+  - **llama**: add custom newline split for Gemma 4 (#21406)
+  - **server**: fix undefined timing measurement errors in server context (#21201)
+  - **ggml-webgpu**: move from parameter buffer pool to single buffer with offsets (#21278)
+  - **ci**: add Windows Vulkan backend testing on Intel (#21292)
+
+## v0.6.13
+
+### Changed
+
+- **llama.cpp submodule** — Updated from 95a6ebabb to 50e0ad08f (32 commits).
+  - **server**: save and clear idle slots on new task (`--clear-idle`) (#20993)
+  - **common/parser**: fix call ID detection (Mistral parser mostly) + atomicity for tag-json parsers (#21230)
+  - **common**: fix tool call type detection for nullable and enum schemas (#21327), add commentary rules for gpt-oss-20b (#21286)
+  - **chat**: avoid including json in chat.h (#21306), add Granite 4.0 chat template (#20804), Gemma4 tool response support
+  - **jinja**: coerce input for string-specific filters (#21370)
+  - **vocab**: fix Gemma4 tokenizer (#21343)
+  - **ggml**: bump to 0.9.11 (ggml/1456)
+  - **ggml-webgpu**: add vectorized flash attention (#20709)
+  - **ggml-zendnn**: add MUL_MAT_ID op support for MoE models (#21315)
+  - **rpc**: reuse compute graph buffers (#21299)
+  - **kv-cache**: do not quantize SWA KV cache (#21277)
+  - **SYCL**: fix llama_kv_cache hang when kv_cache is huge: 5GB (#21283)
+  - **hexagon**: add cumsum op support (#21246)
+  - **model/mtmd**: fix gguf conversion for audio/vision mmproj (#21309)
+  - **tests**: add unit test coverage for llama_tensor_get_type (#20112), allow exporting graph ops from HF file without downloading weights (#21182)
+  - **fix**: remove stale assert (#21369), fix gemma 4 template (#21326)
+
 ## v0.6.12
 
 ### Changed

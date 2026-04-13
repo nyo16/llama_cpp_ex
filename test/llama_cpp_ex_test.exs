@@ -692,7 +692,7 @@ defmodule LlamaCppExTest do
           LlamaCppEx.Server.start_link(
             model_path: @model_path,
             n_parallel: 2,
-            n_ctx: 2048
+            n_ctx: 8192
           )
 
         %{server: server}

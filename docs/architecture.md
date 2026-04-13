@@ -293,6 +293,29 @@ sequenceDiagram
     Note over S: Sample both slots — slot 1 now generating
 ```
 
+### Prefix Caching
+
+When `cache_prompt: true`, the server retains KV cache after a slot finishes. The next request on that slot gets automatic prefix detection:
+
+```
+Request 1: [system_prompt, user_turn_1]  → full prefill
+Request 2: [system_prompt, user_turn_1, assistant_reply, user_turn_2]
+                                          → skip prefill for common prefix
+                                            only process new tokens
+```
+
+The `common_prefix_length` helper compares new tokens with cached tokens. Prefix-affinity slot selection picks the idle slot with the best match.
+
+### Pluggable Batching Strategies
+
+The batch building logic is extracted into a `BatchStrategy` behaviour. Three strategies are provided:
+
+- **DecodeMaximal** (default): Decode tokens first, prefill fills remaining budget
+- **PrefillPriority**: Prefill first, decode fills remainder (throughput-oriented)
+- **Balanced**: Equal budget split between decode and prefill
+
+Custom strategies implement `build_batch(slots, budget, chunk_size, opts)`.
+
 ### Why Batching Matters
 
 - **Prefill** (prompt processing): Already GPU-efficient, compute-bound
@@ -319,9 +342,19 @@ llama_cpp_ex/
 │       ├── tokenizer.ex             # Text <-> token conversion
 │       ├── chat.ex                  # Chat template formatting
 │       ├── embedding.ex             # Text embeddings (L2 norm, batched)
-│       └── server.ex                # Continuous batching GenServer
+│       ├── server.ex                # Continuous batching GenServer
+│       ├── server/
+│       │   ├── batch_strategy.ex    # BatchStrategy behaviour
+│       │   └── strategy/
+│       │       ├── decode_maximal.ex  # Decode-first (default)
+│       │       ├── prefill_priority.ex # Prefill-first (throughput)
+│       │       └── balanced.ex        # Equal split
+│       └── hub.ex                   # HuggingFace Hub downloads
 ├── priv/                            # Build output (.so / .dylib)
+├── bench/                           # Benchee benchmarks
 ├── docs/                            # Architecture docs + ADRs
 └── test/
-    └── llama_cpp_ex_test.exs        # 46 tests (2 unit + 44 model-dependent)
+    ├── llama_cpp_ex_test.exs        # Model-dependent tests
+    ├── batch_strategy_test.exs      # Strategy unit tests (no model)
+    └── hub_test.exs                 # Hub unit tests (no network)
 ```

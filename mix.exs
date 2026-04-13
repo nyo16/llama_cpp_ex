@@ -37,7 +37,7 @@ end
 defmodule LlamaCppEx.MixProject do
   use Mix.Project
 
-  @version "0.6.12"
+  @version "0.7.4"
   @source_url "https://github.com/nyo16/llama_cpp_ex"
 
   def project do
@@ -56,7 +56,7 @@ defmodule LlamaCppEx.MixProject do
       make_precompiler_filename: "llama_cpp_ex_nif",
       make_precompiler_priv_paths: ["llama_cpp_ex_nif.so"],
       make_precompiler_nif_versions: [versions: ["2.17", "2.18"]],
-      make_force_build: System.get_env("LLAMA_BACKEND") in ["cuda", "vulkan"],
+      make_force_build: System.get_env("LLAMA_BACKEND") != nil,
       description: description(),
       package: package(),
       name: "LlamaCppEx",
@@ -76,9 +76,11 @@ defmodule LlamaCppEx.MixProject do
       {:fine, "~> 0.1", runtime: false},
       {:telemetry, "~> 1.0"},
       {:ecto, "~> 3.0", optional: true},
+      {:req, "~> 0.5", optional: true},
       {:ex_doc, "~> 0.34", only: :dev, runtime: false},
       {:dialyxir, "~> 1.4", only: :dev, runtime: false},
-      {:benchee, "~> 1.0", only: :bench, runtime: false}
+      {:benchee, "~> 1.0", only: :bench, runtime: false},
+      {:benchee_html, "~> 1.0", only: :bench, runtime: false}
     ]
   end
 
@@ -117,7 +119,10 @@ defmodule LlamaCppEx.MixProject do
         "docs/adr/004-streaming-via-enif-send.md",
         "docs/adr/005-batching-architecture.md",
         "docs/adr/006-continuous-batching.md",
+        "docs/adr/007-prefix-caching.md",
+        "docs/adr/008-batching-strategies.md",
         "docs/examples.md",
+        "docs/performance.md",
         "docs/release-guide.md"
       ],
       groups_for_extras: [
@@ -134,7 +139,14 @@ defmodule LlamaCppEx.MixProject do
           LlamaCppEx.Embedding,
           LlamaCppEx.Grammar,
           LlamaCppEx.Schema,
-          LlamaCppEx.Server
+          LlamaCppEx.Server,
+          LlamaCppEx.Hub
+        ],
+        "Batching Strategies": [
+          LlamaCppEx.Server.BatchStrategy,
+          LlamaCppEx.Server.Strategy.DecodeMaximal,
+          LlamaCppEx.Server.Strategy.PrefillPriority,
+          LlamaCppEx.Server.Strategy.Balanced
         ],
         Internal: [LlamaCppEx.NIF]
       ]

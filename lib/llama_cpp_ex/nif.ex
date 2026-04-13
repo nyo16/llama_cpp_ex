@@ -21,7 +21,8 @@ defmodule LlamaCppEx.NIF do
         _tensor_split,
         _use_mlock,
         _use_direct_io,
-        _vocab_only
+        _vocab_only,
+        _check_tensors
       ),
       do: :erlang.nif_error(:not_loaded)
 
@@ -53,7 +54,23 @@ defmodule LlamaCppEx.NIF do
         _n_threads_batch,
         _embeddings,
         _pooling_type,
-        _n_seq_max
+        _n_seq_max,
+        _type_k,
+        _type_v,
+        _flash_attn,
+        _offload_kqv,
+        _op_offload,
+        _rope_scaling_type,
+        _rope_freq_base,
+        _rope_freq_scale,
+        _yarn_ext_factor,
+        _yarn_attn_factor,
+        _yarn_beta_fast,
+        _yarn_beta_slow,
+        _yarn_orig_ctx,
+        _attention_type,
+        _no_perf,
+        _swa_full
       ),
       do: :erlang.nif_error(:not_loaded)
 
