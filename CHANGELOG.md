@@ -1,5 +1,17 @@
 # Changelog
 
+## v0.7.5
+
+### Changed
+
+- **llama.cpp submodule** — Updated from 073bb2c20 to a8bad3842 (18 commits).
+  - **mtmd**: add Gemma 4 audio conformer encoder support (#21421), qwen3 audio support (qwen3-omni and qwen3-asr) (#19441), use causal attn for gemma 4 audio (#21824), fix crash when sending image under 2x2 pixels (#21711)
+  - **Vulkan**: Flash Attention DP4A shader for quantized KV cache (#20797)
+  - **CUDA**: limit DeviceSegmentedSort to immediate mode (#21718), skip compilation of superfluous FA kernels (#21768)
+  - **common**: add download cancellation and temp file cleanup (#21813)
+  - **server**: expose build_info in router mode (#21835)
+  - **convert**: force f16 or f32 on step3-vl conv weights (#21646)
+
 ## v0.7.4
 
 ### Changed

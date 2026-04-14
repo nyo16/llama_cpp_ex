@@ -33,7 +33,7 @@ Add `llama_cpp_ex` to your list of dependencies in `mix.exs`:
 ```elixir
 def deps do
   [
-    {:llama_cpp_ex, "~> 0.7.4"}
+    {:llama_cpp_ex, "~> 0.7.5"}
   ]
 end
 ```
