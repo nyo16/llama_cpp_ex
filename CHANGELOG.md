@@ -1,5 +1,27 @@
 # Changelog
 
+## v0.7.6
+
+### Changed
+
+- **llama.cpp submodule** — Updated from a8bad3842 to 408225bb1 (28 commits).
+  - **server**: use random media marker (#21962), support OAI `/v1/audio/transcriptions` API (#21863)
+  - **chat**: dedicated DeepSeek v3.2 parser + "official" template (#21785)
+  - **autoparser**: support case of JSON_NATIVE with per-call markers (test case: Reka-Edge) (#21892)
+  - **common**: handle gemma4 parsing edge cases (#21760), skip reasoning budget sampler when no budget is requested (#21870)
+  - **mtmd**: add `mtmd_image_tokens_get_decoder_pos()` API (#21851)
+  - **llama**: read `n_ctx` back after making `llama_context` (#21939)
+  - **CUDA**: Q1_0 initial backend (#21629), require explicit opt-in for P2P access (#21910), manage NCCL communicators in context (#21891)
+  - **Metal**: fix FA support logic (#21898), add XIELU unary op (#20802)
+  - **Vulkan**: optimize im2col (#21713), support GGML_TYPE_NVFP4 (#21455), programmatically add RoundingModeRTE to all shaders when the device supports it (#21572)
+  - **ggml-webgpu**: fix dequantization helpers to not pass in pointers (#21872), update register tiling matmul to use f32 accumulation (#21644)
+  - **ggml**: remove `ggml-ext.h` (#21869), fix ARM NEON nvfp4 dot product on non-dotprod targets (#21559)
+  - **hexagon**: optimization for HMX mat_mul (#21554)
+  - **rpc**: add native RDMA transport for RPC backend (RoCEv2) (#20590)
+  - **vendor**: update BoringSSL to 0.20260413.0 (#21881)
+  - **cmake**: fix CMP0194 warning on Windows with MSVC (#21630)
+  - **ci**: re-enable mac workflows (#21894), disable test-backend-ops on Vulkan llvmpipe run and restore default timeout (#21901)
+
 ## v0.7.5
 
 ### Changed
