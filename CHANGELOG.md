@@ -1,5 +1,25 @@
 # Changelog
 
+## v0.7.7
+
+### Changed
+
+- **llama.cpp submodule** — Updated from 408225bb1 to 30dce2cf2 (18 commits).
+  - **model**: using single llm_build per arch (#21970), refactor QKV into common `build_qkv` and `create_tensor_qkv` helpers (#21245), support NVFP4 tensors for Gemma4 (#21971)
+  - **cli**: use `get_media_marker` (#22017)
+  - **server**: tests fetch random media marker via `/apply-template` (#21980)
+  - **convert**: fix NemotronH config parsing (#21664)
+  - **ggml**: add `graph_reused` (#21764)
+  - **ggml-cpu**: 128-bit RVV implementation for Quantization Vector Dot (#20633), SIMD gemm kernel for RISC-V vector extension (#20627)
+  - **Metal**: implement ROLL op (#21946)
+  - **OpenCL**: add q5_K gemm and gemv kernels for Adreno (#21595)
+  - **SYCL**: fix Q8_0 reorder garbage on 2nd prompt + crash on full VRAM (#21638)
+  - **hexagon**: optimize HMX matmul operations (#21071)
+  - **ggml-webgpu**: compute pass batching and remove profiling overhead (#21873)
+  - **cmake**: use glob to collect `src/models` sources (#22005)
+  - **ci**: use ggml-org/ccache-action on RISC-V (#21632)
+  - **devops**: add spirv-headers to nix (#21965)
+
 ## v0.7.6
 
 ### Changed
