@@ -8,14 +8,15 @@ on:
 
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
-  MIX_ENV: test
   ELIXIR_VERSION: "1.18"
   OTP_VERSION: "27.0"
 
 jobs:
-  compile:
-    name: Compile & Warnings
+  setup-test:
+    name: Setup (test)
     runs-on: ubuntu-22.04
+    outputs:
+      cache-key: ${{ steps.key.outputs.value }}
     steps:
       - uses: actions/checkout@v6
         with:
@@ -29,24 +30,89 @@ jobs:
       - name: Install build dependencies
         run: sudo apt-get update && sudo apt-get install -y cmake libgomp1
 
-      - name: Cache deps & build
+      - name: Compute cache key
+        id: key
+        env:
+          SRC_HASH: ${{ hashFiles('mix.lock', 'c_src/**', 'Makefile') }}
+          RUNNER_OS: ${{ runner.os }}
+        run: |
+          SUB_SHA=$(git -C vendor/llama.cpp rev-parse HEAD)
+          echo "value=${RUNNER_OS}-mix-${ELIXIR_VERSION}-${OTP_VERSION}-test-${SRC_HASH}-${SUB_SHA}" >> "$GITHUB_OUTPUT"
+
+      - name: Cache deps & build (test)
+        id: cache
         uses: actions/cache@v5
         with:
           path: |
             deps
-            _build
-          key: ${{ runner.os }}-mix-${{ env.ELIXIR_VERSION }}-${{ env.OTP_VERSION }}-${{ hashFiles('mix.lock', 'c_src/**/*.cpp', 'c_src/**/*.h') }}
-          restore-keys: |
-            ${{ runner.os }}-mix-${{ env.ELIXIR_VERSION }}-${{ env.OTP_VERSION }}-
+            _build/test
+          key: ${{ steps.key.outputs.value }}
 
       - run: mix deps.get
-      - run: mix clean && mix compile --warnings-as-errors
+        if: steps.cache.outputs.cache-hit != 'true'
         env:
+          MIX_ENV: test
+
+      - run: mix compile --warnings-as-errors
+        if: steps.cache.outputs.cache-hit != 'true'
+        env:
+          MIX_ENV: test
+          LLAMA_BACKEND: cpu
+
+  setup-dev:
+    name: Setup (dev)
+    runs-on: ubuntu-22.04
+    outputs:
+      cache-key: ${{ steps.key.outputs.value }}
+      plt-key: ${{ steps.key.outputs.plt }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          submodules: recursive
+
+      - uses: erlef/setup-beam@v1
+        with:
+          otp-version: ${{ env.OTP_VERSION }}
+          elixir-version: ${{ env.ELIXIR_VERSION }}
+
+      - name: Install build dependencies
+        run: sudo apt-get update && sudo apt-get install -y cmake libgomp1
+
+      - name: Compute cache keys
+        id: key
+        env:
+          SRC_HASH: ${{ hashFiles('mix.lock', 'c_src/**', 'Makefile') }}
+          LOCK_HASH: ${{ hashFiles('mix.lock') }}
+          RUNNER_OS: ${{ runner.os }}
+        run: |
+          SUB_SHA=$(git -C vendor/llama.cpp rev-parse HEAD)
+          echo "value=${RUNNER_OS}-mix-${ELIXIR_VERSION}-${OTP_VERSION}-dev-${SRC_HASH}-${SUB_SHA}" >> "$GITHUB_OUTPUT"
+          echo "plt=${RUNNER_OS}-plt-${ELIXIR_VERSION}-${OTP_VERSION}-${LOCK_HASH}" >> "$GITHUB_OUTPUT"
+
+      - name: Cache deps & build (dev)
+        id: cache
+        uses: actions/cache@v5
+        with:
+          path: |
+            deps
+            _build/dev
+          key: ${{ steps.key.outputs.value }}
+
+      - run: mix deps.get
+        if: steps.cache.outputs.cache-hit != 'true'
+        env:
+          MIX_ENV: dev
+
+      - run: mix compile
+        if: steps.cache.outputs.cache-hit != 'true'
+        env:
+          MIX_ENV: dev
           LLAMA_BACKEND: cpu
 
   format:
     name: Formatting
     runs-on: ubuntu-22.04
+    needs: [setup-test]
     steps:
       - uses: actions/checkout@v6
 
@@ -55,21 +121,20 @@ jobs:
           otp-version: ${{ env.OTP_VERSION }}
           elixir-version: ${{ env.ELIXIR_VERSION }}
 
-      - name: Cache deps
-        uses: actions/cache@v5
+      - uses: actions/cache/restore@v5
         with:
-          path: deps
-          key: ${{ runner.os }}-deps-${{ env.ELIXIR_VERSION }}-${{ env.OTP_VERSION }}-${{ hashFiles('mix.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-deps-${{ env.ELIXIR_VERSION }}-${{ env.OTP_VERSION }}-
+          path: |
+            deps
+            _build/test
+          key: ${{ needs.setup-test.outputs.cache-key }}
+          fail-on-cache-miss: true
 
-      - run: mix deps.get
       - run: mix format --check-formatted
 
   test:
     name: Tests
     runs-on: ubuntu-22.04
-    needs: [compile]
+    needs: [setup-test]
     steps:
       - uses: actions/checkout@v6
         with:
@@ -80,31 +145,26 @@ jobs:
           otp-version: ${{ env.OTP_VERSION }}
           elixir-version: ${{ env.ELIXIR_VERSION }}
 
-      - name: Install build dependencies
-        run: sudo apt-get update && sudo apt-get install -y cmake libgomp1
+      - name: Install runtime dependencies
+        run: sudo apt-get update && sudo apt-get install -y libgomp1
 
-      - name: Cache deps & build
-        uses: actions/cache@v5
+      - uses: actions/cache/restore@v5
         with:
           path: |
             deps
-            _build
-          key: ${{ runner.os }}-mix-${{ env.ELIXIR_VERSION }}-${{ env.OTP_VERSION }}-${{ hashFiles('mix.lock', 'c_src/**/*.cpp', 'c_src/**/*.h') }}
-          restore-keys: |
-            ${{ runner.os }}-mix-${{ env.ELIXIR_VERSION }}-${{ env.OTP_VERSION }}-
+            _build/test
+          key: ${{ needs.setup-test.outputs.cache-key }}
+          fail-on-cache-miss: true
 
-      - run: mix deps.get
-      - run: mix clean && mix compile
-        env:
-          LLAMA_BACKEND: cpu
       - run: mix test
         env:
+          MIX_ENV: test
           LLAMA_BACKEND: cpu
 
   dialyzer:
     name: Dialyzer
     runs-on: ubuntu-22.04
-    needs: [compile]
+    needs: [setup-dev]
     steps:
       - uses: actions/checkout@v6
         with:
@@ -115,34 +175,25 @@ jobs:
           otp-version: ${{ env.OTP_VERSION }}
           elixir-version: ${{ env.ELIXIR_VERSION }}
 
-      - name: Install build dependencies
-        run: sudo apt-get update && sudo apt-get install -y cmake libgomp1
+      - name: Install runtime dependencies
+        run: sudo apt-get update && sudo apt-get install -y libgomp1
 
-      - name: Cache deps & build
-        uses: actions/cache@v5
+      - uses: actions/cache/restore@v5
         with:
           path: |
             deps
-            _build
-          key: ${{ runner.os }}-mix-${{ env.ELIXIR_VERSION }}-${{ env.OTP_VERSION }}-${{ hashFiles('mix.lock', 'c_src/**/*.cpp', 'c_src/**/*.h') }}
-          restore-keys: |
-            ${{ runner.os }}-mix-${{ env.ELIXIR_VERSION }}-${{ env.OTP_VERSION }}-
+            _build/dev
+          key: ${{ needs.setup-dev.outputs.cache-key }}
+          fail-on-cache-miss: true
 
       - name: Cache PLTs
         uses: actions/cache@v5
         with:
           path: priv/plts
-          key: ${{ runner.os }}-plt-${{ env.ELIXIR_VERSION }}-${{ env.OTP_VERSION }}-${{ hashFiles('mix.lock') }}
+          key: ${{ needs.setup-dev.outputs.plt-key }}
           restore-keys: |
             ${{ runner.os }}-plt-${{ env.ELIXIR_VERSION }}-${{ env.OTP_VERSION }}-
 
-      - run: mix deps.get
-        env:
-          MIX_ENV: dev
-      - run: mix clean && mix compile
-        env:
-          MIX_ENV: dev
-          LLAMA_BACKEND: cpu
       - run: mix dialyzer
         env:
           MIX_ENV: dev
