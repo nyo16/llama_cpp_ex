@@ -1,5 +1,18 @@
 # Changelog
 
+## v0.7.8
+
+### Changed
+
+- **llama.cpp submodule** — Updated from 30dce2cf2 to 45cac7ca7 (7 commits).
+  - **model**: Gemma4 model type detection (#22027)
+  - **mtmd**: add missing struct tag (#22023)
+  - **libs**: rename `libcommon` → `libllama-common` (#21936)
+  - **CUDA**: use LRU based eviction for cuda graphs (#21611)
+  - **OpenCL**: refactor q8_0 `set_tensor` and `mul_mat` host side dispatch for Adreno (#21938)
+  - **ggml-webgpu**: fix compiler warnings and refactor FlashAttention encoding (#21052)
+  - **ci**: add android arm64 build and release (#21647)
+
 ## v0.7.7
 
 ### Changed
