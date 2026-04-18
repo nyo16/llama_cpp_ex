@@ -78,7 +78,7 @@ defmodule LlamaCppEx.MixProject do
       {:ecto, "~> 3.0", optional: true},
       {:req, "~> 0.5", optional: true},
       {:ex_doc, "~> 0.34", only: :dev, runtime: false},
-      {:dialyxir, "~> 1.4", only: :dev, runtime: false},
+      {:dialyxir, "~> 1.4", only: [:dev, :test], runtime: false},
       {:benchee, "~> 1.0", only: :bench, runtime: false},
       {:benchee_html, "~> 1.0", only: :bench, runtime: false}
     ]
