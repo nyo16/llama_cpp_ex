@@ -33,7 +33,7 @@ Add `llama_cpp_ex` to your list of dependencies in `mix.exs`:
 ```elixir
 def deps do
   [
-    {:llama_cpp_ex, "~> 0.7.4"}
+    {:llama_cpp_ex, "~> 0.7.5"}
   ]
 end
 ```
@@ -335,6 +335,16 @@ Measured on Apple M4 Max (64 GB), Metal backend (`n_gpu_layers: -1`).
 | GPT-OSS 20B | Q4_K_XL | 79.4 |
 | Qwen3.5-35B-A3B | Q6_K | 56.0 |
 | Qwen3.5-27B | Q4_K_XL | 17.5 |
+
+### Qwen3.6-35B-A3B (v0.7.8)
+
+New `qwen35moe` architecture with Gated Delta Net (hybrid linear/full attention). Measured on Apple M1 Max (64 GB) with v0.7.8 bindings — not directly comparable to the M4 Max numbers above.
+
+| Model | Quantization | Tokens/sec (M1 Max) |
+|-------|-------------|---------------------|
+| Qwen3.6-35B-A3B | Q4_K_XL | 43.8 |
+
+128-token generation, `temp: 0.0`, 3-run average (43.3 / 44.1 / 44.0 t/s).
 
 ### Single-sequence generation (Qwen3-4B Q4_K_M)
 

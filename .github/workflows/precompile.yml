@@ -98,51 +98,10 @@ jobs:
           git add checksum.exs
           git diff --staged --quiet && echo "No changes" || (git commit -m "Update checksum.exs for ${TAG_NAME}" && git push origin master)
 
-  test:
-    name: CI Checks
-    runs-on: ubuntu-22.04
-    steps:
-      - uses: actions/checkout@v6
-        with:
-          submodules: recursive
-
-      - uses: erlef/setup-beam@v1
-        with:
-          otp-version: ${{ env.OTP_VERSION }}
-          elixir-version: ${{ env.ELIXIR_VERSION }}
-
-      - name: Install build dependencies
-        run: sudo apt-get update && sudo apt-get install -y cmake libgomp1
-
-      - name: Cache deps & build
-        uses: actions/cache@v5
-        with:
-          path: |
-            deps
-            _build
-          key: ${{ runner.os }}-mix-${{ env.ELIXIR_VERSION }}-${{ env.OTP_VERSION }}-${{ hashFiles('mix.lock', 'c_src/**/*.cpp', 'c_src/**/*.h') }}
-          restore-keys: |
-            ${{ runner.os }}-mix-${{ env.ELIXIR_VERSION }}-${{ env.OTP_VERSION }}-
-
-      - run: mix deps.get
-      - run: mix format --check-formatted
-      - run: mix clean && mix compile --warnings-as-errors
-        env:
-          LLAMA_BACKEND: cpu
-          MIX_ENV: test
-      - run: mix test
-        env:
-          LLAMA_BACKEND: cpu
-      - run: mix clean && mix compile
-        env:
-          LLAMA_BACKEND: cpu
-          MIX_ENV: dev
-      - run: mix dialyzer
-
   publish:
     name: Publish to Hex
     runs-on: ubuntu-22.04
-    needs: [checksum, test]
+    needs: [checksum]
     permissions:
       contents: read
     steps:

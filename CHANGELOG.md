@@ -1,5 +1,72 @@
 # Changelog
 
+## v0.7.8
+
+### Changed
+
+- **llama.cpp submodule** — Updated from 30dce2cf2 to 45cac7ca7 (7 commits).
+  - **model**: Gemma4 model type detection (#22027)
+  - **mtmd**: add missing struct tag (#22023)
+  - **libs**: rename `libcommon` → `libllama-common` (#21936)
+  - **CUDA**: use LRU based eviction for cuda graphs (#21611)
+  - **OpenCL**: refactor q8_0 `set_tensor` and `mul_mat` host side dispatch for Adreno (#21938)
+  - **ggml-webgpu**: fix compiler warnings and refactor FlashAttention encoding (#21052)
+  - **ci**: add android arm64 build and release (#21647)
+
+## v0.7.7
+
+### Changed
+
+- **llama.cpp submodule** — Updated from 408225bb1 to 30dce2cf2 (18 commits).
+  - **model**: using single llm_build per arch (#21970), refactor QKV into common `build_qkv` and `create_tensor_qkv` helpers (#21245), support NVFP4 tensors for Gemma4 (#21971)
+  - **cli**: use `get_media_marker` (#22017)
+  - **server**: tests fetch random media marker via `/apply-template` (#21980)
+  - **convert**: fix NemotronH config parsing (#21664)
+  - **ggml**: add `graph_reused` (#21764)
+  - **ggml-cpu**: 128-bit RVV implementation for Quantization Vector Dot (#20633), SIMD gemm kernel for RISC-V vector extension (#20627)
+  - **Metal**: implement ROLL op (#21946)
+  - **OpenCL**: add q5_K gemm and gemv kernels for Adreno (#21595)
+  - **SYCL**: fix Q8_0 reorder garbage on 2nd prompt + crash on full VRAM (#21638)
+  - **hexagon**: optimize HMX matmul operations (#21071)
+  - **ggml-webgpu**: compute pass batching and remove profiling overhead (#21873)
+  - **cmake**: use glob to collect `src/models` sources (#22005)
+  - **ci**: use ggml-org/ccache-action on RISC-V (#21632)
+  - **devops**: add spirv-headers to nix (#21965)
+
+## v0.7.6
+
+### Changed
+
+- **llama.cpp submodule** — Updated from a8bad3842 to 408225bb1 (28 commits).
+  - **server**: use random media marker (#21962), support OAI `/v1/audio/transcriptions` API (#21863)
+  - **chat**: dedicated DeepSeek v3.2 parser + "official" template (#21785)
+  - **autoparser**: support case of JSON_NATIVE with per-call markers (test case: Reka-Edge) (#21892)
+  - **common**: handle gemma4 parsing edge cases (#21760), skip reasoning budget sampler when no budget is requested (#21870)
+  - **mtmd**: add `mtmd_image_tokens_get_decoder_pos()` API (#21851)
+  - **llama**: read `n_ctx` back after making `llama_context` (#21939)
+  - **CUDA**: Q1_0 initial backend (#21629), require explicit opt-in for P2P access (#21910), manage NCCL communicators in context (#21891)
+  - **Metal**: fix FA support logic (#21898), add XIELU unary op (#20802)
+  - **Vulkan**: optimize im2col (#21713), support GGML_TYPE_NVFP4 (#21455), programmatically add RoundingModeRTE to all shaders when the device supports it (#21572)
+  - **ggml-webgpu**: fix dequantization helpers to not pass in pointers (#21872), update register tiling matmul to use f32 accumulation (#21644)
+  - **ggml**: remove `ggml-ext.h` (#21869), fix ARM NEON nvfp4 dot product on non-dotprod targets (#21559)
+  - **hexagon**: optimization for HMX mat_mul (#21554)
+  - **rpc**: add native RDMA transport for RPC backend (RoCEv2) (#20590)
+  - **vendor**: update BoringSSL to 0.20260413.0 (#21881)
+  - **cmake**: fix CMP0194 warning on Windows with MSVC (#21630)
+  - **ci**: re-enable mac workflows (#21894), disable test-backend-ops on Vulkan llvmpipe run and restore default timeout (#21901)
+
+## v0.7.5
+
+### Changed
+
+- **llama.cpp submodule** — Updated from 073bb2c20 to a8bad3842 (18 commits).
+  - **mtmd**: add Gemma 4 audio conformer encoder support (#21421), qwen3 audio support (qwen3-omni and qwen3-asr) (#19441), use causal attn for gemma 4 audio (#21824), fix crash when sending image under 2x2 pixels (#21711)
+  - **Vulkan**: Flash Attention DP4A shader for quantized KV cache (#20797)
+  - **CUDA**: limit DeviceSegmentedSort to immediate mode (#21718), skip compilation of superfluous FA kernels (#21768)
+  - **common**: add download cancellation and temp file cleanup (#21813)
+  - **server**: expose build_info in router mode (#21835)
+  - **convert**: force f16 or f32 on step3-vl conv weights (#21646)
+
 ## v0.7.4
 
 ### Changed
