@@ -1,5 +1,33 @@
 # Changelog
 
+## v0.7.9
+
+### Changed
+
+- **llama.cpp submodule** — Updated from 45cac7ca7 to 550d684bd (69 commits).
+  - **server**: Enable transcriptions API for LFM2-Audio (#22000); ignore reasoning content from transcription api (#21905); allow cancel loading model (#21814); fix hardcoded proxy connection timeout in router mode (#22003)
+  - **metal**: fix event synchronization (#22260); workaround macOS GPU interactivity watchdog (#22216)
+  - **ggml-base**: use `MATH_LIBRARY` variable instead of hardcoded `m` (#22239)
+  - **ggml**: bump version to 0.10.0
+  - **SYCL**: update oneapi 2025.3.3, separate SYCL build, release Ubuntu 24 package (#22078); fused MoE `mul_mat_vec_q` for TG (#21920); improve `mul_mat_id` memory efficiency and add BF16 fast path (#22119)
+  - **CUDA**: fuse relu + sqr (#22249); flush legacy pool on OOM and retry (#22155)
+  - **HIP**: flip `GGML_HIP_GRAPHS` to default on (#22254)
+  - **ggml-webgpu**: add support for im2col (#22259); implement async tensor api and event api (#22099); fused RMS_NORM + MUL (#21983); conv2d kernels (#21964); reset CPU/GPU profiling time when freeing context (#22050)
+  - **vulkan**: Support F16 OP_FILL (#22177)
+  - **hexagon**: add support for FILL op (#22198); DAIG op (#22195); fix missing v79 entry in `libggml-htp.inf` (#22194)
+  - **mtmd**: also support `LLAMA_ROPE_TYPE_NONE` (#22242); update HunyuanVL vision-language model support (#22037); correct `mtmd_decode_use_mrope()` (#22188); add support for Reka Edge 2603 (#21616)
+  - **chat**: fix `parallel_tool_calls` default setting based on model capabilities, add tests for parallel tool calls and structured outputs (#22217)
+  - **common**: refactoring sampler parameters (#22233); refactor, move all conversion functions to common, add tests (#20690)
+  - **speculative**: add checkpoint support (#22227); reset `i_last` when low acceptance streak occurs (#22168); `--spec-default` arg (#22223)
+  - **convert**: handle ModelOpt produced mixed precision model during convert to GGUF (#22247)
+  - **openvino**: driver setup, CI split, thread safety, and NPU optimizations (#21944)
+  - **llama-ext**: fix exports (#22202)
+  - **vendor**: update cpp-httplib to 0.43.1 (#22143)
+
+### Fixed
+
+- **build**: Added `-DLLAMA_OPENSSL=OFF` to suppress upstream HTTPS dependency pulled in by the new `LLAMA_OPENSSL=ON` default.
+
 ## v0.7.8
 
 ### Changed
