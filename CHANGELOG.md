@@ -1,5 +1,23 @@
 # Changelog
 
+## v0.8.2
+
+### Changed
+
+- **llama.cpp submodule** — Updated from d77599234 to b97ebdc98 (18 commits).
+  - **llama-quant**: fix `--tensor-type` when default `qtype` is overriden (#22572); add fast matmul iquants (#22504)
+  - **CUDA**: fix tile FA kernel on Pascal (#22541)
+  - **vulkan**: support asymmetric FA in coopmat2 path (#21753); add get/set tensor 2d functions (#22514)
+  - **ggml-webgpu**: fix vectorized handling in mul-mat and mul-mat-id (#22578); add the upscale shader (#22419); improve performance of mat-vec and mat-mat for `MUL_MAT_ID` (#22464)
+  - **hexagon**: enable non-contiguous row tensor support for unary ops (#22574)
+  - **llama-mmap**: use `ftello`/`fseeko` (#22497)
+  - **spec**: fix draft model checkpoints (#22521); fix vocab compat checks in spec example (#22426); fix argument typo (#22552)
+  - **common**: check for null `getpwuid` in hf-cache (#22550)
+  - **webui**: Spring Cleaning Refactor v1 (#22505)
+  - **vendor**: update cpp-httplib to 0.43.2 (#22548)
+  - **ci**: bump ty to 0.0.33 (#22535)
+  - **scripts**: add `wc2wt.sh` - create worktree from current HEAD (#22513)
+
 ## v0.8.1
 
 ### Changed
