@@ -1,5 +1,21 @@
 # Changelog
 
+## v0.8.4
+
+### Changed
+
+- **llama.cpp submodule** — Updated from e48034dfc to eff06702b (12 commits).
+  - **model**: move `load_hparams` and `load_tensors` to per-model definition (#22004)
+  - **server**: implement `/models?reload=1` (#21848); add a simple `get_datetime` server tool (#22649)
+  - **CUDA**: use fastdiv for batch index split in `get_rows` (#22650)
+  - **vulkan**: delete dead `GGML_VK_MAX_NODES` def (#22621)
+  - **ggml-webgpu**: add layer norm ops (#22406)
+  - **kleidiai**: update to v1.24.0 and use release archive (#22549)
+  - **common/autoparser**: fixes for newline handling / forced tool calls (#22654)
+  - **webui**: fix circular dependency between `chat.service.ts` and `models.svelte.ts` (#22625); restore missing settings (#22666)
+  - **examples**: refactor diffusion generation (#22590)
+  - **docs**: update speculative decoding parameters after refactor (#22539)
+
 ## v0.8.3
 
 ### Changed
