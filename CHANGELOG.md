@@ -1,5 +1,19 @@
 # Changelog
 
+## v0.8.3
+
+### Changed
+
+- **llama.cpp submodule** — Updated from b97ebdc98 to e48034dfc (14 commits).
+  - **common**: determine generation prompt using longest common prefix (#22657)
+  - **convert**: Mistral format yarn `apply_scale` support (#22612); apply Q/K RoPE permutation in NVFP4 repack path (#22611); disable uint types (#18908)
+  - **CUDA**: fix device PCI bus ID de-dupe OOMing (ignoring other 3 GPUs entirely) (#22533)
+  - **server**: avoid checkpoint data host copies (#22558)
+  - **ggml-virtgpu**: fix circular dependency in headers (#22557)
+  - **opencl**: Adreno optimization for MoE - MxFP4 (#22301)
+  - **hexagon**: HMX flash attention (#22347)
+  - **ggml**: bump version to 0.10.2; sync ggml; try fix win32 build
+
 ## v0.8.2
 
 ### Changed
