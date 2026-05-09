@@ -1,5 +1,29 @@
 # Changelog
 
+## v0.8.5
+
+### Changed
+
+- **llama.cpp submodule** — Updated from eff06702b to 1e5ad35d5 (68 commits).
+  - **model**: add sarvam_moe architecture (#20275); support Gemma4_26B_A4B_NVFP4 (#22804); add Mimo v2.5 (#22493); support sarashina2.2-vision-3b (#22103); don't crash on unsupported architecture (#22742).
+  - **llama**: add option to save memory in device buffers, with new `LLAMA_STATE_SEQ_FLAGS_ON_DEVICE` flag (#22679); fix device state save/load (#22805); remove unnecessary seq_id check during state restore (#22797); add missing `ggml_backend_load_all()` call (#22752).
+  - **common**: do not wrap raw strings in schema parser for tagged parsers (#22827); revert reasoning budget +inf logit bias (#22740); preserve media markers for typed-content templates (#22634); do not fit to unknown device memory (#22614); only load backends when required (#22290); fix missing-noreturn warnings on clang 21 (#22702).
+  - **server**: support Vertex AI compatible API (#22545); router exposes child model info from `/v1/models` (#22683); validate `--tools` CLI argument against known tool names (#22538).
+  - **mtmd**: support MiniCPM-V 4.6 (#22529); add granite-speech support (#22101); fix whisper audio tail truncation by exposing padded buffer to FFT (#22770).
+  - **CUDA**: fuse snake activation (#22667); batch `out_prod` inner loop with `cublasSgemmStridedBatched` (#22651); lower-case PCI bus id, standardize for ggml (#22820).
+  - **SYCL**: reduce allocation overhead during flash attention (#22732); BF16 support in `GET_ROWS` (#21391); Q5_K reorder MMVQ/dequant + Q8_0 reorder MMVQ (#22152); Battlemage AOT build via `spir64_gen` (#22147); add FILL, CUMSUM, DIAG, SOLVE_TRI, SSM_SCAN, GATED_DELTA_NET (#22149); non-contiguous input in PAD op (#22148).
+  - **vulkan**: flash attention MMA / Tiles for MiMo-V2.5 (#22812); fix spv shadowing (#22760).
+  - **hexagon**: HTP kernel for `GGML_OP_GATED_DELTA_NET` (#22837); l2 norm (#22816); process M-tail rows on HMX instead of HVX (#22724).
+  - **opencl**: q4_0 MoE GEMM for Adreno (#22731); refactor Adreno q4_0 (#22335); use `CL_DEVICE_GLOBAL_MEM_SIZE` for `--fit` memory estimate (#22688); add opfilter regex for debugging (#22782).
+  - **ggml-cpu**: fuse `RMS_NORM + MUL` on CPU backend (#22423); optimized risc-v q1_0 dot.
+  - **ggml**: fast Walsh-Hadamard transform for KV rotation (#22631); bump version to 0.11.0; update `SCHED_DEBUG` output to use `ggml_op_desc()` (#22825).
+  - **graph**: handle non-contiguous Q/K/V in `mul_mat_aux` (#22630).
+  - **rpc**: use graph uid instead of graph cache (#22701).
+  - **convert**: fix RuntimeError when stripping FP8 KV-cache scales (#22818); ignore non-language tensors for Gemma4Model (#22753); add `filter_tensors` method (#22597).
+  - **gguf-py**: bump to 0.19.0 (#22664); migrate to PEP 621 and add uv support (#21907).
+  - **webui**: import/export of settings (#22803); LLM title generation for agentic conversations (#22840); fix `?model=` URL param race in router mode (#22771); remove Google favicons (#22719); accessibility fixes (#22699, #22773).
+  - **build/deps**: update BoringSSL to 0.20260508.0 (#22839); cpp-httplib 0.43.3 (#22686); upgrade default intel compute-runtime in docker (#22567); update Nix systems (#22869).
+
 ## v0.8.4
 
 ### Changed
