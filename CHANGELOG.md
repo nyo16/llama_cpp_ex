@@ -1,5 +1,118 @@
 # Changelog
 
+## v0.8.5
+
+### Changed
+
+- **llama.cpp submodule** — Updated from eff06702b to 1e5ad35d5 (68 commits).
+  - **model**: add sarvam_moe architecture (#20275); support Gemma4_26B_A4B_NVFP4 (#22804); add Mimo v2.5 (#22493); support sarashina2.2-vision-3b (#22103); don't crash on unsupported architecture (#22742).
+  - **llama**: add option to save memory in device buffers, with new `LLAMA_STATE_SEQ_FLAGS_ON_DEVICE` flag (#22679); fix device state save/load (#22805); remove unnecessary seq_id check during state restore (#22797); add missing `ggml_backend_load_all()` call (#22752).
+  - **common**: do not wrap raw strings in schema parser for tagged parsers (#22827); revert reasoning budget +inf logit bias (#22740); preserve media markers for typed-content templates (#22634); do not fit to unknown device memory (#22614); only load backends when required (#22290); fix missing-noreturn warnings on clang 21 (#22702).
+  - **server**: support Vertex AI compatible API (#22545); router exposes child model info from `/v1/models` (#22683); validate `--tools` CLI argument against known tool names (#22538).
+  - **mtmd**: support MiniCPM-V 4.6 (#22529); add granite-speech support (#22101); fix whisper audio tail truncation by exposing padded buffer to FFT (#22770).
+  - **CUDA**: fuse snake activation (#22667); batch `out_prod` inner loop with `cublasSgemmStridedBatched` (#22651); lower-case PCI bus id, standardize for ggml (#22820).
+  - **SYCL**: reduce allocation overhead during flash attention (#22732); BF16 support in `GET_ROWS` (#21391); Q5_K reorder MMVQ/dequant + Q8_0 reorder MMVQ (#22152); Battlemage AOT build via `spir64_gen` (#22147); add FILL, CUMSUM, DIAG, SOLVE_TRI, SSM_SCAN, GATED_DELTA_NET (#22149); non-contiguous input in PAD op (#22148).
+  - **vulkan**: flash attention MMA / Tiles for MiMo-V2.5 (#22812); fix spv shadowing (#22760).
+  - **hexagon**: HTP kernel for `GGML_OP_GATED_DELTA_NET` (#22837); l2 norm (#22816); process M-tail rows on HMX instead of HVX (#22724).
+  - **opencl**: q4_0 MoE GEMM for Adreno (#22731); refactor Adreno q4_0 (#22335); use `CL_DEVICE_GLOBAL_MEM_SIZE` for `--fit` memory estimate (#22688); add opfilter regex for debugging (#22782).
+  - **ggml-cpu**: fuse `RMS_NORM + MUL` on CPU backend (#22423); optimized risc-v q1_0 dot.
+  - **ggml**: fast Walsh-Hadamard transform for KV rotation (#22631); bump version to 0.11.0; update `SCHED_DEBUG` output to use `ggml_op_desc()` (#22825).
+  - **graph**: handle non-contiguous Q/K/V in `mul_mat_aux` (#22630).
+  - **rpc**: use graph uid instead of graph cache (#22701).
+  - **convert**: fix RuntimeError when stripping FP8 KV-cache scales (#22818); ignore non-language tensors for Gemma4Model (#22753); add `filter_tensors` method (#22597).
+  - **gguf-py**: bump to 0.19.0 (#22664); migrate to PEP 621 and add uv support (#21907).
+  - **webui**: import/export of settings (#22803); LLM title generation for agentic conversations (#22840); fix `?model=` URL param race in router mode (#22771); remove Google favicons (#22719); accessibility fixes (#22699, #22773).
+  - **build/deps**: update BoringSSL to 0.20260508.0 (#22839); cpp-httplib 0.43.3 (#22686); upgrade default intel compute-runtime in docker (#22567); update Nix systems (#22869).
+
+## v0.8.4
+
+### Changed
+
+- **llama.cpp submodule** — Updated from e48034dfc to eff06702b (12 commits).
+  - **model**: move `load_hparams` and `load_tensors` to per-model definition (#22004)
+  - **server**: implement `/models?reload=1` (#21848); add a simple `get_datetime` server tool (#22649)
+  - **CUDA**: use fastdiv for batch index split in `get_rows` (#22650)
+  - **vulkan**: delete dead `GGML_VK_MAX_NODES` def (#22621)
+  - **ggml-webgpu**: add layer norm ops (#22406)
+  - **kleidiai**: update to v1.24.0 and use release archive (#22549)
+  - **common/autoparser**: fixes for newline handling / forced tool calls (#22654)
+  - **webui**: fix circular dependency between `chat.service.ts` and `models.svelte.ts` (#22625); restore missing settings (#22666)
+  - **examples**: refactor diffusion generation (#22590)
+  - **docs**: update speculative decoding parameters after refactor (#22539)
+
+## v0.8.3
+
+### Changed
+
+- **llama.cpp submodule** — Updated from b97ebdc98 to e48034dfc (14 commits).
+  - **common**: determine generation prompt using longest common prefix (#22657)
+  - **convert**: Mistral format yarn `apply_scale` support (#22612); apply Q/K RoPE permutation in NVFP4 repack path (#22611); disable uint types (#18908)
+  - **CUDA**: fix device PCI bus ID de-dupe OOMing (ignoring other 3 GPUs entirely) (#22533)
+  - **server**: avoid checkpoint data host copies (#22558)
+  - **ggml-virtgpu**: fix circular dependency in headers (#22557)
+  - **opencl**: Adreno optimization for MoE - MxFP4 (#22301)
+  - **hexagon**: HMX flash attention (#22347)
+  - **ggml**: bump version to 0.10.2; sync ggml; try fix win32 build
+
+## v0.8.2
+
+### Changed
+
+- **llama.cpp submodule** — Updated from d77599234 to b97ebdc98 (18 commits).
+  - **llama-quant**: fix `--tensor-type` when default `qtype` is overriden (#22572); add fast matmul iquants (#22504)
+  - **CUDA**: fix tile FA kernel on Pascal (#22541)
+  - **vulkan**: support asymmetric FA in coopmat2 path (#21753); add get/set tensor 2d functions (#22514)
+  - **ggml-webgpu**: fix vectorized handling in mul-mat and mul-mat-id (#22578); add the upscale shader (#22419); improve performance of mat-vec and mat-mat for `MUL_MAT_ID` (#22464)
+  - **hexagon**: enable non-contiguous row tensor support for unary ops (#22574)
+  - **llama-mmap**: use `ftello`/`fseeko` (#22497)
+  - **spec**: fix draft model checkpoints (#22521); fix vocab compat checks in spec example (#22426); fix argument typo (#22552)
+  - **common**: check for null `getpwuid` in hf-cache (#22550)
+  - **webui**: Spring Cleaning Refactor v1 (#22505)
+  - **vendor**: update cpp-httplib to 0.43.2 (#22548)
+  - **ci**: bump ty to 0.0.33 (#22535)
+  - **scripts**: add `wc2wt.sh` - create worktree from current HEAD (#22513)
+
+## v0.8.1
+
+### Changed
+
+- **llama.cpp submodule** — Updated from 98dc1418e to d77599234 (49 commits).
+  - **server**: use `pos_next` instead of `n_tokens` for m-rope (#22439); (router) forward form-data to model server (#22118)
+  - **CUDA**: fuse SSM_CONV + ADD(bias) + SILU (#22478); refactor fusion code (#22468); Blackwell native NVFP4 support (#22196); flash-attn support for DKQ=320/DV=256 with `ncols2=32` (#22286); better coalesce data-access for contiguous concat (#22330)
+  - **ggml-cpu**: disable tiled matmul on AIX to fix page boundary segfault (#22293); append `xsmtvdotii` march for SpacemiT IME (#22317); re-enable fast `gelu_quick_f16` (#22339); optimize avx2 q6_k (#22345); SVE-tuned `gemm_q8_0_4x8_q8_0` kernel (#21916)
+  - **ggml-webgpu**: fix FlashAttention support check (#22492); fix buffer aliasing for `ssm_scan` (#22456); add Q1_0 support (#22374)
+  - **vulkan**: coalesce Q4_K/Q5_K scale loads (#21751); add barrier after `writetimestamp` (#21865)
+  - **ggml**: bump version to 0.10.1; use 64-byte aligned tile buffers (#21058); skip already-registered backends and devices (#22296); revert to `-lm` linking instead of `find_library` (#22355); improve SPIR-V headers detection with `__has_include` (#21918)
+  - **hexagon**: make vmem and buffer-size configurable (#22487); guard HMX clock request for v75+ platforms (#22377)
+  - **spec**: discard last drafted token with low prob (#22506); refactor params (#22397)
+  - **common**: do not pass prompt tokens to reasoning budget sampler (#22488); re-arm reasoning budget after DONE on new `<think>` (#22323); intentionally leak logger instance to fix hanging on Windows (#22273); fix missing exports in `llama-common` (#22340)
+  - **chat**: fix handling of space in reasoning markers (#22353); handle gemma4 parsing edge cases (#22420)
+  - **convert**: add support for Nemotron Nano 3 Omni (#22481); remove `input_scale` for dequantized fp8 modelopt (#22356)
+  - **model**: remove duplicate `wo_s` scale after `build_attn` (Qwen3, LLaMA) (#22421)
+  - **opencl**: add iq4_nl support (#22272)
+  - **CANN**: add new ops, optimize existing ops (#21204)
+  - **TP**: fix delayed AllReduce + zero-sized slices (#22489)
+  - **rpc**: fix rpc-server cache on Windows (#22394)
+  - **download**: prefer q8_0 when q4_k not available (#22428)
+  - **webui**: fix slow mic stop and WAV encode (#22480); add Server tools (#21237)
+
+## v0.8.0
+
+### Changed
+
+- **llama.cpp submodule** — Updated from 550d684bd to 98dc1418e (30 commits).
+  - **server**: fix swa-full logic (#22288); rename debug tags to match `--cache-idle-slots` (#22292); `convert_anthropic_to_oai` also copy `chat_template_kwargs` (#22154); fix heap-buffer-overflow from negative `n_discard` (CVE-2026-21869) (#22267); (anthropic API) fix prefix caching (#21793)
+  - **CUDA**: reduce MMQ stream-k overhead (#22298)
+  - **metal**: optimize Metal Tensor API usage for `GGML_OP_MUL_MAT` (#20962); print GPU description (#22318)
+  - **SYCL**: optimize Q4_0 `mul_mat` for Arc770, add scripts (#22291); fix build number for SYCL release (#22283)
+  - **hexagon**: bump HMX frequency to max corner (#22334); use DIRID 13 in `libggml-htp.inf` for modern InfVerif (#22306); add SOLVE_TRI op (#21974); add basic and extended op profiling (#22269)
+  - **ggml-webgpu**: support for SSM_SCAN and disable `set_rows` error checking (#22327); enable `FLASH_ATTN_EXT` on browser without subgroup matrix (#22199)
+  - **llama-quant**: default ftype param `Q5_1` → `Q8_0` (#20828)
+  - **spec**: fix vocab compat checks (#22358)
+  - **parser**: fix structured output bug (#22302)
+  - **common**: fix jinja warnings with clang 21 (#22313)
+  - **vendor**: update LibreSSL to 4.3.1 (#22285)
+
 ## v0.7.9
 
 ### Changed
