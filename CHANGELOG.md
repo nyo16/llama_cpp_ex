@@ -1,5 +1,37 @@
 # Changelog
 
+## Unreleased
+
+### Changed
+
+- **llama.cpp submodule** — Updated from 1e5ad35d5 to 834a24366 (63 commits).
+  - **model**: fix model type check for granite/llama3 and deepseek2/glm4.7 lite (#22870).
+  - **spec**: parallel drafting support (#22838); update CLI arguments for better consistency (#22964).
+  - **server**: accept `continue_final_message` flag for vLLM API compat (#23012); support continue generation on reasoning models (#22727); expose modalities to `/v1/models` (#22952); print warning when HTTP timeout exceeded (#22907).
+  - **mtmd**: add MiMo v2.5 vision (#22883).
+  - **CUDA**: handle `OW > 65535` in `im2col` (2D and 3D) (#22944); snake fusion hardening (#22912); directly include `cuda/iterator` (#22936); internal AllReduce kernel for CUDA provider (#22299).
+  - **SYCL**: fix multi-GPU system RAM exhaustion by using Level Zero allocations (#21597); add OP `im2col_3d` (#22903).
+  - **vulkan**: fix matmul integer pipeline selection (#23005); fix Windows performance regression on Intel GPU BF16 for Xe2+ (#22461); check shared memory size for MMQ shaders (#22693); support asymmetric FA in scalar/MMQ/coopmat1 paths (#22589).
+  - **hexagon**: add unary tanh op (#22999); eliminate scalar VTCM loads via HVX splat helpers (#22993).
+  - **opencl**: add q5_0/q5_1 MoE for Adreno (#22985); fix crash when warming up MoE on Adreno (#22876); add opt-in Adreno xmem F16xF32 GEMM for prefill (#22755); add q4_1 MoE for Adreno (#22856).
+  - **ggml-webgpu**: enable NVIDIA self-hosted CI (#22976); subgroup-aware flash attn vec path (#23040); restrict subgroup-matrix path to compatible head dims (#23020); enable running gpt-oss-20b (#22906); precision fixes for multimodal (#22808); cast intermediate results to float to avoid half+half ambiguity (#22994); flush GPU profile timestamp before queryset overflow (#22995).
+  - **ggml-cpu**: add IME2 instruction support for the SpacemiT backend (#22863).
+  - **ggml-zendnn**: adaptive fallback to CPU backend for small batch sizes (#22681).
+  - **ggml-virtgpu**: add a GHA build check (#22943); include missing mutex header (#22810).
+  - **ggml**: bump version to 0.11.1; sync ggml.
+  - **metal**: promote `mul_mv`/`mul_mm` batch divisors to function constants (#22711).
+  - **backend sampling**: support returning post-sampling probs (#22622).
+  - **unicode**: add Qwen3.5 non-backtracking tokenizer handler and regression test (#22110).
+  - **logs**: reduce verbosity (#23021).
+  - **download**: do not `exit()` on error (#23008).
+  - **convert**: fix Pixtral 12B `--mistral-format` conversion (3 bugs) (#22981); add `split()` to `LoraTorchTensor` in LoRA converter (#22832); add image break token fallback (#22914).
+  - **webui**: move static build output from repo code to HF Bucket (#22937); deduplicate model aliases (#22979); preserve system message on edit cancel (#22911); fix chat screen form box disappearing + autoscroll issues on WebKit (#22977); autoscroll detection (#23026); propagate version tag to WebUI asset download in self-hosted CI (#23051).
+  - **examples**: add `llama-eval` (#21152); enable type check in `llama-eval` (#22988); update speculative-simple README (#22938).
+  - **model-conversion**: add `causal-convert-mmproj` target (#22969).
+  - **vendor/deps**: update cpp-httplib to 0.44.0 (#22919, #22888).
+  - **build/CI**: revert docker intel compute-runtime to stable (#22968); validate model naming convention (#22680); bump `ty` to 0.0.35 (#22961).
+  - **docs**: update OPENVINO.md (#22959); fix metrics endpoint description in server README (#22879).
+
 ## v0.8.5
 
 ### Changed
