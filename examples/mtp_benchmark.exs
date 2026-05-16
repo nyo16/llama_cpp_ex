@@ -181,14 +181,12 @@ results
 |> Enum.filter(&match?(%{mode: :mtp}, &1))
 |> Enum.each(fn r ->
   t = r.timing_us
-  sum = (t.draft || 0) + (t.verify || 0) + (t.sample || 0)
-  pct = fn part -> if sum > 0, do: Float.round(part * 100 / sum, 1), else: 0.0 end
+  other = Map.get(t, :other, 0)
+  iters = max(r.iters, 1)
+  ms = fn us -> Float.round(us / 1000 / iters, 2) end
 
   IO.puts(
-    "  max_tokens=#{r.max_tokens}: " <>
-      "draft=#{t.draft}μs (#{pct.(t.draft)}%) " <>
-      "verify=#{t.verify}μs (#{pct.(t.verify)}%) " <>
-      "sample=#{t.sample}μs (#{pct.(t.sample)}%) " <>
-      "total=#{t.total}μs"
+    "  max_tokens=#{r.max_tokens}, iters=#{r.iters}: " <>
+      "draft=#{ms.(t.draft)} verify=#{ms.(t.verify)} sample=#{ms.(t.sample)} other=#{ms.(other)} total=#{ms.(t.total)} ms/iter"
   )
 end)

@@ -882,25 +882,28 @@ static ERL_NIF_TERM build_mtp_stats_map(ErlNifEnv* env, const LlamaSpeculative& 
     uint64_t udraft  = s.us_draft.load(std::memory_order_relaxed);
     uint64_t uverify = s.us_verify.load(std::memory_order_relaxed);
     uint64_t usample = s.us_sample.load(std::memory_order_relaxed);
+    uint64_t uother  = s.us_other.load(std::memory_order_relaxed);
     uint64_t utotal  = s.us_total.load(std::memory_order_relaxed);
 
     double acceptance_rate = dgen > 0 ? (double)dacc / (double)dgen : 0.0;
     double tokens_per_sec  = utotal > 0 ? (double)emitted * 1e6 / (double)utotal : 0.0;
 
-    ERL_NIF_TERM tk[4] = {
+    ERL_NIF_TERM tk[5] = {
         enif_make_atom(env, "draft"),
         enif_make_atom(env, "verify"),
         enif_make_atom(env, "sample"),
+        enif_make_atom(env, "other"),
         enif_make_atom(env, "total"),
     };
-    ERL_NIF_TERM tv[4] = {
+    ERL_NIF_TERM tv[5] = {
         enif_make_uint64(env, udraft),
         enif_make_uint64(env, uverify),
         enif_make_uint64(env, usample),
+        enif_make_uint64(env, uother),
         enif_make_uint64(env, utotal),
     };
     ERL_NIF_TERM timing;
-    enif_make_map_from_arrays(env, tk, tv, 4, &timing);
+    enif_make_map_from_arrays(env, tk, tv, 5, &timing);
 
     ERL_NIF_TERM keys[8] = {
         enif_make_atom(env, "iters"),
@@ -1149,6 +1152,10 @@ fine::Ok<> generate_mtp_tokens(
     while (n_emitted < max_tokens) {
         sp.n_iters.fetch_add(1, std::memory_order_relaxed);
 
+        // Anchor for the "other" bucket: time between known timer ends
+        // (us_draft, us_verify, us_sample) accumulates into us_other.
+        auto t_anchor = std::chrono::steady_clock::now();
+
         // 0. Ensure the draft ctx is at pos n_past - 1 BEFORE drafting.
         //    After a partial-accept in the previous iteration, ctx_dft may
         //    still hold positions [n_past, n_past + drafts_prev) that need
@@ -1178,6 +1185,10 @@ fine::Ok<> generate_mtp_tokens(
         std::vector<llama_token> drafts;
         {
             auto t0 = std::chrono::steady_clock::now();
+            sp.us_other.fetch_add(
+                std::chrono::duration_cast<std::chrono::microseconds>(t0 - t_anchor).count(),
+                std::memory_order_relaxed);
+
             auto& dp = common_speculative_get_draft_params(sp.spec, seq_id);
             dp.drafting = true;
             dp.n_max    = n_draft;
@@ -1187,9 +1198,9 @@ fine::Ok<> generate_mtp_tokens(
             dp.result   = &drafts;
 
             common_speculative_draft(sp.spec);
+            t_anchor = std::chrono::steady_clock::now();
             sp.us_draft.fetch_add(
-                std::chrono::duration_cast<std::chrono::microseconds>(
-                    std::chrono::steady_clock::now() - t0).count(),
+                std::chrono::duration_cast<std::chrono::microseconds>(t_anchor - t0).count(),
                 std::memory_order_relaxed);
         }
 
@@ -1217,6 +1228,10 @@ fine::Ok<> generate_mtp_tokens(
         // 3. Decode on the target context, then feed back into the spec.
         {
             auto t0 = std::chrono::steady_clock::now();
+            sp.us_other.fetch_add(
+                std::chrono::duration_cast<std::chrono::microseconds>(t0 - t_anchor).count(),
+                std::memory_order_relaxed);
+
             int ret = llama_decode(ctx_tgt, batch);
             if (ret != 0) {
                 llama_batch_free(batch);
@@ -1230,9 +1245,9 @@ fine::Ok<> generate_mtp_tokens(
                 enif_free_env(msg_env);
                 return fine::Ok();
             }
+            t_anchor = std::chrono::steady_clock::now();
             sp.us_verify.fetch_add(
-                std::chrono::duration_cast<std::chrono::microseconds>(
-                    std::chrono::steady_clock::now() - t0).count(),
+                std::chrono::duration_cast<std::chrono::microseconds>(t_anchor - t0).count(),
                 std::memory_order_relaxed);
         }
 
@@ -1246,10 +1261,13 @@ fine::Ok<> generate_mtp_tokens(
 
         for (int i = 0; i < n_verify; i++) {
             auto t0 = std::chrono::steady_clock::now();
+            sp.us_other.fetch_add(
+                std::chrono::duration_cast<std::chrono::microseconds>(t0 - t_anchor).count(),
+                std::memory_order_relaxed);
             llama_token tok = llama_sampler_sample(sampler, ctx_tgt, i);
+            t_anchor = std::chrono::steady_clock::now();
             sp.us_sample.fetch_add(
-                std::chrono::duration_cast<std::chrono::microseconds>(
-                    std::chrono::steady_clock::now() - t0).count(),
+                std::chrono::duration_cast<std::chrono::microseconds>(t_anchor - t0).count(),
                 std::memory_order_relaxed);
             llama_sampler_accept(sampler, tok);
 
@@ -1332,6 +1350,14 @@ fine::Ok<> generate_mtp_tokens(
         n_past += n_accepted_total;
 
         maybe_send_stats();
+
+        // Close out us_other for this iter — captures the post-sample-loop
+        // work plus any implicit GPU-sync wait that bleeds into the next
+        // iter from llama_decode's async submission on Metal.
+        sp.us_other.fetch_add(
+            std::chrono::duration_cast<std::chrono::microseconds>(
+                std::chrono::steady_clock::now() - t_anchor).count(),
+            std::memory_order_relaxed);
 
         if (send_failed) {
             // Caller process is gone; stop quietly.

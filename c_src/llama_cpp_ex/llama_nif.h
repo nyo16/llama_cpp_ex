@@ -90,6 +90,13 @@ public:
     std::atomic<uint64_t> us_draft{0};
     std::atomic<uint64_t> us_verify{0};
     std::atomic<uint64_t> us_sample{0};
+    // Everything in the speculative iter NOT inside the three hot-path
+    // timers above. On Metal this is dominated by implicit GPU-sync waits
+    // from the previous iter's async verify decode (llama_decode returns
+    // before the command buffer completes; the wait lands on the next
+    // unrelated allocation in the next iter). Sum of draft+verify+sample
+    // +other ≈ us_total.
+    std::atomic<uint64_t> us_other{0};
     std::atomic<uint64_t> us_total{0};
 
     LlamaSpeculative(common_speculative* s,

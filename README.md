@@ -326,9 +326,13 @@ See [Performance Guide](docs/performance.md) for all available parameters includ
 
 Multi-Token Prediction speculative decoding (upstream PR [#22673](https://github.com/ggml-org/llama.cpp/pull/22673)) drafts several tokens at once via a head shipped inside the same GGUF as the target model. Upstream llama-server reports ~2x speedup at ~75% draft acceptance on Qwen 3.6.
 
-> **Performance note: Apple Silicon.** The 2× number comes from NVIDIA datacenter GPUs, where a batched verify decode costs ~1.2× a single-token decode. On Apple Silicon (Metal), a 4-wide verify costs ~2.4× a single decode, which cancels MTP's iteration savings. We measured upstream's own `llama-server --spec-type draft-mtp` on M1 Max: **39.80 tok/s with MTP vs 39.14 tok/s plain** on Qwen 3.6 35B-A3B — i.e. effectively zero speedup from the reference implementation itself. This matches the pattern reported in upstream [#23011](https://github.com/ggml-org/llama.cpp/issues/23011); a Metal MTP optimization is tracked in [#23114](https://github.com/ggml-org/llama.cpp/pull/23114).
+> **Performance note: Apple Silicon.** The upstream 2× claim is from NVIDIA datacenter GPUs, where a batched verify decode costs ~1.2× a single-token decode. On Apple Silicon (Metal), a 4-wide verify costs ~2.4× a single decode, which cancels MTP's iteration savings. We measured upstream's own `llama-server --spec-type draft-mtp` on M1 Max: **39.80 tok/s with MTP vs 39.14 tok/s plain** on Qwen 3.6 35B-A3B (1.02×) — i.e. effectively zero speedup from the reference implementation itself. This matches the pattern in upstream [#23011](https://github.com/ggml-org/llama.cpp/issues/23011); a Metal MTP optimization is tracked in [#23114](https://github.com/ggml-org/llama.cpp/pull/23114).
 >
-> **Tuning for Apple Silicon:** use `n_draft: 1`. With one draft per iteration the verify batch is only 2-wide (much cheaper on Metal) and acceptance jumps (we observed ~79% on Qwen 3.6 35B-A3B), netting ~1.06× over plain decoding. Larger `n_draft` (3, 4) hurts on Metal because batched-decode cost grows faster than acceptance benefit. On NVIDIA, `n_draft: 3` is the right default — that's what the upstream 2× speedup number assumes.
+> **Tuning for Apple Silicon:** use `n_draft: 1`. With one draft per iteration the verify batch is only 2-wide (much cheaper on Metal) and acceptance jumps to ~79% on Qwen 3.6 35B-A3B. Our measurements on M1 Max with `n_draft: 1`:
+> - Qwen 3.6 35B-A3B-MTP (hybrid MoE): plain 39.5 → MTP **44.0 tok/s (1.11×)**
+> - Qwen 3.6 27B (dense): plain 10.7 → MTP **10.6 tok/s (~1.0×, neutral)**
+>
+> Larger `n_draft` hurts on Metal because verify cost grows faster than acceptance benefit. On NVIDIA, `n_draft: 3` is the right default — that's what the upstream 2× number assumes.
 
 ### Models with MTP heads
 
