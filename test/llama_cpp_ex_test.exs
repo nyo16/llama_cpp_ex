@@ -818,6 +818,40 @@ defmodule LlamaCppExTest do
         :telemetry.detach("test-request-done-#{inspect(ref)}")
         :telemetry.detach("test-tick-#{inspect(ref)}")
       end
+
+      @tag timeout: 120_000
+      @tag :slow
+      test "cache_prompt sequential requests don't crash on hybrid models" do
+        # Regression test for the M-RoPE positional-mismatch abort that fired
+        # when partial seq_rm silently no-op'd on hybrid GDN models (Qwen 3.5
+        # / 3.6). The fix: probe common_context_can_seq_rm at server init and
+        # fall back to a full slot reset when the model only supports `:full`
+        # range trims.
+        :ok = LlamaCppEx.init()
+
+        {:ok, server} =
+          LlamaCppEx.Server.start_link(
+            model_path: @model_path,
+            n_parallel: 1,
+            n_ctx: 4096,
+            cache_prompt: true
+          )
+
+        shared = "System: respond briefly.\nUser: "
+
+        {:ok, t1} =
+          LlamaCppEx.Server.generate(server, shared <> "Say one word.", max_tokens: 12)
+
+        # Second request shares a prefix with the first but diverges — this is
+        # the path that previously triggered the M-RoPE crash on hybrid models.
+        {:ok, t2} =
+          LlamaCppEx.Server.generate(server, shared <> "Pick a color.", max_tokens: 12)
+
+        assert is_binary(t1) and byte_size(t1) > 0
+        assert is_binary(t2) and byte_size(t2) > 0
+
+        GenServer.stop(server, :normal, 10_000)
+      end
     end
   else
     @tag :skip
