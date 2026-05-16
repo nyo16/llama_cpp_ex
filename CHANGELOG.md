@@ -2,7 +2,21 @@
 
 ## Unreleased
 
+### Added
+
+- **Multi-Token Prediction (MTP) speculative decoding** — new `LlamaCppEx.MTP` module exposing `init/2`, `stream/3`, `stream_events/3`, `generate/3`, `stats/1`, and `print_stats/1`. Drives a target/draft speculative loop where the draft model is the MTP head embedded in the same GGUF (e.g. [`ggml-org/Qwen3.6-35B-A3B-MTP-GGUF`](https://huggingface.co/ggml-org/Qwen3.6-35B-A3B-MTP-GGUF), or the `unsloth/Qwen3.6-35B-A3B-MTP-GGUF` UD-Q4_K_XL quant). On hybrid models (GDN + attention, e.g. Qwen 3.6) the loop wraps each iteration in a recurrent-state checkpoint save/restore so partial draft rejections are recoverable. See README "Speculative decoding (MTP)" and `examples/mtp_speculative.exs` / `examples/mtp_benchmark.exs`.
+
+  **Current performance status:** correctness is verified end-to-end, acceptance peaks around 50–60% on Qwen 3.6 in our setup, and throughput is roughly on par with non-MTP decoding. Upstream llama-server hits ~75% acceptance and ~2x speedup — closing that gap (MTP-head priming + cheaper checkpointing) is tracked for follow-up.
+- **Live MTP statistics** — `MTP.stats/1` returns a lock-free snapshot of speculative counters (`iters`, `drafts_generated`, `drafts_accepted`, `acceptance_rate`, `tokens_emitted`, `tokens_per_sec`, per-stage `timing_us`). Safe to call mid-stream from any process; optional `:emit_stats_every` flag streams periodic snapshots over the token channel.
+- **Context options for speculative decoding** — `LlamaCppEx.Context.create/2` accepts `:ctx_type` (`:default` / `:mtp`) and `:n_rs_seq` (rollback snapshot count), plus new `Context.n_rs_seq/1` getter.
+
 ### Changed
+
+- **llama.cpp submodule** — Updated from 1e5ad35d5 to 0253fb21f (94 commits), pulling in MTP and related speculative-decoding work.
+  - **llama + spec**: MTP Support (#22673) — multi-token prediction speculative decoding, new `llama_context_type` enum (`LLAMA_CONTEXT_TYPE_DEFAULT` / `LLAMA_CONTEXT_TYPE_MTP`), new `llama_context_params.ctx_type` and `n_rs_seq` fields, new `llama_n_rs_seq()` API, new `COMMON_SPECULATIVE_TYPE_DRAFT_MTP`.
+  - **spec**: parallel drafting support (#22838); update CLI arguments for better consistency (#22964); allow partial seq_rm for GDN models for speculative decoding (#22400).
+
+#### Previously in 0.8.6 (squashed into the master bump)
 
 - **llama.cpp submodule** — Updated from 1e5ad35d5 to 834a24366 (63 commits).
   - **model**: fix model type check for granite/llama3 and deepseek2/glm4.7 lite (#22870).

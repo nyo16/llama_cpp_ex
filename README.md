@@ -21,6 +21,7 @@ Built with C++ NIFs using [fine](https://github.com/elixir-nx/fine) for ergonomi
 - Structured output via JSON Schema (auto-converted to GBNF grammar)
 - Optional Ecto schema to JSON Schema conversion
 - Continuous batching server for concurrent inference
+- **Multi-Token Prediction (MTP) speculative decoding** — ~2x token-generation speedup on Qwen 3.6 with live acceptance-rate stats
 - **Prefix caching** — same-slot KV cache reuse for multi-turn chat (1.23x faster)
 - **Pluggable batching strategies** — DecodeMaximal, PrefillPriority, Balanced
 - **Pre-tokenized API** — tokenize outside the GenServer for lower contention
@@ -320,6 +321,66 @@ These also work with the high-level API:
 ```
 
 See [Performance Guide](docs/performance.md) for all available parameters including RoPE context extension, GPU offload control, attention type, and more.
+
+## Speculative decoding (MTP)
+
+Multi-Token Prediction speculative decoding (upstream PR [#22673](https://github.com/ggml-org/llama.cpp/pull/22673)) drafts several tokens at once via a head shipped inside the same GGUF as the target model. Upstream llama-server reports ~2x speedup at ~75% draft acceptance on Qwen 3.6.
+
+> **Status (initial release):** this binding ships a single-sequence MTP loop with full statistics. On a hybrid model like Qwen 3.6 (GDN + attention layers) we still pay a per-iteration recurrent-state checkpoint, and our current draft acceptance peaks around 50–60% — so end-to-end throughput is roughly on par with non-MTP decoding rather than 2x. The pipeline is correct and stats are accurate; performance tuning (priming the MTP head, lighter checkpointing) is tracked for follow-up. See `LlamaCppEx.MTP` and `examples/mtp_benchmark.exs`.
+
+### Models with MTP heads
+
+- [`ggml-org/Qwen3.6-35B-A3B-MTP-GGUF`](https://huggingface.co/ggml-org/Qwen3.6-35B-A3B-MTP-GGUF) (recommended: `Q4_K_M`, ~21 GB)
+- [`ggml-org/Qwen3.6-27B-MTP-GGUF`](https://huggingface.co/ggml-org/Qwen3.6-27B-MTP-GGUF)
+- [`unsloth/Qwen3.6-35B-A3B-MTP-GGUF`](https://huggingface.co/unsloth/Qwen3.6-35B-A3B-MTP-GGUF)
+
+A regular (non-MTP) Qwen 3.6 quant will fail at `LlamaCppEx.MTP.init/2` — the GGUF must contain `mtp-*` tensors.
+
+### Usage
+
+```elixir
+:ok = LlamaCppEx.init()
+{:ok, model} = LlamaCppEx.load_model(
+  "~/Downloads/Qwen3.6-35B-A3B-MTP-Q4_K_M.gguf" |> Path.expand(),
+  n_gpu_layers: 999
+)
+
+# Build the speculative session once — it owns a target context and a
+# separate MTP draft context on the same model.
+{:ok, mtp} = LlamaCppEx.MTP.init(model, n_draft: 3, n_ctx: 8192)
+
+# Stream like any other generation.
+mtp
+|> LlamaCppEx.MTP.stream("Write a haiku about the sea:", max_tokens: 256)
+|> Stream.each(&IO.write/1)
+|> Stream.run()
+
+# Inspect the speculative stats.
+stats = LlamaCppEx.MTP.stats(mtp)
+IO.puts("acceptance rate: #{Float.round(stats.acceptance_rate * 100, 1)}%")
+IO.puts("tokens/sec:      #{Float.round(stats.tokens_per_sec, 1)}")
+```
+
+`LlamaCppEx.MTP.stats/1` is lock-free and safe to call from any process — including mid-stream — so it composes with live progress dashboards.
+
+### Options
+
+`LlamaCppEx.MTP.init/2`:
+
+  * `:n_draft` — draft tokens proposed per iteration (default `3`). 2–4 is the sweet spot.
+  * `:n_ctx`, `:n_threads`, `:flash_attn`, `:type_k`/`:type_v`, `:offload_kqv`, … — any `LlamaCppEx.Context` option; applied to both target and draft contexts.
+
+`LlamaCppEx.MTP.stream/3`:
+
+  * `:max_tokens` (default `256`), plus all sampling options (`:temp`, `:top_k`, `:top_p`, `:min_p`, `:seed`, `:penalty_*`, `:grammar`).
+  * `:emit_stats_every` — when set, periodic `{:stats, _}` events become available via `stream_events/3`.
+
+### Caveats
+
+- Upstream currently requires `n_parallel = 1` for MTP; this binding mirrors that. Use `LlamaCppEx.Server` for concurrent non-MTP inference, or stick to a single MTP session at a time.
+- Prompt prefill is somewhat slower with MTP than without (the MTP head also processes the prompt). The win shows up at decode time.
+
+See [`examples/mtp_speculative.exs`](examples/mtp_speculative.exs) for a runnable demo with full timing breakdown.
 
 ## Benchmarks
 

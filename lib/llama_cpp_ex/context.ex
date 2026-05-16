@@ -56,6 +56,16 @@ defmodule LlamaCppEx.Context do
     * `:no_perf` - Disable performance timing. Defaults to `true`.
     * `:swa_full` - Use full-size sliding window attention cache. Defaults to `true`.
 
+  ### Speculative decoding / MTP
+
+    * `:ctx_type` - Context kind. `:default` (the main target context, default) or `:mtp`
+      (a draft context that consumes MTP heads from the same model). Use `:mtp` together
+      with a separate `:default` context to drive multi-token-prediction speculative
+      decoding via `LlamaCppEx.MTP`.
+    * `:n_rs_seq` - Number of recurrent-state snapshots per sequence to retain for
+      partial rollback of speculative drafts. `0` (default) disables rollback. For an
+      MTP draft context, set this to your intended max draft length (e.g. `3`).
+
   """
   @spec create(LlamaCppEx.Model.t(), keyword()) :: {:ok, t()} | {:error, String.t()}
   def create(%LlamaCppEx.Model{ref: model_ref} = model, opts \\ []) do
@@ -95,6 +105,10 @@ defmodule LlamaCppEx.Context do
     no_perf = Keyword.get(opts, :no_perf, true)
     swa_full = Keyword.get(opts, :swa_full, true)
 
+    # Speculative decoding / MTP
+    ctx_type = Keyword.get(opts, :ctx_type, :default) |> ctx_type_to_int()
+    n_rs_seq = Keyword.get(opts, :n_rs_seq, 0)
+
     case LlamaCppEx.NIF.context_create(
            model_ref,
            n_ctx,
@@ -120,7 +134,9 @@ defmodule LlamaCppEx.Context do
            yarn_orig_ctx,
            attention_type,
            no_perf,
-           swa_full
+           swa_full,
+           ctx_type,
+           n_rs_seq
          ) do
       {:ok, ref} -> {:ok, %__MODULE__{ref: ref, model: model}}
       {:error, _} = error -> error
@@ -134,6 +150,17 @@ defmodule LlamaCppEx.Context do
   @doc "Returns the max number of sequences."
   @spec n_seq_max(t()) :: integer()
   def n_seq_max(%__MODULE__{ref: ref}), do: LlamaCppEx.NIF.context_n_seq_max(ref)
+
+  @doc """
+  Returns the number of recurrent-state snapshots per sequence available for
+  partial rollback of speculative drafts.
+
+  `0` means the context does not support partial rollback (e.g. a regular target
+  context with `n_rs_seq: 0`). For an MTP draft context created with
+  `n_rs_seq: N`, this returns at most `N`.
+  """
+  @spec n_rs_seq(t()) :: non_neg_integer()
+  def n_rs_seq(%__MODULE__{ref: ref}), do: LlamaCppEx.NIF.context_n_rs_seq(ref)
 
   @doc "Clears the KV cache."
   @spec clear(t()) :: :ok
@@ -205,4 +232,8 @@ defmodule LlamaCppEx.Context do
   defp attention_type_to_int(:causal), do: 0
   defp attention_type_to_int(:non_causal), do: 1
   defp attention_type_to_int(n) when is_integer(n), do: n
+
+  defp ctx_type_to_int(:default), do: 0
+  defp ctx_type_to_int(:mtp), do: 1
+  defp ctx_type_to_int(n) when is_integer(n), do: n
 end

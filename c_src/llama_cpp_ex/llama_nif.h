@@ -3,6 +3,8 @@
 #include <fine.hpp>
 #include <llama.h>
 #include "chat.h"
+#include "speculative.h"
+#include <atomic>
 
 namespace llama_cpp_ex {
 
@@ -59,6 +61,46 @@ public:
 
     LlamaSampler(const LlamaSampler&) = delete;
     LlamaSampler& operator=(const LlamaSampler&) = delete;
+};
+
+// RAII wrapper for common_speculative* (MTP draft state).
+// Holds ResourcePtrs to both the target (main) and draft (MTP) contexts so
+// they stay alive while a speculative session is in flight. Counters are
+// updated by the streaming generate_mtp_tokens NIF and read lock-free by
+// speculative_stats; relaxed ordering is sufficient because readers tolerate
+// a slightly stale snapshot and there is no cross-counter invariant to
+// preserve.
+class LlamaSpeculative {
+public:
+    common_speculative* spec;
+    fine::ResourcePtr<LlamaContext> ctx_tgt;
+    fine::ResourcePtr<LlamaContext> ctx_dft;
+    uint32_t n_draft;
+
+    std::atomic<uint64_t> n_iters{0};
+    std::atomic<uint64_t> n_drafts_generated{0};
+    std::atomic<uint64_t> n_drafts_accepted{0};
+    std::atomic<uint64_t> n_tokens_emitted{0};
+    std::atomic<uint64_t> us_draft{0};
+    std::atomic<uint64_t> us_verify{0};
+    std::atomic<uint64_t> us_sample{0};
+    std::atomic<uint64_t> us_total{0};
+
+    LlamaSpeculative(common_speculative* s,
+                     fine::ResourcePtr<LlamaContext> tgt,
+                     fine::ResourcePtr<LlamaContext> dft,
+                     uint32_t n)
+        : spec(s)
+        , ctx_tgt(std::move(tgt))
+        , ctx_dft(std::move(dft))
+        , n_draft(n)
+    {}
+    ~LlamaSpeculative() {
+        if (spec) common_speculative_free(spec);
+    }
+
+    LlamaSpeculative(const LlamaSpeculative&) = delete;
+    LlamaSpeculative& operator=(const LlamaSpeculative&) = delete;
 };
 
 } // namespace llama_cpp_ex

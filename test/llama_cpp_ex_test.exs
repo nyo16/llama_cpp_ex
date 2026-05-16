@@ -3,6 +3,7 @@ defmodule LlamaCppExTest do
 
   @model_path System.get_env("LLAMA_MODEL_PATH")
   @embedding_model_path System.get_env("LLAMA_EMBEDDING_MODEL_PATH")
+  @mtp_model_path System.get_env("LLAMA_MTP_MODEL_PATH")
 
   describe "Grammar (JSON Schema to GBNF)" do
     test "from_json_schema converts simple object schema" do
@@ -905,6 +906,88 @@ defmodule LlamaCppExTest do
     @tag :skip
     test "embedding tests require LLAMA_EMBEDDING_MODEL_PATH env var" do
       flunk("Set LLAMA_EMBEDDING_MODEL_PATH to an embedding .gguf file to run embedding tests")
+    end
+  end
+
+  if @mtp_model_path && File.exists?(@mtp_model_path) do
+    describe "MTP speculative decoding" do
+      @describetag :mtp
+      @describetag timeout: 300_000
+
+      setup do
+        :ok = LlamaCppEx.init()
+        {:ok, model} = LlamaCppEx.load_model(@mtp_model_path, n_gpu_layers: 999)
+        {:ok, mtp} = LlamaCppEx.MTP.init(model, n_draft: 3, n_ctx: 4096)
+        on_exit(fn -> :ok end)
+        %{model: model, mtp: mtp}
+      end
+
+      test "draft context exposes rollback capacity", %{mtp: mtp} do
+        # n_rs_seq on the MTP draft ctx should be at least the configured n_draft;
+        # the default target ctx should report 0 (no rollback).
+        assert LlamaCppEx.Context.n_rs_seq(mtp.mtp_ctx) >= mtp.n_draft
+        assert LlamaCppEx.Context.n_rs_seq(mtp.main_ctx) == 0
+      end
+
+      test "stream produces text and a sensible acceptance rate", %{mtp: mtp} do
+        chunks =
+          mtp
+          |> LlamaCppEx.MTP.stream("Briefly explain prime numbers:",
+            max_tokens: 96,
+            temp: 0.7,
+            seed: 42
+          )
+          |> Enum.to_list()
+
+        text = IO.iodata_to_binary(chunks)
+        assert byte_size(text) > 0
+
+        stats = LlamaCppEx.MTP.stats(mtp)
+        assert stats.tokens_emitted > 0
+        # Loose floor — upstream reports ~0.75 on Qwen 3.6 MTP. Anything
+        # under 0.3 indicates the draft/verify wiring is broken.
+        assert stats.acceptance_rate > 0.3,
+               "acceptance_rate=#{stats.acceptance_rate} (expected > 0.3); " <>
+                 "stats=#{inspect(stats)}"
+      end
+
+      test "live stats are readable mid-stream and advance monotonically", %{mtp: mtp} do
+        parent = self()
+
+        gen_task =
+          Task.async(fn ->
+            mtp
+            |> LlamaCppEx.MTP.stream("Count from one to one hundred:",
+              max_tokens: 64,
+              temp: 0.0
+            )
+            |> Enum.into("")
+            |> then(&send(parent, {:gen_done, &1}))
+          end)
+
+        # Sample a few snapshots while generation is in flight.
+        snapshots =
+          for _ <- 1..5 do
+            Process.sleep(50)
+            LlamaCppEx.MTP.stats(mtp)
+          end
+
+        Task.await(gen_task, 60_000)
+        assert_receive {:gen_done, _text}, 1_000
+
+        token_counts = Enum.map(snapshots, & &1.tokens_emitted)
+
+        assert token_counts == Enum.sort(token_counts),
+               "tokens_emitted should be monotonically non-decreasing, got #{inspect(token_counts)}"
+      end
+    end
+  else
+    @tag :skip
+    test "MTP tests require LLAMA_MTP_MODEL_PATH env var" do
+      flunk(
+        "Set LLAMA_MTP_MODEL_PATH to an MTP-enabled .gguf file " <>
+          "(e.g. from ggml-org/Qwen3.6-35B-A3B-MTP-GGUF)"
+      )
     end
   end
 end
