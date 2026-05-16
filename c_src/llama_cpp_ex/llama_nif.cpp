@@ -416,6 +416,22 @@ bool memory_seq_rm(ErlNifEnv* env, fine::ResourcePtr<LlamaContext> ctx,
 }
 FINE_NIF(memory_seq_rm, 0);
 
+// Reports what kinds of seq_rm the context supports — `:part` (any position
+// range), `:full` (whole sequence only — hybrid GDN models), `:rs` (partial
+// bounded by n_rs_seq snapshots), or `:no` (no memory module). NOTE: calling
+// this clears the context's KV memory as a side effect (upstream behavior).
+// Only call once at init time, before any decode work has been done.
+fine::Term context_can_seq_rm(ErlNifEnv* env, fine::ResourcePtr<LlamaContext> ctx) {
+    switch (common_context_can_seq_rm(ctx->ctx)) {
+        case COMMON_CONTEXT_SEQ_RM_TYPE_NO:   return fine::Term(enif_make_atom(env, "no"));
+        case COMMON_CONTEXT_SEQ_RM_TYPE_PART: return fine::Term(enif_make_atom(env, "part"));
+        case COMMON_CONTEXT_SEQ_RM_TYPE_FULL: return fine::Term(enif_make_atom(env, "full"));
+        case COMMON_CONTEXT_SEQ_RM_TYPE_RS:   return fine::Term(enif_make_atom(env, "rs"));
+    }
+    return fine::Term(enif_make_atom(env, "unknown"));
+}
+FINE_NIF(context_can_seq_rm, 0);
+
 // --- Memory seq_cp ---
 
 fine::Ok<> memory_seq_cp(ErlNifEnv* env, fine::ResourcePtr<LlamaContext> ctx,

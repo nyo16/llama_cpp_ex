@@ -109,6 +109,7 @@ defmodule LlamaCppEx.NIF do
   def memory_seq_cp(_ctx, _seq_id_src, _seq_id_dst, _p0, _p1), do: :erlang.nif_error(:not_loaded)
   def memory_seq_keep(_ctx, _seq_id), do: :erlang.nif_error(:not_loaded)
   def memory_seq_pos_max(_ctx, _seq_id), do: :erlang.nif_error(:not_loaded)
+  def context_can_seq_rm(_ctx), do: :erlang.nif_error(:not_loaded)
 
   # Chat template
   def chat_apply_template(_template, _messages, _add_assistant),

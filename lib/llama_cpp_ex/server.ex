@@ -82,6 +82,10 @@ defmodule LlamaCppEx.Server do
     n_batch: 2048,
     chunk_size: 512,
     cache_prompt: false,
+    # `:part`/`:rs` = partial seq_rm works; `:full` = whole-sequence only
+    # (hybrid GDN models like Qwen 3.5/3.6); `:no` = no memory module. We
+    # only do prefix-cache partial trims when this is `:part` or `:rs`.
+    seq_rm_kind: :part,
     batch_strategy: LlamaCppEx.Server.Strategy.DecodeMaximal,
     tick_scheduled: false
   ]
@@ -314,6 +318,23 @@ defmodule LlamaCppEx.Server do
         [n_ctx: n_ctx, n_batch: n_batch, n_seq_max: n_parallel] ++ context_opts
       )
 
+    # Probe seq_rm support BEFORE any decode work — the call has the side
+    # effect of clearing KV memory. Hybrid models (GDN, e.g. Qwen 3.5/3.6)
+    # report `:full`, meaning partial range trims aren't supported; we'd
+    # otherwise produce M-RoPE position-mismatch aborts in the prefix-cache
+    # path when an old slot's KV tail extends past the new prompt's prefix
+    # match.
+    seq_rm_kind = LlamaCppEx.NIF.context_can_seq_rm(ctx.ref)
+
+    if cache_prompt and seq_rm_kind == :full do
+      Logger.info(
+        "LlamaCppEx.Server: cache_prompt: true requested but model reports " <>
+          "seq_rm support = :full (hybrid GDN). Prefix cache will only fire " <>
+          "for exact-prefix continuations; cache hits requiring partial KV " <>
+          "trim will fall back to a full slot reset."
+      )
+    end
+
     slots =
       for seq_id <- 0..(n_parallel - 1), into: %{} do
         {:ok, sampler} = Sampler.create(model, sampler_opts)
@@ -355,6 +376,7 @@ defmodule LlamaCppEx.Server do
       n_batch: n_batch,
       chunk_size: chunk_size,
       cache_prompt: cache_prompt,
+      seq_rm_kind: seq_rm_kind,
       batch_strategy: batch_strategy
     }
 
@@ -481,22 +503,40 @@ defmodule LlamaCppEx.Server do
   defp init_slot(state, seq_id, tokens, max_tokens, from, stream_pid, stream_ref) do
     slot = state.slots[seq_id]
 
-    # Prefix cache: find common prefix with cached KV
-    n_match =
+    # Prefix cache: find common prefix with cached KV. On models that only
+    # support whole-sequence seq_rm (`:full`, e.g. hybrid GDN), a partial
+    # trim would silently fail and leave stale KV past `n_match`, producing
+    # an M-RoPE position-mismatch abort on the next decode. Disable the
+    # cache hit in that case unless the new prompt extends the old one
+    # exactly (no trim needed).
+    raw_match =
       if state.cache_prompt do
         common_prefix_length(tokens, slot.cached_tokens)
       else
         0
       end
 
-    if n_match > 0 do
-      # Trim KV cache beyond the matched prefix
-      if n_match < slot.cached_pos do
-        LlamaCppEx.NIF.memory_seq_rm(state.ctx.ref, seq_id, n_match, -1)
+    needs_trim = raw_match > 0 and raw_match < slot.cached_pos
+
+    n_match =
+      if needs_trim and state.seq_rm_kind == :full do
+        0
+      else
+        raw_match
       end
-    else
-      # No match — clear everything
-      LlamaCppEx.NIF.memory_seq_rm(state.ctx.ref, seq_id, 0, -1)
+
+    cond do
+      n_match > 0 and n_match < slot.cached_pos ->
+        # Trim KV cache beyond the matched prefix (only safe on `:part`/`:rs`).
+        true = LlamaCppEx.NIF.memory_seq_rm(state.ctx.ref, seq_id, n_match, -1)
+
+      n_match > 0 ->
+        # Exact-prefix continuation; nothing to trim.
+        :noop
+
+      true ->
+        # No usable match — clear everything for this slot.
+        _ = LlamaCppEx.NIF.memory_seq_rm(state.ctx.ref, seq_id, 0, -1)
     end
 
     # Reset sampler for fresh generation
