@@ -77,6 +77,12 @@ public:
     fine::ResourcePtr<LlamaContext> ctx_dft;
     uint32_t n_draft;
 
+    // True when ctx_tgt requires checkpointing for partial draft rollback
+    // (e.g. hybrid models like Qwen 3.6 MoE with GDN layers). Captured once
+    // at speculative_init time. Dense attention-only models report
+    // COMMON_CONTEXT_SEQ_RM_TYPE_PART and skip the checkpoint path entirely.
+    bool needs_ckpt;
+
     std::atomic<uint64_t> n_iters{0};
     std::atomic<uint64_t> n_drafts_generated{0};
     std::atomic<uint64_t> n_drafts_accepted{0};
@@ -89,11 +95,13 @@ public:
     LlamaSpeculative(common_speculative* s,
                      fine::ResourcePtr<LlamaContext> tgt,
                      fine::ResourcePtr<LlamaContext> dft,
-                     uint32_t n)
+                     uint32_t n,
+                     bool ckpt)
         : spec(s)
         , ctx_tgt(std::move(tgt))
         , ctx_dft(std::move(dft))
         , n_draft(n)
+        , needs_ckpt(ckpt)
     {}
     ~LlamaSpeculative() {
         if (spec) common_speculative_free(spec);

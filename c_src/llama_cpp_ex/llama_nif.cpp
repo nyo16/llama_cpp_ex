@@ -831,6 +831,20 @@ speculative_init(
         return fine::Error(std::string("n_draft must be > 0"));
     }
 
+    // Probe partial-rollback support on the target context BEFORE
+    // common_speculative_init. Two reasons:
+    //   1. common_context_can_seq_rm clears the context's KV memory as a
+    //      side effect (see common.h:904).
+    //   2. common_speculative_init's MTP impl calls
+    //      llama_set_embeddings_pre_norm(ctx_tgt, true) in its constructor.
+    //      Probing afterwards would clobber that flag and the MTP head
+    //      would see garbage hidden states (acceptance drops to ~5%).
+    // Dense attention-only models report PART → partial seq_rm is native,
+    // skip the per-iter checkpoint path. Hybrid models (Qwen 3.6 MoE with
+    // GDN layers) report FULL → checkpoint every iteration.
+    const auto rm_type_tgt = common_context_can_seq_rm(ctx_tgt->ctx);
+    const bool needs_ckpt = (rm_type_tgt == COMMON_CONTEXT_SEQ_RM_TYPE_FULL);
+
     common_params_speculative params;
     params.types        = { COMMON_SPECULATIVE_TYPE_DRAFT_MTP };
     params.draft.n_max  = static_cast<int32_t>(n_draft);
@@ -851,7 +865,8 @@ speculative_init(
     }
 
     return fine::Ok(fine::make_resource<LlamaSpeculative>(
-        spec, std::move(ctx_tgt), std::move(ctx_dft), static_cast<uint32_t>(n_draft)));
+        spec, std::move(ctx_tgt), std::move(ctx_dft),
+        static_cast<uint32_t>(n_draft), needs_ckpt));
 }
 FINE_NIF(speculative_init, 0);
 
@@ -1142,9 +1157,11 @@ fine::Ok<> generate_mtp_tokens(
         //    M-RoPE consistency check.
         soft_seq_rm(ctx_dft, seq_id, n_past);
 
-        // Snapshot both contexts so we can roll back on partial draft accept
-        // (hybrid models don't support partial seq_rm).
-        {
+        // Snapshot both contexts so we can roll back on partial draft accept.
+        // Skip entirely on dense models — common_context_can_seq_rm reported
+        // PART at init time, so llama_memory_seq_rm handles partial rejection
+        // natively and the checkpoint would be pure overhead.
+        if (sp.needs_ckpt) {
             size_t sz_tgt = llama_state_seq_get_size_ext(ctx_tgt, seq_id, ckpt_flags);
             ckpt_tgt.resize(sz_tgt);
             if (sz_tgt > 0) {
@@ -1268,43 +1285,47 @@ fine::Ok<> generate_mtp_tokens(
 
         const int n_unaccepted = n_verify - n_accepted_total;
         if (n_unaccepted > 0) {
-            // Partial accept: restore both contexts from the pre-iteration
-            // checkpoint, then re-decode just the accepted tokens. This is
-            // mandatory on hybrid models (e.g. Qwen 3.6 with GDN layers)
-            // because partial seq_rm isn't supported — we have to rebuild
-            // the KV cache from a known-good snapshot.
-            if (!ckpt_tgt.empty()) {
-                llama_state_seq_set_data_ext(ctx_tgt, ckpt_tgt.data(),
-                                              ckpt_tgt.size(), seq_id, ckpt_flags);
-            }
-            soft_seq_rm(ctx_tgt, seq_id, n_past);
-
-            if (!ckpt_dft.empty()) {
-                llama_state_seq_set_data_ext(ctx_dft, ckpt_dft.data(),
-                                              ckpt_dft.size(), seq_id, ckpt_flags);
-            }
-            soft_seq_rm(ctx_dft, seq_id, n_past);
-
-            // Re-decode only the accepted tokens on the target so the next
-            // iteration's draft starts from a consistent state.
-            if (n_accepted_total > 0) {
-                llama_batch redo = llama_batch_init(n_accepted_total, 0, 1);
-                for (int i = 0; i < n_accepted_total; i++) {
-                    // accepted[i] sits at the (n_past + i)-th position in
-                    // the original verify batch; we recorded it in `prompt`.
-                    llama_token tok = prompt[prompt.size() - n_accepted_total + i];
-                    common_batch_add(redo, tok,
-                                     n_past + static_cast<llama_pos>(i),
-                                     { seq_id },
-                                     /*logits=*/ i == n_accepted_total - 1);
+            if (sp.needs_ckpt) {
+                // Hybrid model: partial seq_rm isn't supported, so restore
+                // both contexts from the pre-iteration recurrent-state
+                // snapshot and re-decode just the accepted prefix.
+                if (!ckpt_tgt.empty()) {
+                    llama_state_seq_set_data_ext(ctx_tgt, ckpt_tgt.data(),
+                                                  ckpt_tgt.size(), seq_id, ckpt_flags);
                 }
-                int ret = llama_decode(ctx_tgt, redo);
-                llama_batch_free(redo);
-                if (ret != 0) {
-                    send_error("rollback re-decode failed: code=" + std::to_string(ret));
-                    enif_free_env(msg_env);
-                    return fine::Ok();
+                soft_seq_rm(ctx_tgt, seq_id, n_past);
+
+                if (!ckpt_dft.empty()) {
+                    llama_state_seq_set_data_ext(ctx_dft, ckpt_dft.data(),
+                                                  ckpt_dft.size(), seq_id, ckpt_flags);
                 }
+                soft_seq_rm(ctx_dft, seq_id, n_past);
+
+                // Re-decode the accepted tokens on the target so the next
+                // iteration's draft starts from a consistent state.
+                if (n_accepted_total > 0) {
+                    llama_batch redo = llama_batch_init(n_accepted_total, 0, 1);
+                    for (int i = 0; i < n_accepted_total; i++) {
+                        llama_token tok =
+                            prompt[prompt.size() - n_accepted_total + i];
+                        common_batch_add(redo, tok,
+                                         n_past + static_cast<llama_pos>(i),
+                                         { seq_id },
+                                         /*logits=*/ i == n_accepted_total - 1);
+                    }
+                    int ret = llama_decode(ctx_tgt, redo);
+                    llama_batch_free(redo);
+                    if (ret != 0) {
+                        send_error("rollback re-decode failed: code=" + std::to_string(ret));
+                        enif_free_env(msg_env);
+                        return fine::Ok();
+                    }
+                }
+            } else {
+                // Dense model: native partial seq_rm trims the unaccepted
+                // tail of the verify batch in-place. Much cheaper.
+                soft_seq_rm(ctx_tgt, seq_id, n_past + n_accepted_total);
+                soft_seq_rm(ctx_dft, seq_id, n_past + n_accepted_total);
             }
         }
 
