@@ -338,30 +338,113 @@ A regular (non-MTP) Qwen 3.6 quant will fail at `LlamaCppEx.MTP.init/2` — the 
 
 ### Usage
 
+#### Minimal: stream a single response
+
 ```elixir
 :ok = LlamaCppEx.init()
-{:ok, model} = LlamaCppEx.load_model(
-  "~/Downloads/Qwen3.6-35B-A3B-MTP-Q4_K_M.gguf" |> Path.expand(),
-  n_gpu_layers: 999
-)
+
+{:ok, model} =
+  LlamaCppEx.load_model(
+    Path.expand("~/Downloads/Qwen3.6-35B-A3B-MTP-Q4_K_M.gguf"),
+    n_gpu_layers: 999
+  )
 
 # Build the speculative session once — it owns a target context and a
-# separate MTP draft context on the same model.
+# separate MTP draft context on the *same* model file (no extra download).
 {:ok, mtp} = LlamaCppEx.MTP.init(model, n_draft: 3, n_ctx: 8192)
 
-# Stream like any other generation.
 mtp
 |> LlamaCppEx.MTP.stream("Write a haiku about the sea:", max_tokens: 256)
 |> Stream.each(&IO.write/1)
 |> Stream.run()
 
-# Inspect the speculative stats.
+# Final stats (also returned via the {:done, stats} stream event)
 stats = LlamaCppEx.MTP.stats(mtp)
-IO.puts("acceptance rate: #{Float.round(stats.acceptance_rate * 100, 1)}%")
-IO.puts("tokens/sec:      #{Float.round(stats.tokens_per_sec, 1)}")
+IO.puts("\nacceptance: #{Float.round(stats.acceptance_rate * 100, 1)}%  " <>
+        "throughput: #{Float.round(stats.tokens_per_sec, 1)} tok/s")
 ```
 
-`LlamaCppEx.MTP.stats/1` is lock-free and safe to call from any process — including mid-stream — so it composes with live progress dashboards.
+#### Synchronous generate (collect to a string)
+
+```elixir
+{:ok, mtp} = LlamaCppEx.MTP.init(model, n_draft: 3, n_ctx: 4096)
+
+{:ok, text} =
+  LlamaCppEx.MTP.generate(mtp, "Explain monads to a Go programmer:",
+    max_tokens: 200,
+    temp: 0.7,
+    top_p: 0.95,
+    seed: 42
+  )
+
+IO.puts(text)
+```
+
+#### Reuse a session across multiple prompts
+
+`MTP.init/2` allocates two `llama_context`s and the speculative state. It's the expensive bit. Reuse the same `%MTP{}` value across calls — KV caches are cleared at the start of each `stream/3` / `generate/3`:
+
+```elixir
+{:ok, mtp} = LlamaCppEx.MTP.init(model, n_draft: 3, n_ctx: 8192)
+
+for q <- ["What is Elixir?", "What is OTP?", "What is BEAM?"] do
+  IO.puts("\n> #{q}")
+  mtp |> LlamaCppEx.MTP.stream(q, max_tokens: 150) |> Stream.each(&IO.write/1) |> Stream.run()
+end
+
+# Counters are cumulative across all calls on this session.
+LlamaCppEx.MTP.stats(mtp) |> IO.inspect(label: "cumulative")
+```
+
+#### Watch stats live from a separate process
+
+`MTP.stats/1` is lock-free, so a sibling process can poll it while a stream is in flight — handy for Phoenix LiveView dashboards:
+
+```elixir
+parent = self()
+
+gen_task =
+  Task.async(fn ->
+    mtp
+    |> LlamaCppEx.MTP.stream("Generate a 500-line Python implementation of A*:",
+      max_tokens: 1024,
+      temp: 0.7
+    )
+    |> Enum.into("")
+    |> then(&send(parent, {:done, &1}))
+  end)
+
+# Sample every 200 ms while the generation runs.
+Stream.repeatedly(fn ->
+  Process.sleep(200)
+  s = LlamaCppEx.MTP.stats(mtp)
+  IO.puts(
+    "iters=#{s.iters}  emitted=#{s.tokens_emitted}  " <>
+      "accept=#{Float.round(s.acceptance_rate * 100, 1)}%  " <>
+      "tok/s=#{Float.round(s.tokens_per_sec, 1)}"
+  )
+end)
+|> Stream.take_while(fn _ -> not Task.yield(gen_task, 0) |> match?({:ok, _}) end)
+|> Stream.run()
+
+Task.await(gen_task, :infinity)
+```
+
+For in-band progress events (no separate process), use `stream_events/3` with `emit_stats_every`:
+
+```elixir
+mtp
+|> LlamaCppEx.MTP.stream_events("Write a sonnet:",
+  max_tokens: 400,
+  emit_stats_every: 32
+)
+|> Enum.each(fn
+  {:token, _id, text} -> IO.write(text)
+  {:stats, s}        -> IO.puts("\n[stats] accept=#{Float.round(s.acceptance_rate * 100, 1)}%")
+  {:done, _final}    -> IO.puts("\n[done]")
+  {:eog, _}          -> IO.puts("\n[eog]")
+end)
+```
 
 ### Options
 
