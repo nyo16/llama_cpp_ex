@@ -62,6 +62,7 @@ run_mtp = fn max_tokens ->
     drafts_accepted: stats.drafts_accepted,
     acceptance_rate: stats.acceptance_rate,
     iters: stats.iters,
+    timing_us: stats.timing_us,
     text: text
   }
 end
@@ -168,5 +169,26 @@ results
       "#{Float.round(speedup, 2)}x  " <>
       "(plain #{Float.round(plain.tok_per_sec, 1)} tok/s → " <>
       "mtp #{Float.round(mtp.tok_per_sec, 1)} tok/s)"
+  )
+end)
+
+# Per-stage timing breakdown for MTP runs. Lets us see whether the verify
+# batch decode dominates (hardware-bound on Metal) or whether the draft model
+# is unexpectedly expensive (would indicate a wiring bug, e.g. ctx_dft on CPU).
+IO.puts("\nper-stage timings (μs total across the run, MTP only):")
+
+results
+|> Enum.filter(&match?(%{mode: :mtp}, &1))
+|> Enum.each(fn r ->
+  t = r.timing_us
+  sum = (t.draft || 0) + (t.verify || 0) + (t.sample || 0)
+  pct = fn part -> if sum > 0, do: Float.round(part * 100 / sum, 1), else: 0.0 end
+
+  IO.puts(
+    "  max_tokens=#{r.max_tokens}: " <>
+      "draft=#{t.draft}μs (#{pct.(t.draft)}%) " <>
+      "verify=#{t.verify}μs (#{pct.(t.verify)}%) " <>
+      "sample=#{t.sample}μs (#{pct.(t.sample)}%) " <>
+      "total=#{t.total}μs"
   )
 end)

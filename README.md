@@ -326,7 +326,9 @@ See [Performance Guide](docs/performance.md) for all available parameters includ
 
 Multi-Token Prediction speculative decoding (upstream PR [#22673](https://github.com/ggml-org/llama.cpp/pull/22673)) drafts several tokens at once via a head shipped inside the same GGUF as the target model. Upstream llama-server reports ~2x speedup at ~75% draft acceptance on Qwen 3.6.
 
-> **Status (initial release):** this binding ships a single-sequence MTP loop with full statistics. On a hybrid model like Qwen 3.6 (GDN + attention layers) we still pay a per-iteration recurrent-state checkpoint, and our current draft acceptance peaks around 50–60% — so end-to-end throughput is roughly on par with non-MTP decoding rather than 2x. The pipeline is correct and stats are accurate; performance tuning (priming the MTP head, lighter checkpointing) is tracked for follow-up. See `LlamaCppEx.MTP` and `examples/mtp_benchmark.exs`.
+> **Performance note: Apple Silicon.** The 2× number comes from NVIDIA datacenter GPUs, where a batched verify decode costs ~1.2× a single-token decode. On Apple Silicon (Metal), a 4-wide verify costs ~2.4× a single decode, which cancels MTP's iteration savings. We measured upstream's own `llama-server --spec-type draft-mtp` on M1 Max: **39.80 tok/s with MTP vs 39.14 tok/s plain** on Qwen 3.6 35B-A3B — i.e. effectively zero speedup from the reference implementation itself. This matches the pattern reported in upstream [#23011](https://github.com/ggml-org/llama.cpp/issues/23011); a Metal MTP optimization is tracked in [#23114](https://github.com/ggml-org/llama.cpp/pull/23114).
+>
+> **Tuning for Apple Silicon:** use `n_draft: 1`. With one draft per iteration the verify batch is only 2-wide (much cheaper on Metal) and acceptance jumps (we observed ~79% on Qwen 3.6 35B-A3B), netting ~1.06× over plain decoding. Larger `n_draft` (3, 4) hurts on Metal because batched-decode cost grows faster than acceptance benefit. On NVIDIA, `n_draft: 3` is the right default — that's what the upstream 2× speedup number assumes.
 
 ### Models with MTP heads
 
@@ -450,7 +452,7 @@ end)
 
 `LlamaCppEx.MTP.init/2`:
 
-  * `:n_draft` — draft tokens proposed per iteration (default `3`). 2–4 is the sweet spot.
+  * `:n_draft` — draft tokens proposed per iteration (default `3`). On NVIDIA, 2–4 is the sweet spot. On Apple Silicon, set this to `1` — see the Apple Silicon performance note above.
   * `:n_ctx`, `:n_threads`, `:flash_attn`, `:type_k`/`:type_v`, `:offload_kqv`, … — any `LlamaCppEx.Context` option; applied to both target and draft contexts.
 
 `LlamaCppEx.MTP.stream/3`:
