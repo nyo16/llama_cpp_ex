@@ -70,12 +70,15 @@ defmodule LlamaCppEx.NIF do
         _yarn_orig_ctx,
         _attention_type,
         _no_perf,
-        _swa_full
+        _swa_full,
+        _ctx_type,
+        _n_rs_seq
       ),
       do: :erlang.nif_error(:not_loaded)
 
   def context_n_ctx(_ctx), do: :erlang.nif_error(:not_loaded)
   def context_n_seq_max(_ctx), do: :erlang.nif_error(:not_loaded)
+  def context_n_rs_seq(_ctx), do: :erlang.nif_error(:not_loaded)
 
   # Sampler
   def sampler_init(
@@ -124,6 +127,22 @@ defmodule LlamaCppEx.NIF do
   # Streaming generation (sends messages to caller_pid tagged with ref)
   def generate_tokens(_ctx, _sampler, _prompt_tokens, _max_tokens, _caller_pid, _ref),
     do: :erlang.nif_error(:not_loaded)
+
+  # Speculative decoding (MTP)
+  def speculative_init(_ctx_tgt, _ctx_dft, _n_draft), do: :erlang.nif_error(:not_loaded)
+  def speculative_stats(_spec), do: :erlang.nif_error(:not_loaded)
+  def speculative_print_stats(_spec), do: :erlang.nif_error(:not_loaded)
+
+  def generate_mtp_tokens(
+        _spec,
+        _sampler,
+        _prompt_tokens,
+        _max_tokens,
+        _emit_stats_every,
+        _caller_pid,
+        _ref
+      ),
+      do: :erlang.nif_error(:not_loaded)
 
   # High-level generation
   def generate(_ctx, _sampler, _prompt_tokens, _max_tokens), do: :erlang.nif_error(:not_loaded)

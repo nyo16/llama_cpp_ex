@@ -21,6 +21,7 @@ Built with C++ NIFs using [fine](https://github.com/elixir-nx/fine) for ergonomi
 - Structured output via JSON Schema (auto-converted to GBNF grammar)
 - Optional Ecto schema to JSON Schema conversion
 - Continuous batching server for concurrent inference
+- **Multi-Token Prediction (MTP) speculative decoding** — ~2x token-generation speedup on Qwen 3.6 with live acceptance-rate stats
 - **Prefix caching** — same-slot KV cache reuse for multi-turn chat (1.23x faster)
 - **Pluggable batching strategies** — DecodeMaximal, PrefillPriority, Balanced
 - **Pre-tokenized API** — tokenize outside the GenServer for lower contention
@@ -320,6 +321,155 @@ These also work with the high-level API:
 ```
 
 See [Performance Guide](docs/performance.md) for all available parameters including RoPE context extension, GPU offload control, attention type, and more.
+
+## Speculative decoding (MTP)
+
+Multi-Token Prediction speculative decoding (upstream PR [#22673](https://github.com/ggml-org/llama.cpp/pull/22673)) drafts several tokens at once via a head shipped inside the same GGUF as the target model. Upstream llama-server reports ~2x speedup at ~75% draft acceptance on Qwen 3.6.
+
+> **Performance note: Apple Silicon.** The upstream 2× claim is from NVIDIA datacenter GPUs, where a batched verify decode costs ~1.2× a single-token decode. On Apple Silicon (Metal), a 4-wide verify costs ~2.4× a single decode, which cancels MTP's iteration savings. We measured upstream's own `llama-server --spec-type draft-mtp` on M1 Max: **39.80 tok/s with MTP vs 39.14 tok/s plain** on Qwen 3.6 35B-A3B (1.02×) — i.e. effectively zero speedup from the reference implementation itself. This matches the pattern in upstream [#23011](https://github.com/ggml-org/llama.cpp/issues/23011); a Metal MTP optimization is tracked in [#23114](https://github.com/ggml-org/llama.cpp/pull/23114).
+>
+> **Tuning for Apple Silicon:** use `n_draft: 1`. With one draft per iteration the verify batch is only 2-wide (much cheaper on Metal) and acceptance jumps to ~79% on Qwen 3.6 35B-A3B. Our measurements on M1 Max with `n_draft: 1`:
+> - Qwen 3.6 35B-A3B-MTP (hybrid MoE): plain 39.5 → MTP **44.0 tok/s (1.11×)**
+> - Qwen 3.6 27B (dense): plain 10.7 → MTP **10.6 tok/s (~1.0×, neutral)**
+>
+> Larger `n_draft` hurts on Metal because verify cost grows faster than acceptance benefit. On NVIDIA, `n_draft: 3` is the right default — that's what the upstream 2× number assumes.
+
+### Models with MTP heads
+
+- [`ggml-org/Qwen3.6-35B-A3B-MTP-GGUF`](https://huggingface.co/ggml-org/Qwen3.6-35B-A3B-MTP-GGUF) (recommended: `Q4_K_M`, ~21 GB)
+- [`ggml-org/Qwen3.6-27B-MTP-GGUF`](https://huggingface.co/ggml-org/Qwen3.6-27B-MTP-GGUF)
+- [`unsloth/Qwen3.6-35B-A3B-MTP-GGUF`](https://huggingface.co/unsloth/Qwen3.6-35B-A3B-MTP-GGUF)
+
+A regular (non-MTP) Qwen 3.6 quant will fail at `LlamaCppEx.MTP.init/2` — the GGUF must contain `mtp-*` tensors.
+
+### Usage
+
+#### Minimal: stream a single response
+
+```elixir
+:ok = LlamaCppEx.init()
+
+{:ok, model} =
+  LlamaCppEx.load_model(
+    Path.expand("~/Downloads/Qwen3.6-35B-A3B-MTP-Q4_K_M.gguf"),
+    n_gpu_layers: 999
+  )
+
+# Build the speculative session once — it owns a target context and a
+# separate MTP draft context on the *same* model file (no extra download).
+{:ok, mtp} = LlamaCppEx.MTP.init(model, n_draft: 3, n_ctx: 8192)
+
+mtp
+|> LlamaCppEx.MTP.stream("Write a haiku about the sea:", max_tokens: 256)
+|> Stream.each(&IO.write/1)
+|> Stream.run()
+
+# Final stats (also returned via the {:done, stats} stream event)
+stats = LlamaCppEx.MTP.stats(mtp)
+IO.puts("\nacceptance: #{Float.round(stats.acceptance_rate * 100, 1)}%  " <>
+        "throughput: #{Float.round(stats.tokens_per_sec, 1)} tok/s")
+```
+
+#### Synchronous generate (collect to a string)
+
+```elixir
+{:ok, mtp} = LlamaCppEx.MTP.init(model, n_draft: 3, n_ctx: 4096)
+
+{:ok, text} =
+  LlamaCppEx.MTP.generate(mtp, "Explain monads to a Go programmer:",
+    max_tokens: 200,
+    temp: 0.7,
+    top_p: 0.95,
+    seed: 42
+  )
+
+IO.puts(text)
+```
+
+#### Reuse a session across multiple prompts
+
+`MTP.init/2` allocates two `llama_context`s and the speculative state. It's the expensive bit. Reuse the same `%MTP{}` value across calls — KV caches are cleared at the start of each `stream/3` / `generate/3`:
+
+```elixir
+{:ok, mtp} = LlamaCppEx.MTP.init(model, n_draft: 3, n_ctx: 8192)
+
+for q <- ["What is Elixir?", "What is OTP?", "What is BEAM?"] do
+  IO.puts("\n> #{q}")
+  mtp |> LlamaCppEx.MTP.stream(q, max_tokens: 150) |> Stream.each(&IO.write/1) |> Stream.run()
+end
+
+# Counters are cumulative across all calls on this session.
+LlamaCppEx.MTP.stats(mtp) |> IO.inspect(label: "cumulative")
+```
+
+#### Watch stats live from a separate process
+
+`MTP.stats/1` is lock-free, so a sibling process can poll it while a stream is in flight — handy for Phoenix LiveView dashboards:
+
+```elixir
+parent = self()
+
+gen_task =
+  Task.async(fn ->
+    mtp
+    |> LlamaCppEx.MTP.stream("Generate a 500-line Python implementation of A*:",
+      max_tokens: 1024,
+      temp: 0.7
+    )
+    |> Enum.into("")
+    |> then(&send(parent, {:done, &1}))
+  end)
+
+# Sample every 200 ms while the generation runs.
+Stream.repeatedly(fn ->
+  Process.sleep(200)
+  s = LlamaCppEx.MTP.stats(mtp)
+  IO.puts(
+    "iters=#{s.iters}  emitted=#{s.tokens_emitted}  " <>
+      "accept=#{Float.round(s.acceptance_rate * 100, 1)}%  " <>
+      "tok/s=#{Float.round(s.tokens_per_sec, 1)}"
+  )
+end)
+|> Stream.take_while(fn _ -> not Task.yield(gen_task, 0) |> match?({:ok, _}) end)
+|> Stream.run()
+
+Task.await(gen_task, :infinity)
+```
+
+For in-band progress events (no separate process), use `stream_events/3` with `emit_stats_every`:
+
+```elixir
+mtp
+|> LlamaCppEx.MTP.stream_events("Write a sonnet:",
+  max_tokens: 400,
+  emit_stats_every: 32
+)
+|> Enum.each(fn
+  {:token, _id, text} -> IO.write(text)
+  {:stats, s}        -> IO.puts("\n[stats] accept=#{Float.round(s.acceptance_rate * 100, 1)}%")
+  {:done, _final}    -> IO.puts("\n[done]")
+  {:eog, _}          -> IO.puts("\n[eog]")
+end)
+```
+
+### Options
+
+`LlamaCppEx.MTP.init/2`:
+
+  * `:n_draft` — draft tokens proposed per iteration (default `3`). On NVIDIA, 2–4 is the sweet spot. On Apple Silicon, set this to `1` — see the Apple Silicon performance note above.
+  * `:n_ctx`, `:n_threads`, `:flash_attn`, `:type_k`/`:type_v`, `:offload_kqv`, … — any `LlamaCppEx.Context` option; applied to both target and draft contexts.
+
+`LlamaCppEx.MTP.stream/3`:
+
+  * `:max_tokens` (default `256`), plus all sampling options (`:temp`, `:top_k`, `:top_p`, `:min_p`, `:seed`, `:penalty_*`, `:grammar`).
+  * `:emit_stats_every` — when set, periodic `{:stats, _}` events become available via `stream_events/3`.
+
+### Caveats
+
+- Upstream currently requires `n_parallel = 1` for MTP; this binding mirrors that. Use `LlamaCppEx.Server` for concurrent non-MTP inference, or stick to a single MTP session at a time.
+- Prompt prefill is somewhat slower with MTP than without (the MTP head also processes the prompt). The win shows up at decode time.
+
+See [`examples/mtp_speculative.exs`](examples/mtp_speculative.exs) for a runnable demo with full timing breakdown.
 
 ## Benchmarks
 

@@ -3,9 +3,11 @@
 #include <llama.h>
 #include <nlohmann/json.hpp>
 #include "json-schema-to-grammar.h"
+#include "speculative.h"
 #include <string>
 #include <vector>
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstring>
 
@@ -16,6 +18,7 @@ using namespace llama_cpp_ex;
 FINE_RESOURCE(LlamaModel);
 FINE_RESOURCE(LlamaContext);
 FINE_RESOURCE(LlamaSampler);
+FINE_RESOURCE(LlamaSpeculative);
 
 // --- Backend ---
 
@@ -226,7 +229,10 @@ context_create(
     // Misc
     int64_t attention_type,
     bool no_perf,
-    bool swa_full)
+    bool swa_full,
+    // Speculative decoding / MTP
+    int64_t ctx_type,
+    int64_t n_rs_seq)
 {
     auto params = llama_context_default_params();
     params.n_ctx           = static_cast<uint32_t>(n_ctx);
@@ -265,6 +271,10 @@ context_create(
     params.no_perf        = no_perf;
     params.swa_full       = swa_full;
 
+    // Speculative decoding / MTP
+    params.ctx_type = static_cast<enum llama_context_type>(ctx_type);
+    params.n_rs_seq = static_cast<uint32_t>(n_rs_seq);
+
     // For embedding models, n_ubatch must equal n_batch
     if (embeddings) {
         params.n_ubatch = params.n_batch;
@@ -283,6 +293,11 @@ int64_t context_n_ctx(ErlNifEnv* env, fine::ResourcePtr<LlamaContext> ctx) {
     return llama_n_ctx(ctx->ctx);
 }
 FINE_NIF(context_n_ctx, 0);
+
+int64_t context_n_rs_seq(ErlNifEnv* env, fine::ResourcePtr<LlamaContext> ctx) {
+    return static_cast<int64_t>(llama_n_rs_seq(ctx->ctx));
+}
+FINE_NIF(context_n_rs_seq, 0);
 
 // --- Sampler ---
 
@@ -802,6 +817,583 @@ std::string chat_apply_template_jinja(
     return result.prompt;
 }
 FINE_NIF(chat_apply_template_jinja, 0);
+
+// --- Speculative decoding (MTP) ---
+
+std::variant<fine::Ok<fine::ResourcePtr<LlamaSpeculative>>, fine::Error<std::string>>
+speculative_init(
+    ErlNifEnv* env,
+    fine::ResourcePtr<LlamaContext> ctx_tgt,
+    fine::ResourcePtr<LlamaContext> ctx_dft,
+    int64_t n_draft)
+{
+    if (n_draft <= 0) {
+        return fine::Error(std::string("n_draft must be > 0"));
+    }
+
+    // Probe partial-rollback support on the target context BEFORE
+    // common_speculative_init. Two reasons:
+    //   1. common_context_can_seq_rm clears the context's KV memory as a
+    //      side effect (see common.h:904).
+    //   2. common_speculative_init's MTP impl calls
+    //      llama_set_embeddings_pre_norm(ctx_tgt, true) in its constructor.
+    //      Probing afterwards would clobber that flag and the MTP head
+    //      would see garbage hidden states (acceptance drops to ~5%).
+    // Dense attention-only models report PART → partial seq_rm is native,
+    // skip the per-iter checkpoint path. Hybrid models (Qwen 3.6 MoE with
+    // GDN layers) report FULL → checkpoint every iteration.
+    const auto rm_type_tgt = common_context_can_seq_rm(ctx_tgt->ctx);
+    const bool needs_ckpt = (rm_type_tgt == COMMON_CONTEXT_SEQ_RM_TYPE_FULL);
+
+    common_params_speculative params;
+    params.types        = { COMMON_SPECULATIVE_TYPE_DRAFT_MTP };
+    params.draft.n_max  = static_cast<int32_t>(n_draft);
+    params.draft.ctx_tgt = ctx_tgt->ctx;
+    params.draft.ctx_dft = ctx_dft->ctx;
+
+    common_speculative* spec = nullptr;
+    try {
+        spec = common_speculative_init(params, /*n_seq=*/1);
+    } catch (const std::exception& e) {
+        return fine::Error(std::string("common_speculative_init threw: ") + e.what());
+    }
+
+    if (!spec) {
+        return fine::Error(std::string(
+            "common_speculative_init returned null — does the model contain MTP heads "
+            "and does the draft context have ctx_type=:mtp with n_rs_seq>0?"));
+    }
+
+    return fine::Ok(fine::make_resource<LlamaSpeculative>(
+        spec, std::move(ctx_tgt), std::move(ctx_dft),
+        static_cast<uint32_t>(n_draft), needs_ckpt));
+}
+FINE_NIF(speculative_init, 0);
+
+// Build the live counter snapshot as a flat map { atom => term }. Used by
+// speculative_stats (queried from Elixir) and by the streaming NIF when it
+// emits {:done, stats} / {:stats, snapshot}. Lock-free reads via std::atomic;
+// safe to call from any thread while generate_mtp_tokens is in flight.
+static ERL_NIF_TERM build_mtp_stats_map(ErlNifEnv* env, const LlamaSpeculative& s) {
+    uint64_t iters   = s.n_iters.load(std::memory_order_relaxed);
+    uint64_t dgen    = s.n_drafts_generated.load(std::memory_order_relaxed);
+    uint64_t dacc    = s.n_drafts_accepted.load(std::memory_order_relaxed);
+    uint64_t emitted = s.n_tokens_emitted.load(std::memory_order_relaxed);
+    uint64_t udraft  = s.us_draft.load(std::memory_order_relaxed);
+    uint64_t uverify = s.us_verify.load(std::memory_order_relaxed);
+    uint64_t usample = s.us_sample.load(std::memory_order_relaxed);
+    uint64_t uother  = s.us_other.load(std::memory_order_relaxed);
+    uint64_t utotal  = s.us_total.load(std::memory_order_relaxed);
+
+    double acceptance_rate = dgen > 0 ? (double)dacc / (double)dgen : 0.0;
+    double tokens_per_sec  = utotal > 0 ? (double)emitted * 1e6 / (double)utotal : 0.0;
+
+    ERL_NIF_TERM tk[5] = {
+        enif_make_atom(env, "draft"),
+        enif_make_atom(env, "verify"),
+        enif_make_atom(env, "sample"),
+        enif_make_atom(env, "other"),
+        enif_make_atom(env, "total"),
+    };
+    ERL_NIF_TERM tv[5] = {
+        enif_make_uint64(env, udraft),
+        enif_make_uint64(env, uverify),
+        enif_make_uint64(env, usample),
+        enif_make_uint64(env, uother),
+        enif_make_uint64(env, utotal),
+    };
+    ERL_NIF_TERM timing;
+    enif_make_map_from_arrays(env, tk, tv, 5, &timing);
+
+    ERL_NIF_TERM keys[8] = {
+        enif_make_atom(env, "iters"),
+        enif_make_atom(env, "drafts_generated"),
+        enif_make_atom(env, "drafts_accepted"),
+        enif_make_atom(env, "tokens_emitted"),
+        enif_make_atom(env, "acceptance_rate"),
+        enif_make_atom(env, "tokens_per_sec"),
+        enif_make_atom(env, "timing_us"),
+        enif_make_atom(env, "n_draft"),
+    };
+    ERL_NIF_TERM vals[8] = {
+        enif_make_uint64(env, iters),
+        enif_make_uint64(env, dgen),
+        enif_make_uint64(env, dacc),
+        enif_make_uint64(env, emitted),
+        enif_make_double(env, acceptance_rate),
+        enif_make_double(env, tokens_per_sec),
+        timing,
+        enif_make_uint(env, s.n_draft),
+    };
+    ERL_NIF_TERM map;
+    enif_make_map_from_arrays(env, keys, vals, 8, &map);
+    return map;
+}
+
+fine::Term speculative_stats(ErlNifEnv* env, fine::ResourcePtr<LlamaSpeculative> spec) {
+    return fine::Term(build_mtp_stats_map(env, *spec));
+}
+FINE_NIF(speculative_stats, 0);
+
+fine::Ok<> speculative_print_stats(ErlNifEnv* env, fine::ResourcePtr<LlamaSpeculative> spec) {
+    common_speculative_print_stats(spec->spec);
+    return fine::Ok();
+}
+FINE_NIF(speculative_print_stats, 0);
+
+// Streaming MTP generation. Drives a target/draft speculative loop entirely in C++,
+// streaming {ref, {:token, id, text}} messages to caller_pid and finally one of:
+//   {ref, :eog}                          — model emitted end-of-generation
+//   {ref, {:done, stats_map}}            — hit max_tokens (or eog after some output)
+//   {ref, {:error, reason_binary}}       — fatal error
+// If emit_stats_every > 0, also sends {ref, {:stats, snapshot_map}} every Nth
+// emitted token. Stats counters on the LlamaSpeculative resource are updated
+// throughout and remain readable lock-free via speculative_stats/1.
+fine::Ok<> generate_mtp_tokens(
+    ErlNifEnv* env,
+    fine::ResourcePtr<LlamaSpeculative> spec_res,
+    fine::ResourcePtr<LlamaSampler> sampler_res,
+    std::vector<int64_t> prompt_token_ids,
+    int64_t max_tokens,
+    int64_t emit_stats_every,
+    ErlNifPid caller_pid,
+    fine::Term ref)
+{
+    auto& sp = *spec_res;
+    auto* ctx_tgt = sp.ctx_tgt->ctx;
+    auto* ctx_dft = sp.ctx_dft->ctx;
+    auto* sampler = sampler_res->sampler;
+    const auto* vocab = sp.ctx_tgt->model->vocab();
+    const llama_seq_id seq_id = 0;
+    const int32_t n_draft = static_cast<int32_t>(sp.n_draft);
+
+    ErlNifEnv* msg_env = enif_alloc_env();
+
+    auto send_error = [&](const std::string& msg) {
+        enif_clear_env(msg_env);
+        ERL_NIF_TERM rc = enif_make_copy(msg_env, ref);
+        ERL_NIF_TERM inner = enif_make_tuple2(msg_env,
+            enif_make_atom(msg_env, "error"),
+            make_binary_term(msg_env, msg.data(), msg.size()));
+        ERL_NIF_TERM tup = enif_make_tuple2(msg_env, rc, inner);
+        enif_send(env, &caller_pid, msg_env, tup);
+    };
+
+    if (prompt_token_ids.empty()) {
+        send_error("prompt cannot be empty");
+        enif_free_env(msg_env);
+        return fine::Ok();
+    }
+
+    std::vector<llama_token> prompt(prompt_token_ids.begin(), prompt_token_ids.end());
+
+    // Wipe any prior KV on seq 0 in both contexts so the spec begins fresh.
+    llama_memory_clear(llama_get_memory(ctx_tgt), true);
+    llama_memory_clear(llama_get_memory(ctx_dft), true);
+
+    // For MTP, hidden states are extracted via set_embeddings_pre_norm on
+    // ctx_tgt (set up in the MTP impl's constructor). We only need to know
+    // that drafts depend on per-position outputs, so logits=true must be
+    // requested for every prefill token.
+    const bool need_embd = common_speculative_need_embd(sp.spec);
+
+    // Prefill the target context with the prompt. For MTP we request logits
+    // at every position so the streaming hook in common_speculative_process
+    // can mirror t_h_pre_norm into ctx_dft (see speculative.cpp). The full
+    // batch is then fed back to the speculative state.
+    int n_batch = llama_n_batch(ctx_tgt);
+    llama_pos n_past = 0;
+    for (size_t i = 0; i < prompt.size(); i += n_batch) {
+        int n = std::min(static_cast<int>(prompt.size() - i), n_batch);
+        bool is_last_chunk = (i + n >= prompt.size());
+
+        llama_batch batch = llama_batch_init(n, 0, 1);
+        for (int j = 0; j < n; j++) {
+            const bool want_logits = need_embd
+                ? true
+                : (is_last_chunk && j == n - 1);
+            common_batch_add(batch, prompt[i + j], static_cast<llama_pos>(i + j),
+                             { seq_id }, want_logits);
+        }
+
+        int ret = llama_decode(ctx_tgt, batch);
+        if (ret != 0) {
+            llama_batch_free(batch);
+            send_error("prompt decode failed: code=" + std::to_string(ret));
+            enif_free_env(msg_env);
+            return fine::Ok();
+        }
+        bool proc_ok = common_speculative_process(sp.spec, batch);
+        if (!proc_ok) {
+            fprintf(stderr,
+                "MTP prefill: common_speculative_process returned false "
+                "at chunk i=%zu n=%d need_embd=%d logits_on_each=%d\n",
+                i, n, (int) need_embd, (int) need_embd);
+        }
+        llama_batch_free(batch);
+    }
+    n_past = static_cast<llama_pos>(prompt.size());
+
+
+    // Prime the speculative state AFTER prefill+process have populated the
+    // draft ctx's KV. common_speculative_begin checks ctx_dft.pos_max and
+    // warns if prefill hasn't run yet — calling it before prefill leaves
+    // the MTP head's pending_h uninitialised and drafts degrade badly.
+    common_speculative_begin(sp.spec, seq_id, prompt);
+
+    // Sample the first generated token from the prompt's last logits.
+    char piece_buf[1024];
+    std::vector<char> large_buf;
+
+    auto send_token = [&](llama_token tok, bool special) -> bool {
+        int n = llama_token_to_piece(vocab, tok, piece_buf, sizeof(piece_buf),
+                                     0, special);
+        const char* data = piece_buf;
+        int len = n;
+        if (n < 0) {
+            large_buf.resize(-n);
+            len = llama_token_to_piece(vocab, tok, large_buf.data(),
+                                       large_buf.size(), 0, special);
+            data = large_buf.data();
+            if (len < 0) len = 0;
+        }
+        enif_clear_env(msg_env);
+        ERL_NIF_TERM rc = enif_make_copy(msg_env, ref);
+        ERL_NIF_TERM inner = enif_make_tuple3(msg_env,
+            enif_make_atom(msg_env, "token"),
+            enif_make_int64(msg_env, tok),
+            make_binary_term(msg_env, data, len > 0 ? len : 0));
+        ERL_NIF_TERM tup = enif_make_tuple2(msg_env, rc, inner);
+        return enif_send(env, &caller_pid, msg_env, tup);
+    };
+
+    auto maybe_send_stats = [&]() {
+        if (emit_stats_every <= 0) return;
+        uint64_t emitted = sp.n_tokens_emitted.load(std::memory_order_relaxed);
+        if (emitted == 0 || (emitted % static_cast<uint64_t>(emit_stats_every)) != 0) return;
+        enif_clear_env(msg_env);
+        ERL_NIF_TERM rc = enif_make_copy(msg_env, ref);
+        ERL_NIF_TERM inner = enif_make_tuple2(msg_env,
+            enif_make_atom(msg_env, "stats"),
+            build_mtp_stats_map(msg_env, sp));
+        ERL_NIF_TERM tup = enif_make_tuple2(msg_env, rc, inner);
+        enif_send(env, &caller_pid, msg_env, tup);
+    };
+
+    auto send_done = [&](const char* tag) {
+        enif_clear_env(msg_env);
+        ERL_NIF_TERM rc = enif_make_copy(msg_env, ref);
+        ERL_NIF_TERM payload;
+        if (tag == nullptr) {
+            payload = enif_make_tuple2(msg_env,
+                enif_make_atom(msg_env, "done"),
+                build_mtp_stats_map(msg_env, sp));
+        } else {
+            payload = enif_make_atom(msg_env, tag);
+        }
+        ERL_NIF_TERM tup = enif_make_tuple2(msg_env, rc, payload);
+        enif_send(env, &caller_pid, msg_env, tup);
+    };
+
+    const auto t_session_start = std::chrono::steady_clock::now();
+
+    // Sample the first generated token from the prompt's last position.
+    {
+        auto t0 = std::chrono::steady_clock::now();
+        llama_token tok = llama_sampler_sample(sampler, ctx_tgt, -1);
+        sp.us_sample.fetch_add(
+            std::chrono::duration_cast<std::chrono::microseconds>(
+                std::chrono::steady_clock::now() - t0).count(),
+            std::memory_order_relaxed);
+
+        llama_sampler_accept(sampler, tok);
+
+        if (llama_vocab_is_eog(vocab, tok)) {
+            sp.us_total.fetch_add(
+                std::chrono::duration_cast<std::chrono::microseconds>(
+                    std::chrono::steady_clock::now() - t_session_start).count(),
+                std::memory_order_relaxed);
+            send_done("eog");
+            enif_free_env(msg_env);
+            return fine::Ok();
+        }
+
+        if (!send_token(tok, false)) {
+            enif_free_env(msg_env);
+            return fine::Ok();
+        }
+        sp.n_tokens_emitted.fetch_add(1, std::memory_order_relaxed);
+        prompt.push_back(tok);
+    }
+
+    llama_token sampled = prompt.back();
+    int64_t n_emitted = 1;
+
+    // Soft seq_rm helper: trims [from, inf) on a context, ignoring failure
+    // (e.g. when there's nothing past `from` to remove). The MTP loop calls
+    // it at points where the exact prior position depends on how many drafts
+    // were accepted last iteration, so a no-op return is fine.
+    auto soft_seq_rm = [](llama_context* c, llama_seq_id sid, llama_pos from) {
+        llama_memory_seq_rm(llama_get_memory(c), sid, from, -1);
+    };
+
+    // Hybrid models like Qwen 3.6 (GDN + attention) report
+    // COMMON_CONTEXT_SEQ_RM_TYPE_FULL, meaning partial seq_rm fails outright.
+    // To recover on partial-draft-accept we save the recurrent state of both
+    // contexts before each speculative iteration and restore it on rollback,
+    // mirroring upstream's `slot.spec_ckpt` mechanism. We use ON_DEVICE +
+    // PARTIAL_ONLY so the save stays in GPU buffers (cheap on Metal/CUDA).
+    constexpr llama_state_seq_flags ckpt_flags =
+        LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY | LLAMA_STATE_SEQ_FLAGS_ON_DEVICE;
+    std::vector<uint8_t> ckpt_tgt;
+    std::vector<uint8_t> ckpt_dft;
+
+    // Main speculative loop.
+    while (n_emitted < max_tokens) {
+        sp.n_iters.fetch_add(1, std::memory_order_relaxed);
+
+        // Anchor for the "other" bucket: time between known timer ends
+        // (us_draft, us_verify, us_sample) accumulates into us_other.
+        auto t_anchor = std::chrono::steady_clock::now();
+
+        // 0. Ensure the draft ctx is at pos n_past - 1 BEFORE drafting.
+        //    After a partial-accept in the previous iteration, ctx_dft may
+        //    still hold positions [n_past, n_past + drafts_prev) that need
+        //    to be discarded; otherwise common_speculative_draft would try
+        //    to decode at pos n_past with pos_max >= n_past and fail the
+        //    M-RoPE consistency check.
+        soft_seq_rm(ctx_dft, seq_id, n_past);
+
+        // Snapshot both contexts so we can roll back on partial draft accept.
+        // Skip entirely on dense models — common_context_can_seq_rm reported
+        // PART at init time, so llama_memory_seq_rm handles partial rejection
+        // natively and the checkpoint would be pure overhead.
+        if (sp.needs_ckpt) {
+            size_t sz_tgt = llama_state_seq_get_size_ext(ctx_tgt, seq_id, ckpt_flags);
+            ckpt_tgt.resize(sz_tgt);
+            if (sz_tgt > 0) {
+                llama_state_seq_get_data_ext(ctx_tgt, ckpt_tgt.data(), sz_tgt, seq_id, ckpt_flags);
+            }
+            size_t sz_dft = llama_state_seq_get_size_ext(ctx_dft, seq_id, ckpt_flags);
+            ckpt_dft.resize(sz_dft);
+            if (sz_dft > 0) {
+                llama_state_seq_get_data_ext(ctx_dft, ckpt_dft.data(), sz_dft, seq_id, ckpt_flags);
+            }
+        }
+
+        // 1. Generate drafts from the MTP head's current state.
+        std::vector<llama_token> drafts;
+        {
+            auto t0 = std::chrono::steady_clock::now();
+            sp.us_other.fetch_add(
+                std::chrono::duration_cast<std::chrono::microseconds>(t0 - t_anchor).count(),
+                std::memory_order_relaxed);
+
+            auto& dp = common_speculative_get_draft_params(sp.spec, seq_id);
+            dp.drafting = true;
+            dp.n_max    = n_draft;
+            dp.n_past   = n_past;
+            dp.id_last  = sampled;
+            dp.prompt   = &prompt;
+            dp.result   = &drafts;
+
+            common_speculative_draft(sp.spec);
+            t_anchor = std::chrono::steady_clock::now();
+            sp.us_draft.fetch_add(
+                std::chrono::duration_cast<std::chrono::microseconds>(t_anchor - t0).count(),
+                std::memory_order_relaxed);
+        }
+
+        // 2. Build the verification batch: [sampled, drafts...] at consecutive
+        //    positions starting at n_past, all with logits.
+        const int n_verify = 1 + static_cast<int>(drafts.size());
+        llama_batch batch = llama_batch_init(n_verify, 0, 1);
+        common_batch_add(batch, sampled, n_past, { seq_id }, true);
+        for (size_t i = 0; i < drafts.size(); i++) {
+            common_batch_add(batch, drafts[i],
+                             n_past + 1 + static_cast<llama_pos>(i),
+                             { seq_id }, true);
+        }
+
+        // 2b. Roll the draft ctx back to n_past so common_speculative_process
+        //     can re-decode the verify batch on it. common_speculative_draft
+        //     advances ctx_dft to roughly n_past + drafts.size() via internal
+        //     AR decoding; without this rollback, the next llama_decode on
+        //     ctx_dft would hit an "inconsistent sequence positions" abort
+        //     (M-RoPE requires the current pos_max to be < the batch's first
+        //     position). Mirrors the upstream server's seq_rm between draft
+        //     and process (server-context.cpp:2347–2353).
+        soft_seq_rm(ctx_dft, seq_id, n_past);
+
+        // 3. Decode on the target context, then feed back into the spec.
+        {
+            auto t0 = std::chrono::steady_clock::now();
+            sp.us_other.fetch_add(
+                std::chrono::duration_cast<std::chrono::microseconds>(t0 - t_anchor).count(),
+                std::memory_order_relaxed);
+
+            int ret = llama_decode(ctx_tgt, batch);
+            if (ret != 0) {
+                llama_batch_free(batch);
+                send_error("verify decode failed: code=" + std::to_string(ret));
+                enif_free_env(msg_env);
+                return fine::Ok();
+            }
+            if (!common_speculative_process(sp.spec, batch)) {
+                llama_batch_free(batch);
+                send_error("common_speculative_process failed");
+                enif_free_env(msg_env);
+                return fine::Ok();
+            }
+            t_anchor = std::chrono::steady_clock::now();
+            sp.us_verify.fetch_add(
+                std::chrono::duration_cast<std::chrono::microseconds>(t_anchor - t0).count(),
+                std::memory_order_relaxed);
+        }
+
+        // 4. Verify: sample at each position, accept the longest prefix of
+        //    drafts that matches, then also keep the model's own next-token
+        //    from the position after the last accepted draft.
+        int n_accepted_drafts = 0;
+        int n_accepted_total  = 0;
+        bool eog = false;
+        bool send_failed = false;
+
+        for (int i = 0; i < n_verify; i++) {
+            auto t0 = std::chrono::steady_clock::now();
+            sp.us_other.fetch_add(
+                std::chrono::duration_cast<std::chrono::microseconds>(t0 - t_anchor).count(),
+                std::memory_order_relaxed);
+            llama_token tok = llama_sampler_sample(sampler, ctx_tgt, i);
+            t_anchor = std::chrono::steady_clock::now();
+            sp.us_sample.fetch_add(
+                std::chrono::duration_cast<std::chrono::microseconds>(t_anchor - t0).count(),
+                std::memory_order_relaxed);
+            llama_sampler_accept(sampler, tok);
+
+            if (llama_vocab_is_eog(vocab, tok)) {
+                eog = true;
+                break;
+            }
+
+            if (!send_token(tok, false)) {
+                send_failed = true;
+                break;
+            }
+            sp.n_tokens_emitted.fetch_add(1, std::memory_order_relaxed);
+            n_emitted += 1;
+            n_accepted_total += 1;
+            prompt.push_back(tok);
+            sampled = tok;
+
+            if (i < (int) drafts.size() && tok == drafts[i]) {
+                n_accepted_drafts += 1;
+                continue;
+            }
+            break;  // mismatch (or sampled-from-final-position): stop here
+        }
+
+        llama_batch_free(batch);
+
+        sp.n_drafts_generated.fetch_add(drafts.size(), std::memory_order_relaxed);
+        sp.n_drafts_accepted.fetch_add(n_accepted_drafts, std::memory_order_relaxed);
+
+        // 5. Inform the spec state.
+        common_speculative_accept(sp.spec, seq_id, static_cast<uint16_t>(n_accepted_drafts));
+
+        const int n_unaccepted = n_verify - n_accepted_total;
+        if (n_unaccepted > 0) {
+            if (sp.needs_ckpt) {
+                // Hybrid model: partial seq_rm isn't supported, so restore
+                // both contexts from the pre-iteration recurrent-state
+                // snapshot and re-decode just the accepted prefix.
+                if (!ckpt_tgt.empty()) {
+                    llama_state_seq_set_data_ext(ctx_tgt, ckpt_tgt.data(),
+                                                  ckpt_tgt.size(), seq_id, ckpt_flags);
+                }
+                soft_seq_rm(ctx_tgt, seq_id, n_past);
+
+                if (!ckpt_dft.empty()) {
+                    llama_state_seq_set_data_ext(ctx_dft, ckpt_dft.data(),
+                                                  ckpt_dft.size(), seq_id, ckpt_flags);
+                }
+                soft_seq_rm(ctx_dft, seq_id, n_past);
+
+                // Re-decode the accepted tokens on the target so the next
+                // iteration's draft starts from a consistent state.
+                if (n_accepted_total > 0) {
+                    llama_batch redo = llama_batch_init(n_accepted_total, 0, 1);
+                    for (int i = 0; i < n_accepted_total; i++) {
+                        llama_token tok =
+                            prompt[prompt.size() - n_accepted_total + i];
+                        common_batch_add(redo, tok,
+                                         n_past + static_cast<llama_pos>(i),
+                                         { seq_id },
+                                         /*logits=*/ i == n_accepted_total - 1);
+                    }
+                    int ret = llama_decode(ctx_tgt, redo);
+                    llama_batch_free(redo);
+                    if (ret != 0) {
+                        send_error("rollback re-decode failed: code=" + std::to_string(ret));
+                        enif_free_env(msg_env);
+                        return fine::Ok();
+                    }
+                }
+            } else {
+                // Dense model: native partial seq_rm trims the unaccepted
+                // tail of the verify batch in-place. Much cheaper.
+                soft_seq_rm(ctx_tgt, seq_id, n_past + n_accepted_total);
+                soft_seq_rm(ctx_dft, seq_id, n_past + n_accepted_total);
+            }
+        }
+
+        n_past += n_accepted_total;
+
+        maybe_send_stats();
+
+        // Close out us_other for this iter — captures the post-sample-loop
+        // work plus any implicit GPU-sync wait that bleeds into the next
+        // iter from llama_decode's async submission on Metal.
+        sp.us_other.fetch_add(
+            std::chrono::duration_cast<std::chrono::microseconds>(
+                std::chrono::steady_clock::now() - t_anchor).count(),
+            std::memory_order_relaxed);
+
+        if (send_failed) {
+            // Caller process is gone; stop quietly.
+            enif_free_env(msg_env);
+            return fine::Ok();
+        }
+
+        if (eog) {
+            sp.us_total.fetch_add(
+                std::chrono::duration_cast<std::chrono::microseconds>(
+                    std::chrono::steady_clock::now() - t_session_start).count(),
+                std::memory_order_relaxed);
+            send_done("eog");
+            enif_free_env(msg_env);
+            return fine::Ok();
+        }
+
+        if (n_accepted_total == 0) {
+            // Should never happen — the first sampled token (position 0) is
+            // always taken from the target model itself, so verification
+            // emits at least one token per iteration.
+            send_error("speculative loop made no progress");
+            enif_free_env(msg_env);
+            return fine::Ok();
+        }
+    }
+
+    sp.us_total.fetch_add(
+        std::chrono::duration_cast<std::chrono::microseconds>(
+            std::chrono::steady_clock::now() - t_session_start).count(),
+        std::memory_order_relaxed);
+    send_done(nullptr);
+    enif_free_env(msg_env);
+    return fine::Ok();
+}
+FINE_NIF(generate_mtp_tokens, ERL_NIF_DIRTY_JOB_CPU_BOUND);
 
 // --- Streaming generation ---
 
