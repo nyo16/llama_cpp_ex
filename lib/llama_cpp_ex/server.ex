@@ -43,6 +43,22 @@ defmodule LlamaCppEx.Server do
 
     * `:server` - PID of the server process.
 
+  ### `[:llama_cpp_ex, :server, :request, :start]`
+
+  Emitted when a slot is assigned to a request and prefill begins.
+
+  Measurements:
+
+    * `:prompt_tokens` - Number of prompt tokens.
+    * `:prefix_cache_tokens` - Number of prompt tokens reused from the KV
+      prefix cache (`0` when `cache_prompt: false`).
+
+  Metadata:
+
+    * `:server` - PID of the server process.
+    * `:seq_id` - Slot sequence ID.
+    * `:mode` - `:generate` or `:stream`.
+
   ### `[:llama_cpp_ex, :server, :request, :done]`
 
   Emitted when a request (generate or stream) completes.
@@ -63,6 +79,23 @@ defmodule LlamaCppEx.Server do
     * `:server` - PID of the server process.
     * `:seq_id` - Slot sequence ID (integer).
     * `:mode` - `:generate` or `:stream`.
+    * `:stop_reason` - `:eog` (end-of-generation token sampled) or
+      `:max_tokens` (request `max_tokens` reached).
+
+  ### `[:llama_cpp_ex, :server, :request, :exception]`
+
+  Emitted when an inference error aborts an active request (e.g. the
+  underlying `batch_eval` returns an error). Measurement shape matches
+  `:done` so handlers can aggregate them together; `:stop_reason` is
+  `:error` and the failure reason is in `:reason`.
+
+  Metadata:
+
+    * `:server` - PID of the server process.
+    * `:seq_id` - Slot sequence ID.
+    * `:mode` - `:generate` or `:stream`.
+    * `:stop_reason` - `:error`.
+    * `:reason` - The underlying failure term from the NIF.
 
   """
 
@@ -563,8 +596,17 @@ defmodule LlamaCppEx.Server do
         n_prefix_cache_tokens: n_match
     }
 
+    :telemetry.execute(
+      [:llama_cpp_ex, :server, :request, :start],
+      %{prompt_tokens: length(tokens), prefix_cache_tokens: n_match},
+      %{server: self(), seq_id: seq_id, mode: slot_mode(slot)}
+    )
+
     put_in(state.slots[seq_id], slot)
   end
+
+  defp slot_mode(%{stream_pid: pid}) when is_pid(pid), do: :stream
+  defp slot_mode(_slot), do: :generate
 
   defp enqueue_request(state, request) do
     %{state | queue: :queue.in(request, state.queue)}
@@ -612,6 +654,12 @@ defmodule LlamaCppEx.Server do
 
     # Phase 2: Build batch
     {entries, state} = build_batch(state)
+
+    # Capture TTFT immediately after the strategy ran. The strategy sends
+    # each decode token piece to its stream consumer before returning, so
+    # by now any slot whose first decode just streamed has tokens_generated
+    # == 1 — that's the user-perceived first-token timestamp.
+    state = mark_first_tokens(state)
 
     if entries == [] do
       state
@@ -675,13 +723,17 @@ defmodule LlamaCppEx.Server do
       token = slot.pending_token
       is_eog = LlamaCppEx.NIF.vocab_is_eog(state.model.ref, token)
 
-      if is_eog or slot.tokens_generated >= slot.max_tokens do
-        # pending_token is the NEXT token to process:
-        # - if EOG: don't stream (it's a control token)
-        # - if max_tokens reached: don't stream (it's beyond our limit)
-        finish_slot(state, seq_id)
-      else
-        state
+      cond do
+        is_eog ->
+          # pending_token is the EOG control token — finish without streaming it.
+          finish_slot(state, seq_id, :eog)
+
+        slot.tokens_generated >= slot.max_tokens ->
+          # We've already streamed max_tokens; pending_token is beyond the limit.
+          finish_slot(state, seq_id, :max_tokens)
+
+        true ->
+          state
       end
     end)
   end
@@ -694,6 +746,21 @@ defmodule LlamaCppEx.Server do
       state.batch_strategy.build_batch(state.slots, state.n_batch, state.chunk_size, opts)
 
     {entries, %{state | slots: updated_slots}}
+  end
+
+  defp mark_first_tokens(state) do
+    now = System.monotonic_time()
+
+    slots =
+      Enum.reduce(state.slots, state.slots, fn {seq_id, slot}, acc ->
+        if slot.t_first_token == nil and slot.tokens_generated >= 1 do
+          Map.put(acc, seq_id, %{slot | t_first_token: now})
+        else
+          acc
+        end
+      end)
+
+    %{state | slots: slots}
   end
 
   # Phase 4a: Sample for generating slots
@@ -769,7 +836,7 @@ defmodule LlamaCppEx.Server do
 
   # --- Internal: Slot completion ---
 
-  defp finish_slot(state, seq_id) do
+  defp finish_slot(state, seq_id, stop_reason) do
     slot = state.slots[seq_id]
     t_end = System.monotonic_time()
 
@@ -782,12 +849,12 @@ defmodule LlamaCppEx.Server do
     end
 
     # Emit telemetry
-    emit_request_done(slot, seq_id, t_end)
+    emit_request_done(slot, seq_id, t_end, stop_reason)
 
     reset_slot(state, seq_id)
   end
 
-  defp emit_request_done(slot, seq_id, t_end) do
+  defp emit_request_done(slot, seq_id, t_end, stop_reason) do
     duration_ns = t_end - slot.t_start
     duration_ms = duration_ns / 1_000_000
 
@@ -807,10 +874,10 @@ defmodule LlamaCppEx.Server do
     generation_rate =
       if gen_duration_s > 0, do: slot.tokens_generated / gen_duration_s, else: 0.0
 
-    mode = if slot.stream_pid, do: :stream, else: :generate
+    mode = slot_mode(slot)
 
     Logger.debug(
-      "slot #{seq_id} done: #{slot.n_prompt_tokens} prompt tokens (#{Float.round(prompt_eval_rate, 1)} t/s), " <>
+      "slot #{seq_id} done (#{stop_reason}): #{slot.n_prompt_tokens} prompt tokens (#{Float.round(prompt_eval_rate, 1)} t/s), " <>
         "#{slot.tokens_generated} generated (#{Float.round(generation_rate, 1)} t/s), " <>
         "ttft #{Float.round(ttft_ms, 1)}ms, total #{Float.round(duration_ms, 1)}ms"
     )
@@ -832,7 +899,54 @@ defmodule LlamaCppEx.Server do
         prefix_cache_tokens: slot.n_prefix_cache_tokens,
         prefix_cache_ratio: prefix_cache_ratio
       },
-      %{server: self(), seq_id: seq_id, mode: mode}
+      %{server: self(), seq_id: seq_id, mode: mode, stop_reason: stop_reason}
+    )
+  end
+
+  defp emit_request_exception(slot, seq_id, reason) do
+    # Mirror `:done`'s measurement shape so dashboards can aggregate them.
+    # Timings are best-effort: if generation never started, ttft/duration
+    # fall back to the wall time since slot acquisition.
+    t_end = System.monotonic_time()
+    t_start = slot.t_start || t_end
+    duration_ms = (t_end - t_start) / 1_000_000
+
+    ttft_ms =
+      if slot.t_first_token, do: (slot.t_first_token - t_start) / 1_000_000, else: duration_ms
+
+    prompt_duration_s = ttft_ms / 1000
+    gen_duration_s = (t_end - (slot.t_first_token || t_start)) / 1_000_000_000
+
+    prompt_eval_rate =
+      if prompt_duration_s > 0, do: slot.n_prompt_tokens / prompt_duration_s, else: 0.0
+
+    generation_rate =
+      if gen_duration_s > 0, do: slot.tokens_generated / gen_duration_s, else: 0.0
+
+    prefix_cache_ratio =
+      if slot.n_prompt_tokens > 0,
+        do: slot.n_prefix_cache_tokens / slot.n_prompt_tokens,
+        else: 0.0
+
+    :telemetry.execute(
+      [:llama_cpp_ex, :server, :request, :exception],
+      %{
+        prompt_tokens: slot.n_prompt_tokens,
+        generated_tokens: slot.tokens_generated,
+        duration_ms: duration_ms,
+        ttft_ms: ttft_ms,
+        prompt_eval_rate: prompt_eval_rate,
+        generation_rate: generation_rate,
+        prefix_cache_tokens: slot.n_prefix_cache_tokens,
+        prefix_cache_ratio: prefix_cache_ratio
+      },
+      %{
+        server: self(),
+        seq_id: seq_id,
+        mode: slot_mode(slot),
+        stop_reason: :error,
+        reason: reason
+      }
     )
   end
 
@@ -888,6 +1002,8 @@ defmodule LlamaCppEx.Server do
       if slot.stream_pid && slot.stream_ref do
         send(slot.stream_pid, {slot.stream_ref, {:error, reason}})
       end
+
+      emit_request_exception(slot, seq_id, reason)
 
       # Clear KV cache and reset — don't preserve cache on error
       LlamaCppEx.NIF.memory_seq_rm(state.ctx.ref, seq_id, 0, -1)
