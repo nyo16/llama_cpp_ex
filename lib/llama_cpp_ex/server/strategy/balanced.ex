@@ -69,13 +69,6 @@ defmodule LlamaCppEx.Server.Strategy.Balanced do
             generated_token_ids: [token | slot.generated_token_ids]
         }
 
-        slot =
-          if slot.t_first_token == nil do
-            %{slot | t_first_token: System.monotonic_time()}
-          else
-            slot
-          end
-
         entry = {token, slot.pos, seq_id, true}
         slots = Map.put(slots, seq_id, slot)
 

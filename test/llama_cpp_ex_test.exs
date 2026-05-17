@@ -775,6 +775,15 @@ defmodule LlamaCppExTest do
         test_pid = self()
 
         :telemetry.attach(
+          "test-request-start-#{inspect(ref)}",
+          [:llama_cpp_ex, :server, :request, :start],
+          fn _event, measurements, metadata, _config ->
+            send(test_pid, {:start_telemetry, measurements, metadata})
+          end,
+          nil
+        )
+
+        :telemetry.attach(
           "test-request-done-#{inspect(ref)}",
           [:llama_cpp_ex, :server, :request, :done],
           fn _event, measurements, metadata, _config ->
@@ -794,6 +803,15 @@ defmodule LlamaCppExTest do
 
         {:ok, _text} = LlamaCppEx.Server.generate(server, "Hello", max_tokens: 4)
 
+        # :start fires synchronously inside the handle_call, before :done.
+        assert_receive {:start_telemetry, start_measurements, start_metadata}, 5_000
+        assert is_number(start_measurements.prompt_tokens)
+        assert start_measurements.prompt_tokens > 0
+        assert is_number(start_measurements.prefix_cache_tokens)
+        assert is_pid(start_metadata.server)
+        assert is_integer(start_metadata.seq_id)
+        assert start_metadata.mode == :generate
+
         assert_receive {:telemetry, measurements, metadata}, 5_000
 
         assert is_number(measurements.prompt_tokens)
@@ -805,9 +823,15 @@ defmodule LlamaCppExTest do
         assert is_number(measurements.prompt_eval_rate)
         assert is_number(measurements.generation_rate)
 
+        # ttft_ms should be a real measurement, not a fallback to duration_ms.
+        # With max_tokens=4 there will be tokens after the first, so ttft must
+        # be strictly less than duration.
+        assert measurements.ttft_ms < measurements.duration_ms
+
         assert is_pid(metadata.server)
         assert is_integer(metadata.seq_id)
         assert metadata.mode == :generate
+        assert metadata.stop_reason in [:eog, :max_tokens]
 
         # Should also have received tick telemetry
         assert_receive {:tick_telemetry, tick_measurements}, 1_000
@@ -815,6 +839,7 @@ defmodule LlamaCppExTest do
         assert tick_measurements.batch_size > 0
         assert is_number(tick_measurements.eval_ms)
 
+        :telemetry.detach("test-request-start-#{inspect(ref)}")
         :telemetry.detach("test-request-done-#{inspect(ref)}")
         :telemetry.detach("test-tick-#{inspect(ref)}")
       end
