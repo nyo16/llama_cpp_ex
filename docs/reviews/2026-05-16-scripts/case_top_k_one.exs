@@ -1,0 +1,5 @@
+Code.require_file("/tmp/llama_review/_common.exs")
+m = EdgeCase.model()
+{:ok, t1} = LlamaCppEx.generate(m, "The capital of France is", max_tokens: 12, top_k: 1, temp: 0.0, seed: 42)
+{:ok, t2} = LlamaCppEx.generate(m, "The capital of France is", max_tokens: 12, top_k: 1, temp: 0.0, seed: 42)
+IO.puts("RESULT[determinism]: run1=#{inspect(t1)} run2=#{inspect(t2)} identical?=#{t1==t2}")
