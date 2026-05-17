@@ -313,6 +313,72 @@ this review's experiments):
 
 ---
 
+## Existing test suite drift
+
+Running `mix test` against the three local models (`Qwen3.5-0.8B-UD-Q4_K_XL`,
+`Qwen3-Embedding-0.6B-f16`, `Qwen3.6-35B-A3B-MTP-UD-Q4_K_XL`) gave **148 / 150
+passing**. Both failures are in the MTP block of `test/llama_cpp_ex_test.exs`
+and are *not* regressions — they're either out-of-sync with a recent code
+change or set on different hardware.
+
+### TS1. `test/llama_cpp_ex_test.exs:962` is contradicted by the current code
+
+```elixir
+# the default target ctx should report 0 (no rollback).
+assert LlamaCppEx.Context.n_rs_seq(mtp.mtp_ctx) >= mtp.n_draft
+```
+
+`lib/llama_cpp_ex/mtp.ex:97-100` was changed to create the draft context with
+`n_rs_seq: 0`:
+
+```elixir
+# Match upstream server: MTP draft context is created with n_rs_seq=0.
+# The MTP impl handles state rollback internally via cached hidden
+# states (pending_h / verify_h), not via recurrent-state snapshots.
+draft_opts = Keyword.merge(base_ctx_opts, ctx_type: :mtp, n_rs_seq: 0)
+```
+
+So the assertion `>= mtp.n_draft` (e.g. ≥ 3) can never hold for the draft
+context; the test should be either:
+
+```elixir
+assert LlamaCppEx.Context.n_rs_seq(mtp.mtp_ctx) == 0
+```
+
+…or deleted, since the property it's checking no longer exists.
+
+Implication beyond this one test: when the `n_rs_seq` semantics changed,
+nobody re-ran the suite, so the contradiction sat undetected. Worth a
+quick `grep` through the rest of the MTP tests for anything similar
+(particularly anything that exercises the rollback path).
+
+### TS2. `test/llama_cpp_ex_test.exs:983` acceptance threshold too aggressive for Apple Silicon
+
+```elixir
+assert stats.acceptance_rate > 0.3,
+       "acceptance_rate=#{stats.acceptance_rate} (expected > 0.3); ..."
+```
+
+On `Qwen3.6-35B-A3B-MTP-UD-Q4_K_XL` running on M1 Max, observed
+`acceptance_rate = 0.218` (38 / 174 drafts accepted, 97 tokens emitted,
+19.6 tok/s). Matches the Apple Silicon MTP profile already documented in
+upstream issues #23011 (Metal batched-decode scaling) and #23114 (Metal
+MTP drafting optimization, still open).
+
+This test does flag a real wiring break if it drops to single-digit
+acceptance (which is what upstream #23011 sees: 95.6% on CUDA → 1.93 tok/s
+on M-series at the same nominal acceptance). At 21.8% the wiring is fine,
+just hardware-bound.
+
+Options:
+- Lower the threshold to ~0.15 on Apple, parameterize by `:os.type/0`, or
+- Skip this assertion on macOS arm64 with `@tag :skip_metal` and rely on a
+  CUDA CI runner for the strict check, or
+- Replace with a sanity-only check (e.g. `acceptance_rate > 0.05` to catch
+  total wiring breaks while not relying on hardware-specific upper bounds).
+
+---
+
 ## Recommendations: triage priority
 
 If you want to ship fixes in waves:
