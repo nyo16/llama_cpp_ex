@@ -2,6 +2,29 @@
 
 ## Unreleased
 
+## v0.8.11
+
+### Changed
+
+- **llama.cpp submodule** — Updated from 0253fb21f to b28a2f372 (57 commits).
+  - **llama**: MTP clean-up (#23269); initialize pre-norm embedding mask flag (#23256); avoid copying logits during prompt decode in MTP (#23198).
+  - **common**: delegate assistant continuation to underlying template handlers (#23089) — new `common_chat_continuation` enum and `continue_final_message` field on `common_chat_templates_inputs` (default `COMMON_CHAT_CONTINUATION_NONE`, additive); enable streaming JSON argument values (#23173); remove hf cache migration (#23266); fix `--help` and `--fit` `--verbosity` output (#23278, #23282).
+  - **server**: guarantee at least 1 token to decode in server-context (#23280); print graphs reused in slot timings (#23279); honor `--embd-normalize` CLI arg (#23125); router allocates tmp buffer on heap (#23159); skip device enumeration in router mode to avoid creating CUDA primary context (#23137).
+  - **model**: clarify MTP layer comment in qwen35.cpp (#23338); update bid to match each layer's MTP source (#23237).
+  - **vulkan**: add cpy bf16 → f32 pipelines (#22677); support unaligned tensors for ROPE (#22637); fuse `SSM_CONV + BIAS + SILU` (#22653); add `SPIRV-Headers` cmake check (#22009); remove duplicate `#include <memory>` (#23144).
+  - **hexagon**: add MROPE and IMROPE in HTP rope op (#23317); enable NORM op (#23319); add TRI op (#22822); ggml-hexagon PAD op HVX kernel (#23078).
+  - **opencl**: add MoE support for q4_k, q5_k, q6_k on Adreno (#23303).
+  - **CUDA**: continue directly including `cuda/iterator` (#23102); support `d_conv=15` for `ssm-conv.cu` (#23017).
+  - **SYCL**: add `GGML_SYCL_USE_ASYNC_MEM_OP` env toggle (#22153); scalar SWAR byte-subtract in Q6_K MMVQ dot product (#22156); route small f32 matmuls to oneMKL, bypass oneDNN (#22150); fix error when using `-mg 1` (#23140); performance reference in SYCL.md (#23315).
+  - **ggml-webgpu**: extend GDN for K>1 (#23299).
+  - **rpc**: keep `last_graph_uid` in the device context (#23273).
+  - **webui**: chat screen UI refactor (#23333); bump packages + address build warnings (#23300); update KaTeX + clean `sass` warnings (#23275); scroll-to-bottom button + prevent forced scroll (#23270); refactor models store / MCP service / gate logs behind `VITE_DEBUG` (#23236); centralize monospace font styles (#23272); fix Tailwind v4 utility classes missing when built via cmake (#23253); support video files as input (#22830).
+  - **convert**: update MTP-related help (#23334); filter LoRA tensor names (#23077).
+  - **save-load-state**: refactor tests and improve readability (#23196).
+  - **llama-eval**: add per-task summary stats (#23151).
+  - **ngram**: reduce noisy logs (#23185).
+  - **build/CI**: install libssl-dev (#23325); install server kleidiai runner dependencies (#23259); add kleidiai-server to server-self-hosted workflow (#22435); cmake — do not check for bin install dir (#23234), fix `LLAMA_BUILD_UI` logic (#23190), do not install conversion script (#23204); docker — add OCI image labels for version and build date (#21653).
+
 ## v0.8.8
 
 ### Fixed
