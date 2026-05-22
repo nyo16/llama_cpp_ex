@@ -2,6 +2,25 @@
 
 ## Unreleased
 
+### Changed
+
+- **llama.cpp submodule** — Updated from b28a2f372 to 52fb93a2b (30 commits). No public API changes; existing NIF and `LlamaCppEx.MTP` bindings continue to work unchanged.
+  - **MTP / speculative**: move draft sampling to the backend (`backend_sampling` defaults `true` on the new `common_params_speculative_draft` field — additive) (#23287); skip logit computation via `inp_out_ids` (#23433); fix `nullptr` crash in `common_speculative_get_devices_str` (#23386); free draft/MTP resources on server slot sleep to fix a VRAM leak (#23461); doc typo (#23435).
+  - **llama**: fix `llm_graph_input_attn_kv_iswa` null-buffer crash on SWA-only models (#23131).
+  - **vocab**: add Carbon-3B `HybridDNATokenizer` support (#23410).
+  - **server**: re-inject subcommand when the router spawns children under the unified binary (#23442).
+  - **app**: introduce the `llama` unified executable (#23296); add `batched-bench`, `fit-params`, `quantize`, and `perplexity` subcommands (#23459); show version (#23426).
+  - **mtmd**: merge HunyuanOCR into HunyuanVL and fix OCR vision precision (#23329); DeepSeek-OCR image-processing fixes + `img_tool::resize` padding refactor (#23345); `fit_params` now accounts for `mmproj` (#21489); WAV MIME-type variants and improved audio format detection (#23396).
+  - **ggml**: check the right iface method before falling back to the 2D get (#23306).
+  - **metal**: optimize `pad` + `cpy` (#23354).
+  - **CUDA**: Programmatic Dependent Launch (PDL) for Hopper+ (#22522); tune RDNA3 Q6_K MMVQ nwarps (#23349).
+  - **vulkan**: optimize `IM2COL` shader (#22685).
+  - **opencl**: refactor backend initialization (#23318).
+  - **hexagon**: `ssm-conv` fix for large prompts (#23307); HMX quantized matmul rework (#23368).
+  - **snapdragon**: update toolchain to v0.6 (#23369).
+  - **webui**: max image size option (#22849); reactive `isMobile` in viewport store (#23330); div-wrapper pointer-events fix on hidden (#23390); move text attachments before message content in chat-completions payload (#23406); improve UI dev git hooks (#23403).
+  - **docker**: copy conversion files (#23370).
+
 ## v0.8.11
 
 ### Changed
