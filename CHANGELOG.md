@@ -1,6 +1,32 @@
 # Changelog
 
-## Unreleased
+## v0.8.13
+
+### Changed
+
+- **llama.cpp submodule** — Updated from 52fb93a2b to b22ff4b7b (25 commits). No public API changes; `include/llama.h` is unchanged. `common/chat.h` adds an additive `is_continuation` field (default `false`) on `common_chat_parser_params`; `common/common.h` simplifies the `ui` default (removes the `LLAMA_UI_DEFAULT_ENABLED` ifdef, still defaults to `true`). No NIF changes required.
+  - **model**: add NVFP4 MTP scale tensors (#23563).
+  - **server**: only parse empty message if continuing an assistant message (#23506); expose prompt token counts in `/slots` endpoint (#23454).
+  - **vocab**: fix HybridDNA tokenizer (#23466).
+  - **perplexity**: fix integer overflow (#23496).
+  - **ggml**: check the right iface method before using the fallback 2D get (#23514).
+  - **flash-attn**: replace `f32` with `kv_type` and `q_type` (#23372).
+  - **metal**: optimize concat kernel and fix `set` kernel threads (#23411).
+  - **CUDA**: fix PDL CC check for JIT compilation (#23471).
+  - **vulkan**: fuse snake activation `mul + sin + sqr + mul + add` (#22855); fix windows `find_package` of `SPIRV-Headers` (#23215).
+  - **SYCL**: improve MoE prefill throughput (#23142); Level Zero detection in `ggml_sycl_init` (#23097); `gated_delta_net` K>1 (#23174); add BF16 to DMMV kernel path (~4x tg speedup on Intel Arc) (#21580).
+  - **opencl**: generalize Adreno MoE kernels on M (#23449).
+  - **ggml-zendnn**: add Q8_0 quantization support (#23414).
+  - **cmake**: refactor UI build (#23352); add `install()` for impl libraries + fix Apple builds (#23511); remove `STATIC` from impl libraries, enable `LLAMA_BUILD_APP` by default (#23462); build router app only during standalone builds (#23521).
+  - **tests**: move `save-load-state` from examples to tests (#23336).
+  - **docs**: update documentation with Granite 4.0/4.1 (#23404); update WebGPU support and add link to blog/demo (#23483).
+  - **requirements**: bump torch to 2.11.0 (#23503).
+
+### Fixed
+
+- **`mix.exs` `@version` drift** — `@version` is bumped from `0.8.11` to `0.8.13` to re-align with the published Hex/tag stream. Tag `v0.8.12` was cut against a `@version "0.8.11"` source tree, so this release skips `0.8.12` to avoid republishing under a stale version.
+
+## v0.8.12
 
 ### Changed
 
