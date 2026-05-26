@@ -1,5 +1,32 @@
 # Changelog
 
+## v0.8.14
+
+### Changed
+
+- **llama.cpp submodule** — Updated from b22ff4b7b to 0d18aaa9d (52 commits). No public API changes; the only `include/llama.h` diff is a doc comment on `LLAMA_STATE_SEQ_FLAGS_ON_DEVICE` clarifying that getting a per-seq state with the flag invalidates prior on-device states for the same `seq_id`. `common/common.h` replaces `checkpoint_every_nt` with `checkpoint_min_step` (server-only field) and drops the `LLAMA_UI_DEFAULT_ENABLED` ifdef (UI still defaults to `true`); `common/chat.h` adds additive `common_chat_msg_span`/`common_chat_msg_delimiter` structs, a `message_spans` field on `common_chat_params`, an `is_continuation` field on `common_chat_parser_params`, and a new `common_chat_split_by_role` helper. None of these are used by the NIF, so no binding changes were required.
+  - **llama**: document that only one on-device state can be saved per sequence (#23520).
+  - **server**: fix checkpoints creation (#22929); MTP layer kv-cache should respect draft type ctk (#23646); expose prompt token counts in `/slots` (carried from v0.8.13 lineage); add margin for draft model for `fit` (#23485).
+  - **convert**: support `Gemma4ForCausalLM` (#23682); add compressed-tensors NVFP4 support (#21095); minor fixes for numpy 2.x (#23571).
+  - **model**: add support for `talkie-1930-13b` (#22596); tag `ffn_latent` as `MUL_MAT` to fix buft probe (#23664); attach Mistral3 NVFP4 weight scales (#23629).
+  - **vocab**: fix `HybridDNA` tokenizer (#23466) (carried).
+  - **ggml**: bump to 0.13.0 (ggml/1510) and 0.12.1 (ggml/1508); `gguf_init_from_callback` and `gguf_init_from_buffer` (#22341); parallelize quant LUT init (#23595); ggml-alloc out-of-bounds read fix in `ggml_dyn_tallocr_remove_block` (ggml/1492); TP fix ggml context size calculation (#22616); `ggml_silu_back` docstring fix (ggml/1500).
+  - **metal**: add apple device id (#23566).
+  - **CUDA**: add fast Walsh–Hadamard transform (#23615); missing PDL sync for FWHT + better fallback (#23690).
+  - **vulkan**: optimize `conv2d` and implement `coopmat1` support (#22620).
+  - **SYCL**: implement `ggml_sycl_pool_vmm` (#22862).
+  - **hexagon**: add `CONCAT` op (#23648); flash-attn softmax repl optimization (#23455).
+  - **ggml-webgpu**: add MMVQ path for Q4/Q8/Q2_K/Q4_K and clean up legacy `MUL_MAT` pipeline (#23594); check `batch_compute_passes` before sending passes when not GPU profiling (#23457).
+  - **opencl**: batch profiling to improve speed and prevent memory leaks (#23495).
+  - **perplexity**: fix even more integer overflows (#23623).
+  - **TP**: fix entirely zero-sized slices per device (#23525).
+  - **ui**: fix stop/continue during an agentic loop (#23356); media attachments before text (#23467).
+  - **vendor**: update `cpp-httplib` to 0.45.1 (#23639).
+  - **snapdragon**: bump toolchain docker to v0.7 to fix UI build issues (#23680); update windows toolchain to use `hsdk` v6.6.0.0 (#23552).
+  - **cmake**: fix UI build (#23592).
+  - **tests**: `test-backend-ops -j <N>` to run tests in parallel (#23637).
+  - **CI**: many self-hosted runner migrations, `[no release]` keyword support, and macOS/apple workflow consolidation (#23705, #23713, #23715, #23718, #23721, #23728, #23730, #23734, #23619, #23616, #23675, #23642, #23651, #23630).
+
 ## v0.8.13
 
 ### Changed
