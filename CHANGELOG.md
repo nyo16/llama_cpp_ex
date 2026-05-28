@@ -26,6 +26,31 @@
   - **docs**: fix duplicated "the" in granitevision and model-conversion docs (#23767).
   - **CI**: numerous build/runner changes — UI publish on ubuntu-slim (#23818), releases use GitHub-hosted builds for the UI (#23823), Vulkan builds switched to Release (#23820), CI refactor (#23789), move ARM jobs to self-hosted (#23780), bump CUDA release to 13.3 (#23749), add ccache to server builds (#23763), fix windows ccaches (#23777), remove wasm test (#23733).
 
+### Fixed
+
+- **Grammar / structured output crash (double-accept)** — Constrained generation
+  (`:json_schema` and `:grammar` options on `generate`/`stream`/`chat`/`stream_chat`)
+  crashed on the **first** generated token with
+  `RuntimeError: Unexpected empty grammar stack after accepting piece: ...`.
+  The generation loops in the NIF called `llama_sampler_accept/2` after
+  `llama_sampler_sample/3`, but `llama_sampler_sample/3` already accepts the
+  selected token internally. The redundant accept advanced grammar state twice,
+  so the grammar tried to match the just-consumed token against the *next*
+  position and emptied its stack. For unconstrained sampling the double-accept
+  was mostly harmless (it double-counted repeat/frequency/presence penalties),
+  which is why it went unnoticed. Removed the redundant `llama_sampler_accept/2`
+  from all five sampling sites: `generate`, `generate_tokens` (streaming),
+  `decode_batch`, and both MTP/speculative loops. Structured output now returns
+  schema-valid JSON, and penalty-based sampling is no longer double-applied.
+
+### Testing
+
+- **Added an end-to-end smoke test** (`test/smoke_test.exs`, tagged `:smoke` and
+  **excluded by default**) covering generation, streaming, chat templating,
+  structured output (JSON-schema + raw GBNF grammar — a regression guard for the
+  double-accept bug), and embeddings against real GGUF models. Run with
+  `LLAMA_SMOKE_GEN_MODEL=... [LLAMA_SMOKE_EMB_MODEL=...] mix test --include smoke`.
+
 ## v0.8.14
 
 ### Changed

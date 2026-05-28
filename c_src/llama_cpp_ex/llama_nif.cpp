@@ -655,8 +655,8 @@ decode_batch(
         auto& [seq_id, token_id, pos] = entries[i];
 
         llama_sampler_reset(sampler->sampler);
+        // llama_sampler_sample() already accepts the token internally.
         llama_token new_token = llama_sampler_sample(sampler->sampler, ctx->ctx, i);
-        llama_sampler_accept(sampler->sampler, new_token);
 
         // Detokenize
         std::string piece;
@@ -1122,7 +1122,7 @@ fine::Ok<> generate_mtp_tokens(
                 std::chrono::steady_clock::now() - t0).count(),
             std::memory_order_relaxed);
 
-        llama_sampler_accept(sampler, tok);
+        // llama_sampler_sample() already accepts the token internally.
 
         if (llama_vocab_is_eog(vocab, tok)) {
             sp.us_total.fetch_add(
@@ -1285,7 +1285,7 @@ fine::Ok<> generate_mtp_tokens(
             sp.us_sample.fetch_add(
                 std::chrono::duration_cast<std::chrono::microseconds>(t_anchor - t0).count(),
                 std::memory_order_relaxed);
-            llama_sampler_accept(sampler, tok);
+            // llama_sampler_sample() already accepts the token internally.
 
             if (llama_vocab_is_eog(vocab, tok)) {
                 eog = true;
@@ -1464,8 +1464,9 @@ fine::Ok<> generate_tokens(
 
     // Generation loop
     for (int64_t i = 0; i < max_tokens; i++) {
+        // llama_sampler_sample() already accepts the selected token; calling
+        // llama_sampler_accept() again would double-advance grammar state.
         llama_token new_token = llama_sampler_sample(sampler, ctx, -1);
-        llama_sampler_accept(sampler, new_token);
 
         if (llama_vocab_is_eog(vocab, new_token)) {
             enif_clear_env(msg_env);
@@ -1569,8 +1570,10 @@ generate(
     // Generation loop
     std::string result;
     for (int64_t i = 0; i < max_tokens; i++) {
+        // llama_sampler_sample() applies the sampler chain, selects a token, and
+        // already accepts it (advancing grammar state / penalties). Do NOT call
+        // llama_sampler_accept() again — a double-accept corrupts grammar state.
         llama_token new_token = llama_sampler_sample(sampler, ctx, -1);
-        llama_sampler_accept(sampler, new_token);
 
         // Check for end-of-generation
         if (llama_vocab_is_eog(vocab, new_token)) {
