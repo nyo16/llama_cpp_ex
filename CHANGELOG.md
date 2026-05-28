@@ -1,5 +1,31 @@
 # Changelog
 
+## v0.8.15
+
+### Changed
+
+- **llama.cpp submodule** — Updated from 0d18aaa9d to 19e92c33e (51 commits). No public API changes; `include/llama.h`, `common/common.h`, `common/chat.h`, `common/json-schema-to-grammar.h`, and `common/sampling.h` are all unchanged. The only header diffs are internal (`src/llama-chat.h`, `src/llama-vocab.h`, `ggml-cpu/vec.h`, the ggml-hexagon op headers, `clip-graph.h`, `server-http.h`, and the vendored `cpp-httplib`). No NIF binding changes were required.
+  - **chat**: add Granite 4.1 chat template (#23518) — picked up automatically by `chat_apply_template`.
+  - **model/mtmd**: fix gemma 4 projector pre_norm (#23822) and audio rms norm eps (#23815); `n_head_kv` defaults to `n_head` (#23782); mtmd-debug color and rainbow mode (#23829).
+  - **convert**: add FP8 to Q8 conversion (#23250); add MiniCPM5 tokenizer support (#23384).
+  - **arg/common**: add `LLAMA_ARG_API_KEY_FILE` env var for `--api-key-file` (#23167); fix env names to all have the `LLAMA_ARG_` prefix (#23778).
+  - **server**: add support for HTTP ETags in llama-server (#23701); minor tweaks to use more cpp features (#23785); fix the log message when using SSL (#23393).
+  - **ggml**: auto-apply iGPU flag for CUDA/HIP on integrated devices (#23007); fix Arm SVE usage bug in `vec.h`/`vec.cpp` (#22841).
+  - **CUDA**: route batch>=4 quantized matmul to MMQ on AMD MFMA hardware (#23227); add `MMVQ_PARAMETERS_TURING` (#23729); fix KQ mask offset integer overflow in the fattn MMA kernel (#23610); restrict PDL to CTK >= 12.3 due to MSVC issues (#23742).
+  - **vulkan**: fast path for Walsh–Hadamard transform (#23687); use `GL_NV_cooperative_matrix_decode_vector` for faster matmul (#23541); switch `MUL_MAT_VEC` to 4 K per iteration for F16/32 (#22887); add `REPEAT` op support for f16→f16 (#23298); avoid preferring transfer queue on AMD UMA devices (#22455); fix inner-loop index variable (#23665) and memory-logger unsafe iterator access (#23667).
+  - **hexagon**: basic/generic op fusion + `RMS_NORM`+`MUL` fusion (#23835); `OP_GATED_DELTA_NET` K>1 support (#23531); add Q4_1 in `MUL_MAT`/`MUL_MAT_ID` (#23647); minor refresh for HMX FA and MM (#23796).
+  - **opencl**: `OP_GATED_DELTA_NET` (#23312); move backend info printing into its own function (#23702).
+  - **ggml-webgpu**: remove legacy constants (#23672); fix workgroup dispatch for some ops (#23750).
+  - **ggml-zendnn**: fix naming of matmul function (#20964).
+  - **ui**: fix audio and video modality detection (#23756).
+  - **app**: improve help output (#23805).
+  - **perplexity**: fix format specifier in `LOG_ERR` (#23788).
+  - **vendor**: update `cpp-httplib` to 0.46.0 (#23650).
+  - **docker**: add ZenDNN Dockerfile (#23716).
+  - **pyproject**: add conversion folder and update dependencies (#23746).
+  - **docs**: fix duplicated "the" in granitevision and model-conversion docs (#23767).
+  - **CI**: numerous build/runner changes — UI publish on ubuntu-slim (#23818), releases use GitHub-hosted builds for the UI (#23823), Vulkan builds switched to Release (#23820), CI refactor (#23789), move ARM jobs to self-hosted (#23780), bump CUDA release to 13.3 (#23749), add ccache to server builds (#23763), fix windows ccaches (#23777), remove wasm test (#23733).
+
 ## v0.8.14
 
 ### Changed
