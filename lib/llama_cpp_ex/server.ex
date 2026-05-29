@@ -379,13 +379,14 @@ defmodule LlamaCppEx.Server do
           stream_pid: nil,
           stream_ref: nil,
           prompt_tokens: [],
+          prompt_tokens_tuple: {},
           prefill_pos: 0,
           pos: 0,
           pending_token: nil,
           batch_idx: -1,
           tokens_generated: 0,
           max_tokens: 0,
-          accumulated_text: "",
+          accumulated_pieces: [],
           t_start: nil,
           t_first_token: nil,
           n_prompt_tokens: 0,
@@ -582,13 +583,14 @@ defmodule LlamaCppEx.Server do
         stream_pid: stream_pid,
         stream_ref: stream_ref,
         prompt_tokens: tokens,
+        prompt_tokens_tuple: List.to_tuple(tokens),
         prefill_pos: n_match,
         pos: n_match,
         pending_token: nil,
         batch_idx: -1,
         tokens_generated: 0,
         max_tokens: max_tokens,
-        accumulated_text: "",
+        accumulated_pieces: [],
         t_start: System.monotonic_time(),
         t_first_token: nil,
         n_prompt_tokens: length(tokens),
@@ -774,10 +776,10 @@ defmodule LlamaCppEx.Server do
     Enum.reduce(generating_slots, state, fn {seq_id, _slot}, state ->
       slot = state.slots[seq_id]
 
+      # sampler_sample_at/3 already accepts the selected token into the sampler
+      # (advancing grammar/penalty state); a second accept would double-advance.
       next_token =
         LlamaCppEx.NIF.sampler_sample_at(slot.sampler.ref, state.ctx.ref, slot.batch_idx)
-
-      LlamaCppEx.NIF.sampler_accept(slot.sampler.ref, next_token)
 
       slot = %{
         slot
@@ -796,22 +798,21 @@ defmodule LlamaCppEx.Server do
       state.slots
       |> Enum.filter(fn {_id, slot} ->
         slot.state == :prefilling and slot.batch_idx >= 0 and
-          slot.prefill_pos >= length(slot.prompt_tokens)
+          slot.prefill_pos >= slot.n_prompt_tokens
       end)
 
     Enum.reduce(completed_prefills, state, fn {seq_id, _slot}, state ->
       slot = state.slots[seq_id]
 
+      # sampler_sample_at/3 already accepts the token internally — no extra accept.
       first_token =
         LlamaCppEx.NIF.sampler_sample_at(slot.sampler.ref, state.ctx.ref, slot.batch_idx)
-
-      LlamaCppEx.NIF.sampler_accept(slot.sampler.ref, first_token)
 
       slot = %{
         slot
         | state: :generating,
           pending_token: first_token,
-          pos: length(slot.prompt_tokens),
+          pos: slot.n_prompt_tokens,
           batch_idx: -1
       }
 
@@ -824,7 +825,7 @@ defmodule LlamaCppEx.Server do
     incomplete_prefills =
       state.slots
       |> Enum.filter(fn {_id, slot} ->
-        slot.state == :prefilling and slot.prefill_pos < length(slot.prompt_tokens)
+        slot.state == :prefilling and slot.prefill_pos < slot.n_prompt_tokens
       end)
 
     Enum.reduce(incomplete_prefills, state, fn {seq_id, _slot}, state ->
@@ -841,7 +842,7 @@ defmodule LlamaCppEx.Server do
     t_end = System.monotonic_time()
 
     if slot.from do
-      GenServer.reply(slot.from, {:ok, slot.accumulated_text})
+      GenServer.reply(slot.from, {:ok, accumulated_text(slot)})
     end
 
     if slot.stream_pid && slot.stream_ref do
@@ -971,13 +972,14 @@ defmodule LlamaCppEx.Server do
         stream_pid: nil,
         stream_ref: nil,
         prompt_tokens: [],
+        prompt_tokens_tuple: {},
         prefill_pos: 0,
         pos: 0,
         pending_token: nil,
         batch_idx: -1,
         tokens_generated: 0,
         max_tokens: 0,
-        accumulated_text: "",
+        accumulated_pieces: [],
         t_start: nil,
         t_first_token: nil,
         n_prompt_tokens: 0,
@@ -988,6 +990,11 @@ defmodule LlamaCppEx.Server do
     }
 
     put_in(state.slots[seq_id], slot)
+  end
+
+  # Builds the final completion string from the reverse-ordered piece list.
+  defp accumulated_text(slot) do
+    slot.accumulated_pieces |> Enum.reverse() |> IO.iodata_to_binary()
   end
 
   defp fail_all_active_slots(state, reason) do
@@ -1016,13 +1023,14 @@ defmodule LlamaCppEx.Server do
           stream_pid: nil,
           stream_ref: nil,
           prompt_tokens: [],
+          prompt_tokens_tuple: {},
           prefill_pos: 0,
           pos: 0,
           pending_token: nil,
           batch_idx: -1,
           tokens_generated: 0,
           max_tokens: 0,
-          accumulated_text: "",
+          accumulated_pieces: [],
           t_start: nil,
           t_first_token: nil,
           n_prompt_tokens: 0,
@@ -1046,10 +1054,9 @@ defmodule LlamaCppEx.Server do
   end
 
   @doc false
-  def common_prefix_length(a, b) do
-    a
-    |> Enum.zip(b)
-    |> Enum.take_while(fn {x, y} -> x == y end)
-    |> length()
-  end
+  # Single-pass count of the shared prefix length — no intermediate zip list.
+  def common_prefix_length(a, b), do: common_prefix_length(a, b, 0)
+
+  defp common_prefix_length([x | a], [x | b], n), do: common_prefix_length(a, b, n + 1)
+  defp common_prefix_length(_, _, n), do: n
 end

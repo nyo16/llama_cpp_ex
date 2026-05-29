@@ -563,6 +563,61 @@ get_embeddings(
 }
 FINE_NIF(get_embeddings, 0);
 
+// --- Batched embeddings: decode many sequences in a single batch ---
+//
+// Each {seq_id, token_ids} sequence is laid out at its own positions (0..len-1)
+// under its own seq_id, so one llama_decode populates per-sequence pooled
+// embeddings retrievable via get_embeddings(ctx, seq_id, ...). The caller must
+// size the context with embeddings=true and n_seq_max >= number of sequences,
+// and keep the total token count within n_batch/n_ubatch.
+std::variant<fine::Ok<>, fine::Error<std::string>>
+embed_batch_decode(
+    ErlNifEnv* env,
+    fine::ResourcePtr<LlamaContext> ctx,
+    std::vector<std::tuple<int64_t, std::vector<int64_t>>> sequences)
+{
+    if (sequences.empty()) {
+        return fine::Error(std::string("empty sequence list"));
+    }
+
+    int total = 0;
+    for (auto& [seq_id, tokens] : sequences) {
+        total += static_cast<int>(tokens.size());
+    }
+    if (total == 0) {
+        return fine::Error(std::string("no tokens to decode"));
+    }
+
+    // Fresh decode for this batch
+    llama_memory_clear(llama_get_memory(ctx->ctx), true);
+
+    llama_batch batch = llama_batch_init(total, 0, 1);
+    batch.n_tokens = total;
+
+    int idx = 0;
+    for (auto& [seq_id, tokens] : sequences) {
+        int len = static_cast<int>(tokens.size());
+        for (int i = 0; i < len; i++) {
+            batch.token[idx]     = static_cast<llama_token>(tokens[i]);
+            batch.pos[idx]       = static_cast<llama_pos>(i);
+            batch.n_seq_id[idx]  = 1;
+            batch.seq_id[idx][0] = static_cast<llama_seq_id>(seq_id);
+            batch.logits[idx]    = true; // all tokens get embeddings
+            idx++;
+        }
+    }
+
+    int ret = llama_decode(ctx->ctx, batch);
+    llama_batch_free(batch);
+
+    if (ret != 0) {
+        return fine::Error(std::string("embed_batch_decode failed with code: " + std::to_string(ret)));
+    }
+
+    return fine::Ok();
+}
+FINE_NIF(embed_batch_decode, ERL_NIF_DIRTY_JOB_CPU_BOUND);
+
 // --- Prefill (batched inference) ---
 
 std::variant<fine::Ok<int64_t>, fine::Error<std::string>>
@@ -1060,6 +1115,8 @@ fine::Ok<> generate_mtp_tokens(
     // Sample the first generated token from the prompt's last logits.
     char piece_buf[1024];
     std::vector<char> large_buf;
+    // Hot atom, interned once (immediate term, env-independent).
+    const ERL_NIF_TERM atom_token = enif_make_atom(env, "token");
 
     auto send_token = [&](llama_token tok, bool special) -> bool {
         int n = llama_token_to_piece(vocab, tok, piece_buf, sizeof(piece_buf),
@@ -1076,7 +1133,7 @@ fine::Ok<> generate_mtp_tokens(
         enif_clear_env(msg_env);
         ERL_NIF_TERM rc = enif_make_copy(msg_env, ref);
         ERL_NIF_TERM inner = enif_make_tuple3(msg_env,
-            enif_make_atom(msg_env, "token"),
+            atom_token,
             enif_make_int64(msg_env, tok),
             make_binary_term(msg_env, data, len > 0 ? len : 0));
         ERL_NIF_TERM tup = enif_make_tuple2(msg_env, rc, inner);
@@ -1462,6 +1519,14 @@ fine::Ok<> generate_tokens(
     // Allocate reusable message env
     ErlNifEnv* msg_env = enif_alloc_env();
 
+    // Atoms are immediate, environment-independent terms — intern the hot ones
+    // once instead of per token, and reuse the detokenize fallback buffer.
+    const ERL_NIF_TERM atom_token = enif_make_atom(env, "token");
+    const ERL_NIF_TERM atom_eog   = enif_make_atom(env, "eog");
+    const ERL_NIF_TERM atom_done  = enif_make_atom(env, "done");
+    const ERL_NIF_TERM atom_error = enif_make_atom(env, "error");
+    std::vector<char> large_buf;
+
     // Generation loop
     for (int64_t i = 0; i < max_tokens; i++) {
         // llama_sampler_sample() already accepts the selected token; calling
@@ -1471,19 +1536,17 @@ fine::Ok<> generate_tokens(
         if (llama_vocab_is_eog(vocab, new_token)) {
             enif_clear_env(msg_env);
             ERL_NIF_TERM ref_copy = enif_make_copy(msg_env, ref);
-            ERL_NIF_TERM msg = enif_make_tuple2(msg_env, ref_copy,
-                enif_make_atom(msg_env, "eog"));
+            ERL_NIF_TERM msg = enif_make_tuple2(msg_env, ref_copy, atom_eog);
             enif_send(env, &caller_pid, msg_env, msg);
             enif_free_env(msg_env);
             return fine::Ok();
         }
 
-        // Detokenize
+        // Detokenize (fast path uses the stack buffer; large_buf only on overflow)
         char buf[1024];
         int n = llama_token_to_piece(vocab, new_token, buf, sizeof(buf), 0, false);
         const char* piece_data = buf;
         int piece_len = n;
-        std::vector<char> large_buf;
 
         if (n < 0) {
             large_buf.resize(-n);
@@ -1497,7 +1560,7 @@ fine::Ok<> generate_tokens(
         enif_clear_env(msg_env);
         ERL_NIF_TERM ref_copy = enif_make_copy(msg_env, ref);
         ERL_NIF_TERM inner = enif_make_tuple3(msg_env,
-            enif_make_atom(msg_env, "token"),
+            atom_token,
             enif_make_int64(msg_env, new_token),
             make_binary_term(msg_env, piece_data, piece_len > 0 ? piece_len : 0));
         ERL_NIF_TERM msg = enif_make_tuple2(msg_env, ref_copy, inner);
@@ -1515,7 +1578,7 @@ fine::Ok<> generate_tokens(
             ref_copy = enif_make_copy(msg_env, ref);
             ERL_NIF_TERM err_msg = enif_make_tuple2(msg_env, ref_copy,
                 enif_make_tuple2(msg_env,
-                    enif_make_atom(msg_env, "error"),
+                    atom_error,
                     make_binary_term(msg_env, "decode failed during generation", 30)));
             enif_send(env, &caller_pid, msg_env, err_msg);
             enif_free_env(msg_env);
@@ -1526,8 +1589,7 @@ fine::Ok<> generate_tokens(
     // Max tokens reached
     enif_clear_env(msg_env);
     ERL_NIF_TERM ref_copy = enif_make_copy(msg_env, ref);
-    ERL_NIF_TERM msg = enif_make_tuple2(msg_env, ref_copy,
-        enif_make_atom(msg_env, "done"));
+    ERL_NIF_TERM msg = enif_make_tuple2(msg_env, ref_copy, atom_done);
     enif_send(env, &caller_pid, msg_env, msg);
     enif_free_env(msg_env);
 
