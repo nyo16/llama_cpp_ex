@@ -150,6 +150,7 @@ defmodule LlamaCppEx.NIF do
 
   # Embeddings
   def embed_decode(_ctx, _tokens, _seq_id), do: :erlang.nif_error(:not_loaded)
+  def embed_batch_decode(_ctx, _sequences), do: :erlang.nif_error(:not_loaded)
   def get_embeddings(_ctx, _seq_id, _normalize), do: :erlang.nif_error(:not_loaded)
 
   # Batched inference

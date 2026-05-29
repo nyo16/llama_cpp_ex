@@ -144,5 +144,44 @@ defmodule LlamaCppEx.SmokeTest do
         IO.puts("\n[smoke] LLAMA_SMOKE_EMB_MODEL not set — skipping embedding assertions")
       end
     end
+
+    # Guards the multi-sequence batch refactor: batched embeddings (single
+    # context, many sequences) must match one-context-per-text, including when
+    # grouping splits the batch (max_batch_sequences forces multiple groups).
+    @tag :embeddings
+    test "embed_batch matches per-text embed (incl. multi-group)", ctx do
+      if em = ctx[:emb_model] do
+        texts = [
+          "Elixir is a functional programming language.",
+          "Erlang runs on the BEAM virtual machine.",
+          "The weather today is sunny and warm.",
+          "Cats and dogs are common household pets.",
+          "Quantum computing uses qubits."
+        ]
+
+        reference =
+          Enum.map(texts, fn t ->
+            {:ok, e} = LlamaCppEx.embed(em, t)
+            e
+          end)
+
+        assert {:ok, batched} = LlamaCppEx.embed_batch(em, texts)
+        assert {:ok, grouped} = LlamaCppEx.embed_batch(em, texts, max_batch_sequences: 2)
+
+        assert length(batched) == length(texts)
+        assert max_elementwise_diff(batched, reference) < 1.0e-3
+        assert max_elementwise_diff(grouped, reference) < 1.0e-3
+      else
+        IO.puts("\n[smoke] LLAMA_SMOKE_EMB_MODEL not set — skipping embedding assertions")
+      end
+    end
+  end
+
+  defp max_elementwise_diff(a, b) do
+    Enum.zip(a, b)
+    |> Enum.map(fn {va, vb} ->
+      Enum.zip(va, vb) |> Enum.map(fn {x, y} -> abs(x - y) end) |> Enum.max()
+    end)
+    |> Enum.max()
   end
 end

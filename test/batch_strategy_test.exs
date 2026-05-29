@@ -14,6 +14,8 @@ defmodule LlamaCppEx.Server.BatchStrategyTest do
      %{
        state: :prefilling,
        prompt_tokens: tokens,
+       prompt_tokens_tuple: List.to_tuple(tokens),
+       n_prompt_tokens: length(tokens),
        prefill_pos: prefill_pos,
        batch_idx: -1
      }}

@@ -1,5 +1,47 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+
+- **`LlamaCppEx.Server` double-accept.** The server's per-slot sampling called
+  `sampler_accept` after `sampler_sample_at`, but `sampler_sample_at` (like
+  `llama_sampler_sample`) already accepts the selected token. The redundant
+  accept double-advanced sampler state — the same class of bug fixed in the
+  direct generation loops in v0.8.15. It broke grammar-constrained server
+  inference and double-counted repeat/frequency/presence penalties. Removed both
+  redundant accepts (first-token-after-prefill and each decode step). Output for
+  penalty-based sampling through the server changes (now correct); greedy/temp
+  sampling is unaffected.
+
+### Performance
+
+- **Server batch loop — removed super-linear hot paths.** The three batching
+  strategies (`DecodeMaximal`, `PrefillPriority`, `Balanced`) shared identical
+  per-slot/per-token assembly code with several costly patterns: `batch_idx =
+  length(entries)` inside the prefill token loop (**O(n²)** per prompt),
+  `length(slot.prompt_tokens)` (O(n)) called twice per chunk, `Enum.slice/3` on a
+  list (O(prefill_pos)) per chunk, and `accumulated_text <> piece` per decode
+  token (**O(n²)** over a generation). The shared logic now lives in
+  `LlamaCppEx.Server.Strategy.Batch` and: threads a running entry counter instead
+  of `length/1`, uses the cached `slot.n_prompt_tokens`, slices from a
+  `prompt_tokens_tuple` (O(1) indexing), and accumulates token pieces as iodata
+  joined once at completion. Behavior is unchanged (guarded by
+  `test/server_batch_test.exs`).
+- **`common_prefix_length/2`** rewritten as a single-pass tail recursion (was
+  `Enum.zip |> Enum.take_while |> length`, allocating an intermediate list). Runs
+  on every prefix-cache lookup.
+- **`embed_batch/3` no longer allocates a context per text.** It now packs texts
+  into a single context as distinct sequences (greedy bin-packing within the
+  context budget, capped by `:max_batch_sequences`, default 64) and decodes each
+  group in one batch via the new `embed_batch_decode` NIF, retrieving pooled
+  per-sequence embeddings. Falls back to one-context-per-text only for
+  `:pooling_type: :none`. Equivalence with the per-text path is guarded by a smoke
+  test.
+- **Streaming NIF loops** (`generate_tokens`, MTP `generate_mtp_tokens`) intern
+  the hot result atoms once instead of per token and reuse the detokenize fallback
+  buffer across iterations.
+
 ## v0.8.15
 
 ### Changed
