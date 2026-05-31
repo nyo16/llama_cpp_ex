@@ -1,6 +1,25 @@
 # Changelog
 
-## Unreleased
+## v0.8.16
+
+### Changed
+
+- **llama.cpp submodule** — Updated from 19e92c33e to d4c8e2c29 (40 commits, tag b9442). No public API changes; `include/llama.h`, `common/chat.h`, `common/json-schema-to-grammar.h`, and `common/sampling.h` are all unchanged. `common/common.h` has only additive/benign changes (a new `skip_download` field, the server `timeout_read` default bumped 600s→3600s, and a comment tweak) that don't touch any NIF binding. No NIF changes were required; the full test suite passes.
+  - **model/vocab**: support for `DeepseekV32ForCausalLM` with a generic DeepSeek Sparse Attention (DSA) implementation (#23346); tokenizer support for jina-embeddings-v2-base-zh (#18756) and LFM2.5-8B-A1B (#23826).
+  - **mtmd**: add DeepSeekOCR 2 support (#20975).
+  - **llama**: use f16 mask for Flash Attention to save VRAM (#23764); only use one iGPU device by default (#23897) and don't skip iGPU when only RPC devices are present (#23868); add `llm_graph_input_mtp` (#23643).
+  - **server**: in SSE mode, send HTTP headers when the slot starts (#23884); bump read timeout to 3600s (#23842); add speed-bench for speculative decoding (#23869); remove obsolete scripts (#23870).
+  - **metal**: restore im2col implementation for large kernels (#23901).
+  - **vulkan**: add Flash Attention support for BFloat16 KV cache (#23420).
+  - **CUDA**: check PTX version on the host side to guard PDL dispatch (#23530); disable `launch_fattn` PDL enrollment due to a compiler bug (#23825).
+  - **opencl**: support bf16 by converting to f16 (#23839).
+  - **ggml**: add some LSX support (#23798); bump ggml version to 0.13.1; sync ggml; fix missing `buffer` set in the allreduce fallback (#23480).
+  - **ggml-webgpu**: check earlier for required WebGPU features (#23879); add q4_0/q8_0 `SET_ROWS` (#23760).
+  - **graph**: ensure DS32 `kq_mask_lid` is F32 (#23864).
+  - **tensor-parallel**: fix granularity for Qwen 3.5/3.6 with 3 GPUs (#23843).
+  - **download**: add option to skip downloading (#23059); **llama-bench**: support `-fa auto` (#23714).
+  - **app/ui**: add `llama update` self-updater (#23865); move licences to llama-app (#23824); custom CSS injection via config (#23904); handle `audio/vnd.wave` as WAV (#23754); fix ETag truncation with MSVC (#23917); exclude generated build dirs from prettier/eslint (#23910).
+  - **CI/docs/build**: macOS and iOS release jobs moved to macos-26 runners (#23878, #23906); fix s390x release job (#23898); cache-key fixes (#23895); update ZenDNN docs for Q8 support (#23791); `ngram-mod` missing include (#23857).
 
 ### Fixed
 
