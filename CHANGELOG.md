@@ -1,5 +1,22 @@
 # Changelog
 
+## v0.8.17
+
+### Changed
+
+- **llama.cpp submodule** — Updated from d4c8e2c29 to 0b7154066 (37 commits, tag b9479). No NIF changes were required. `common/chat.h` and `common/json-schema-to-grammar.h` are unchanged; the changes to `include/llama.h`, `common/sampling.h`, and `common/common.h` are additive or touch symbols the binding does not use. `include/llama.h` adds an `n_outputs_max` field to `llama_context_params` (the NIF initializes via `llama_context_default_params()` and sets fields by name, so it defaults to `0` = `n_batch`) and marks `llama_set_warmup` as `DEPRECATED` (not called by the NIF). `common/sampling.h` adds `common_sampler_reasoning_budget_force` and `common/common.h` adds `reasoning_control`/`n_outputs_max`/`sse_ping_interval` fields plus a signature change to `common_prompt_batch_decode` — none of which the binding uses. The full test suite passes.
+  - **model/vocab/convert**: add EXAONE 4.5 implementations (#21733); support Step3.7-Flash conversion (#23845); add `normalizer.lowercase` support to WPM tokenizer (#23899).
+  - **llama**: deprecate `llama_set_warmup` (#24009); limit max outputs of `llama_context` via `n_outputs_max` (#23861); SWA checkpoints store only non-masked cells (#23981); tensor-parallel quantized KV cache support (#23792); speculative — fix `n_outputs_max` and remove draft-simple auto-enable (#23988).
+  - **common**: fix state save in `common_prompt_batch_decode` (#23468); support manually triggering the reasoning budget end sequence (#23949).
+  - **server**: add SSE ping interval (#24013); real-time reasoning interruption via control endpoint (#23971); handle `If-None-Match` weak ETags (#23916); disable private security disclosures (#23963).
+  - **vulkan**: don't hold the device mutex while compiling pipelines (#23641); reduce host memory lock contention (#23376); block-load Q3_K/Q6_K block data and subtract on 32-bit ints (#23056); remove unused functions (#23175).
+  - **SYCL**: support Q4_1/Q5_0/Q5_1 in Flash-Attention (#23812); add more types in `GET_ROWS` op (#23710); optimize Q3_K `mul_mat` by reorder (#23725).
+  - **metal**: template GLU kernels to support f16/f32 (#23882).
+  - **hexagon**: MUL_MAT, MUL_MAT_ID, FLASH_ATTN and GDN cleanup and optimizations for latest models (#23989); add `gelu_quick` (#24007).
+  - **opencl**: add basic support for q5_0 and q5_1 (#23548); fix compiler warnings for the non-Adreno path (#23922); revert to using `global_invocation_id` for the cpy shader (#23955).
+  - **webui**: add a Thinking-mode toggle with reasoning effort levels and Chat Form "Add Action" UI improvements (#23434); simplify network error handling (#23431).
+  - **build/vendor/CI/docs**: update cpp-httplib to 0.46.1 (#23980); add nix-nodejs facilities to build the Web UI (#23846); clean up unused-variable warnings (#23975); CI job trimming and runner-label fixes (#24012, #23958, #23927, #23938); update `HOWTO-add-model.md` (#23883).
+
 ## v0.8.16
 
 ### Changed
