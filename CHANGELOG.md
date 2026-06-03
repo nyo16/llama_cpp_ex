@@ -1,5 +1,21 @@
 # Changelog
 
+## v0.8.18
+
+### Changed
+
+- **llama.cpp submodule** — Updated from 0b7154066 to 166fe2949 (16 commits, tag b9495). No NIF changes were required. `include/llama.h`, `common/chat.h`, `common/json-schema-to-grammar.h`, `common/sampling.h`, and `common/common.h` are all unchanged. The only changed header the binding compiles against is `common/speculative.h`, which renames `common_speculative_need_embd_pre_norm` → `common_speculative_need_embd_nextn`; the NIF only calls `common_speculative_need_embd` (not the renamed variant), so the MTP/speculative paths are unaffected. The full test suite passes.
+  - **model/convert**: add Mellum architecture (#23966); support Granite multilingual embeddings R2 (ibm-granite/granite-embedding-{97,311}m-multilingual-r2) (#22716); add StepFun 3.5 MTP (#23274); qwen35 — use the post-norm hidden state for MTP (#24025).
+  - **mtmd**: enable non-causal vision for Gemma 4 unified (#24082); allow skipping `build_vit()` (#24077).
+  - **CUDA**: reserve space for the quantized KV cache at startup (#23907); avoid PDL race conditions by disabling `__restrict__` when PDL is used (#24030).
+  - **opencl**: use flat variants of q4_K and q6_K gemv for very large M (#24006).
+  - **hexagon**: profiler output fix and script updates (#24042).
+  - **ggml-cpu**: use the runtime SVE width in FWHT (#24059).
+  - **common/arg**: skip the unnecessary mmproj download when `--no-mmproj` is passed (#23425).
+  - **webui**: Mermaid diagrams in chat with interactive preview (#24032).
+  - **tests**: add support for qwen3 SSM archs (#24031).
+  - **build/vendor/CI**: update BoringSSL to 0.20260526.0 (#23794); disable ccache for MSVC Windows release jobs (#23911).
+
 ## v0.8.17
 
 ### Changed
