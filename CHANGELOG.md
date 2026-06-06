@@ -1,5 +1,22 @@
 # Changelog
 
+## v0.8.19
+
+### Changed
+
+- **llama.cpp submodule** — Updated from 166fe2949 to 6b80c74f2 (47 commits, tag b9542). No NIF changes were required. Every header the binding compiles against — `include/llama.h`, `common/chat.h`, `common/json-schema-to-grammar.h`, `common/speculative.h`, `common/sampling.h`, and `common/common.h` — is byte-for-byte unchanged across the range. The full test suite passes (147 tests), formatting is clean, and Dialyzer reports 0 errors.
+  - **model/mtmd**: Granite4 Vision (#23545); fix Gemma 4 unified FPE (#24088) and audio projector embedding size (#24091); fix Gemma 4 Unified conversion (#24118); add a "placeholder bitmap" for counting tokens plus a `*/input_tokens` API (#23913); refactor `hparams.n_layer` (#24060); fix `llama_model::n_gpu_layers()` (#24188) and off-by-one comparisons to `n_gpu_layers` (#24208).
+  - **common/chat**: unify and fix the LFM2/LFM2.5 tool parser (#24178).
+  - **server**: disable on-device speculative checkpoints (#24108); avoid unnecessary checkpoint restore when new tokens are present (#24110); restore the memory-saving filter (#24125).
+  - **CUDA / TP**: enroll `mul_mat_vec_q_moe` into PDL (#24087); round tensor-parallel granularity up to 128 (#24180).
+  - **vulkan**: check coopmat2 features before reporting support (#24186); add FWHT support for Intel with shared-memory reduction (#23964).
+  - **SYCL**: port multi-column MMVQ from the CUDA backend (#21845).
+  - **opencl**: improve `get_rows`, `cpy`, `concat`, and q6_K flat gemv (#24160).
+  - **ggml**: WASM SIMD128 vectorization of `ggml_vec_dot_q4_1_q8_1` (#22209); extend RVV quantization vec dot to higher VLENs (#22754); WebGPU FlashAttention refactor and standardized quantization support (#23834); KleidiAI dynamic chunk-based scheduling for hybrid execution (#23819).
+  - **metal**: reduce rset heartbeat from 500ms → 5ms (#24074).
+  - **common/arg**: fix double MTP downloads (#24128).
+  - **build/ci**: use the umbrella Headers directory for the XCFramework module map (#23974); skip cvector-generator and export-lora when the CPU backend is disabled (#24053); consolidate duplicated imatrix code into `common/imatrix-loader.cpp` (#22445).
+
 ## v0.8.18
 
 ### Changed
