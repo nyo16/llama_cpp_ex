@@ -1,5 +1,16 @@
 # Changelog
 
+## v0.8.20
+
+### Changed
+
+- **llama.cpp submodule** — Updated from 6b80c74f2 to 04eb4c446 (7 commits, tag b9549). No NIF changes were required. `common/chat.h`, `common/json-schema-to-grammar.h`, `common/speculative.h`, `common/sampling.h`, and `common/common.h` are all unchanged. The only changed header the binding compiles against is `include/llama.h`, which appends a `ctx_other` field to `llama_context_params` (used by the new Gemma4 MTP path to share `llama_memory`/results between two contexts); the NIF initializes via `llama_context_default_params()` and sets fields by name, so the new field simply defaults to `nullptr` and the binding is unaffected. The full test suite passes, formatting is clean, and Dialyzer reports 0 errors.
+  - **model/mtmd**: add Gemma4 MTP — multi-token prediction / speculative decoding for dense Gemma4, adding the `ctx_other` context-sharing mechanism (#23398); fix Gemma4 conversion when there is no audio encoder (#24242); support "frame merge" for qwen-vl-based models (#21858).
+  - **common/chat**: fix LFM2/LFM2.5 reasoning round-trip and `<think>` leak (#24234).
+  - **spec**: fix the vocab compatibility check (#24256).
+  - **common/arg**: skip the mmproj download when the user supplied an mmproj (#24239).
+  - **docker/ci**: bump cuda13 to 13.3.0 (#24228).
+
 ## v0.8.19
 
 ### Changed
