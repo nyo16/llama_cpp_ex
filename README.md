@@ -379,6 +379,43 @@ LlamaCppEx.ModelManager.unload("chat")  # stops the backing server, frees memory
 
 Override with `mode: :server | :direct`.
 
+### GPU placement
+
+All of llama.cpp's placement options pass straight through `load/3` (per model) to `Model.load/2`/`Server.start_link/1`:
+
+| Option | Meaning |
+|---|---|
+| `:n_gpu_layers` | Layers to offload (`-1` = all, `0` = CPU only) |
+| `:split_mode` | `:none` (single GPU), `:layer` (split layers across GPUs), `:row` (split tensor rows) |
+| `:tensor_split` | A **list of per-device proportions** — one float per GPU, indexed by device order. Zeros exclude a device. |
+| `:main_gpu` | Primary device: the single GPU under `:none`, or the device holding non-split tensors under `:layer` |
+
+`:tensor_split` is the "array of GPUs": it's a weight per device (llama.cpp normalizes the values), **not** a list of indices. Device order follows `CUDA_VISIBLE_DEVICES`.
+
+```elixir
+# Pin a model to one specific GPU
+LlamaCppEx.ModelManager.load("a", {:path, m}, n_gpu_layers: -1, split_mode: :none, main_gpu: 5)
+
+# Spread one big model across all 8 GPUs equally
+LlamaCppEx.ModelManager.load("big", {:path, m},
+  n_gpu_layers: -1, split_mode: :layer,
+  tensor_split: [1, 1, 1, 1, 1, 1, 1, 1]
+)
+
+# Use only a subset — e.g. "big" on GPUs 0–3, "embed" on GPUs 4–7
+LlamaCppEx.ModelManager.load("big", {:path, m1},
+  n_gpu_layers: -1, split_mode: :layer,
+  tensor_split: [1, 1, 1, 1, 0, 0, 0, 0]
+)
+
+LlamaCppEx.ModelManager.load("embed", {:path, m2},
+  capabilities: [:embed], n_gpu_layers: -1, split_mode: :layer,
+  tensor_split: [0, 0, 0, 0, 1, 1, 1, 1]
+)
+```
+
+> On a multi-GPU box, set `memory_budget: :infinity` — the budget is a single coarse pool and does not yet model per-device VRAM, so it will under-count headroom when `:tensor_split` places models on different cards (see below).
+
 ### Memory budget
 
 `:memory_budget` accepts `:infinity` (default), `:auto` (~80% of system RAM), or a byte limit. The manager estimates a model's footprint from its GGUF size (plus a coarse KV-cache estimate for `:server` mode) and **refuses** loads that would exceed the budget:
