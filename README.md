@@ -21,7 +21,8 @@ Built with C++ NIFs using [fine](https://github.com/elixir-nx/fine) for ergonomi
 - Structured output via JSON Schema (auto-converted to GBNF grammar)
 - Optional Ecto schema to JSON Schema conversion
 - Continuous batching server for concurrent inference
-- **Multi-model manager** — keep several models resident, route requests by id, with an advisory memory budget
+- **Multi-model manager** — keep several models resident, route requests by id, with a placement-aware (per-GPU VRAM) memory budget
+- **Device introspection** — `LlamaCppEx.devices/0` lists GPUs/accelerators with per-device VRAM
 - **Multi-Token Prediction (MTP) speculative decoding** — ~2x token-generation speedup on Qwen 3.6 with live acceptance-rate stats
 - **Prefix caching** — same-slot KV cache reuse for multi-turn chat (1.23x faster)
 - **Pluggable batching strategies** — DecodeMaximal, PrefillPriority, Balanced
@@ -414,18 +415,31 @@ LlamaCppEx.ModelManager.load("embed", {:path, m2},
 )
 ```
 
-> On a multi-GPU box, set `memory_budget: :infinity` — the budget is a single coarse pool and does not yet model per-device VRAM, so it will under-count headroom when `:tensor_split` places models on different cards (see below).
+> On a multi-GPU box, `memory_budget: :auto` reads each card's free VRAM and tracks placement per device — `:tensor_split` and `:main_gpu` are accounted for (see Memory budget below).
 
 ### Memory budget
 
-`:memory_budget` accepts `:infinity` (default), `:auto` (~80% of system RAM), or a byte limit. The manager estimates a model's footprint from its GGUF size (plus a coarse KV-cache estimate for `:server` mode) and **refuses** loads that would exceed the budget:
+`:memory_budget` is **placement-aware** — it knows whether a model lands in RAM or on specific GPUs (from `:n_gpu_layers`/`:split_mode`/`:tensor_split`/`:main_gpu`) and checks each pool independently. It accepts:
+
+- `:infinity` (default) — no limit.
+- an **integer** — a single combined pool (RAM + all VRAM count against one number).
+- `:auto` — RAM ≈ 80% of system memory, and **per-GPU VRAM from each card's free memory** (via `LlamaCppEx.devices/0`).
+- a map `%{ram: …, vram: …}` — explicit per-device limits. `vram` is a list `[b0, b1, …]` indexed by GPU, or a map `%{gpu_index => bytes}`; `ram`/`vram` may be `:auto` or `:infinity`.
+
+The manager estimates footprint from GGUF size (plus a coarse KV-cache estimate for `:server` mode) and **refuses** over-budget loads, naming the device that didn't fit:
 
 ```elixir
-{:error, {:insufficient_memory, required: r, available: a}} =
-  LlamaCppEx.ModelManager.load("too-big", {:path, "70b.gguf"})
+# combined (integer) budget
+{:error, {:insufficient_memory, device: :total, required: r, available: a}} = ...
+
+# per-device (:auto / map) budget — e.g. GPU 3 is full
+{:error, {:insufficient_memory, device: {:gpu, 3}, required: r, available: a}} =
+  LlamaCppEx.ModelManager.load("too-big", {:path, "70b.gguf"}, n_gpu_layers: -1, main_gpu: 3)
 ```
 
-There is no automatic eviction — unload a model yourself to make room.
+`device` is `:total` (combined), `:ram`, or `{:gpu, index}`. There is no automatic eviction — unload a model yourself to make room. `LlamaCppEx.devices/0` lists each GPU's `:memory_total`/`:memory_free` and its `:gpu_index` (the same index space as `:tensor_split`).
+
+> **Coarse estimation:** footprint is advisory. Partial offload (`0 < n_gpu_layers < n_layers`) is treated as fully on GPU; compute buffers and fragmentation aren't modeled.
 
 ### Unloading and memory reclamation
 

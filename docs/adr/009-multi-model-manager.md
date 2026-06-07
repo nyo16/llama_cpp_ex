@@ -36,9 +36,11 @@ The manager owns a named, `:protected`, `read_concurrency: true` ETS table of mo
 
 By explicit id, or `:default` (set at load with `default: true` or via `set_default/1`). Capability gating is enforced for embeddings (`embed/3` requires an `:embed`-capable, `:direct` model).
 
-### Memory budget — refuse, don't evict
+### Memory budget — placement-aware, refuse, don't evict
 
-Loads are checked against an advisory budget (`:infinity` default, `:auto` ≈ 80% RAM, or a byte limit). Footprint is estimated from GGUF file size plus a coarse KV-cache estimate for `:server` mode. Over-budget loads are **refused** with `{:error, {:insufficient_memory, required:, available:}}`. There is **no automatic eviction** — yanking a model another caller is mid-stream on is worse than a clear refusal.
+Loads are checked against an advisory, **placement-aware** budget. Footprint is estimated from GGUF file size (plus a coarse KV-cache estimate for `:server` mode) and **distributed across RAM and GPUs** from the load's `:n_gpu_layers`/`:split_mode`/`:tensor_split`/`:main_gpu`. Three budget shapes: `:infinity`; an integer (a single combined RAM+VRAM pool, backward-compatible); and `:auto`/explicit map (per-device — RAM pool plus per-GPU VRAM pools checked independently). `:auto` reads each GPU's free VRAM via a new backend-agnostic `device_list` NIF (`ggml_backend_dev_*`, exposed as `LlamaCppEx.devices/0`). Over-budget loads are **refused**, naming the device: `{:error, {:insufficient_memory, device: :total | :ram | {:gpu, i}, required:, available:}}`. There is **no automatic eviction** — yanking a model another caller is mid-stream on is worse than a clear refusal.
+
+Estimation is coarse and advisory: partial offload (`0 < n_gpu_layers < n_layers`) is treated as fully offloaded, and compute buffers/fragmentation aren't modeled.
 
 ### GC-based unload
 

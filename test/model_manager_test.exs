@@ -207,12 +207,17 @@ defmodule LlamaCppEx.ModelManagerTest do
   end
 
   describe "memory budget" do
-    test "refuses a load that exceeds the budget" do
+    test "an integer budget is a combined pool that refuses over-budget loads" do
       start_manager(memory_budget: 5_000)
 
-      # direct mode: estimate == file bytes, so this is exact.
-      assert {:error, {:insufficient_memory, required: 6_000, available: 5_000}} =
-               ModelManager.load("big", {:path, "big.gguf"}, mode: :direct, fake_bytes: 6_000)
+      # n_gpu_layers: 0 keeps it in RAM so the test is GPU-independent; the
+      # combined pool sums RAM + VRAM either way.
+      assert {:error, {:insufficient_memory, device: :total, required: 6_000, available: 5_000}} =
+               ModelManager.load("big", {:path, "big.gguf"},
+                 mode: :direct,
+                 n_gpu_layers: 0,
+                 fake_bytes: 6_000
+               )
 
       refute ModelManager.loaded?("big")
     end
@@ -221,10 +226,39 @@ defmodule LlamaCppEx.ModelManagerTest do
       start_manager(memory_budget: 5_000)
 
       assert {:ok, _} =
-               ModelManager.load("a", {:path, "a.gguf"}, mode: :direct, fake_bytes: 3_000)
+               ModelManager.load("a", {:path, "a.gguf"},
+                 mode: :direct,
+                 n_gpu_layers: 0,
+                 fake_bytes: 3_000
+               )
 
-      assert {:error, {:insufficient_memory, required: 3_000, available: 2_000}} =
-               ModelManager.load("b", {:path, "b.gguf"}, mode: :direct, fake_bytes: 3_000)
+      assert {:error, {:insufficient_memory, device: :total, required: 3_000, available: 2_000}} =
+               ModelManager.load("b", {:path, "b.gguf"},
+                 mode: :direct,
+                 n_gpu_layers: 0,
+                 fake_bytes: 3_000
+               )
+    end
+
+    test "a per-device budget refuses on the over-budget GPU" do
+      # Requires at least one GPU device (e.g. Metal/CUDA). Skipped on CPU-only.
+      case LlamaCppEx.devices() |> Enum.filter(&(&1.type in [:gpu, :igpu])) do
+        [%{gpu_index: gi} | _] ->
+          start_manager(memory_budget: %{ram: :infinity, vram: %{gi => 5_000}})
+
+          assert {:error,
+                  {:insufficient_memory, device: {:gpu, ^gi}, required: 6_000, available: 5_000}} =
+                   ModelManager.load("big", {:path, "big.gguf"},
+                     mode: :direct,
+                     n_gpu_layers: -1,
+                     split_mode: :none,
+                     main_gpu: gi,
+                     fake_bytes: 6_000
+                   )
+
+        [] ->
+          :ok
+      end
     end
 
     test "infinity budget always fits" do

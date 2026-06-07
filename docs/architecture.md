@@ -344,7 +344,7 @@ llama_cpp_ex/
 │   ├── llama_nif.h                  # RAII wrappers (LlamaModel, LlamaContext, LlamaSampler)
 │   └── llama_nif.cpp                # All NIF implementations (~900 lines)
 ├── lib/
-│   ├── llama_cpp_ex.ex              # High-level API: generate, stream, chat, embed
+│   ├── llama_cpp_ex.ex              # High-level API: generate, stream, chat, embed, devices
 │   └── llama_cpp_ex/
 │       ├── nif.ex                   # @on_load + NIF stubs
 │       ├── model.ex                 # Model loading + introspection

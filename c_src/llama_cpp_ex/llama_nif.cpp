@@ -1,6 +1,7 @@
 #include "llama_nif.h"
 #include <fine.hpp>
 #include <llama.h>
+#include <ggml-backend.h>
 #include <nlohmann/json.hpp>
 #include "json-schema-to-grammar.h"
 #include "speculative.h"
@@ -33,6 +34,74 @@ fine::Ok<> backend_free(ErlNifEnv* env) {
     return fine::Ok();
 }
 FINE_NIF(backend_free, 0);
+
+// --- Devices ---
+
+// Enumerates ggml backend devices for VRAM-aware placement and budgeting.
+// GPU/IGPU devices receive a `gpu_index` (0-based, in device order) matching
+// the index space of llama.cpp's `tensor_split`; other devices get -1.
+fine::Term device_list(ErlNifEnv* env) {
+    auto make_binary = [&](const char* s) -> ERL_NIF_TERM {
+        size_t len = s ? std::strlen(s) : 0;
+        ERL_NIF_TERM bin;
+        unsigned char* data = enif_make_new_binary(env, len, &bin);
+        if (len) std::memcpy(data, s, len);
+        return bin;
+    };
+
+    size_t n = ggml_backend_dev_count();
+    std::vector<ERL_NIF_TERM> devices;
+    devices.reserve(n);
+
+    int gpu_index = 0;
+    for (size_t i = 0; i < n; i++) {
+        ggml_backend_dev_t dev = ggml_backend_dev_get(i);
+
+        size_t free_mem = 0, total_mem = 0;
+        ggml_backend_dev_memory(dev, &free_mem, &total_mem);
+
+        ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
+        const char* backend = reg ? ggml_backend_reg_name(reg) : "";
+
+        const char* type_atom;
+        int this_gpu_index = -1;
+        switch (ggml_backend_dev_type(dev)) {
+            case GGML_BACKEND_DEVICE_TYPE_CPU:   type_atom = "cpu"; break;
+            case GGML_BACKEND_DEVICE_TYPE_GPU:   type_atom = "gpu";  this_gpu_index = gpu_index++; break;
+            case GGML_BACKEND_DEVICE_TYPE_IGPU:  type_atom = "igpu"; this_gpu_index = gpu_index++; break;
+            case GGML_BACKEND_DEVICE_TYPE_ACCEL: type_atom = "accel"; break;
+            default:                             type_atom = "other"; break;
+        }
+
+        ERL_NIF_TERM keys[8] = {
+            enif_make_atom(env, "index"),
+            enif_make_atom(env, "gpu_index"),
+            enif_make_atom(env, "name"),
+            enif_make_atom(env, "description"),
+            enif_make_atom(env, "type"),
+            enif_make_atom(env, "backend"),
+            enif_make_atom(env, "memory_total"),
+            enif_make_atom(env, "memory_free"),
+        };
+        ERL_NIF_TERM vals[8] = {
+            enif_make_int64(env, (int64_t)i),
+            enif_make_int64(env, (int64_t)this_gpu_index),
+            make_binary(ggml_backend_dev_name(dev)),
+            make_binary(ggml_backend_dev_description(dev)),
+            enif_make_atom(env, type_atom),
+            make_binary(backend),
+            enif_make_uint64(env, (uint64_t)total_mem),
+            enif_make_uint64(env, (uint64_t)free_mem),
+        };
+
+        ERL_NIF_TERM map;
+        enif_make_map_from_arrays(env, keys, vals, 8, &map);
+        devices.push_back(map);
+    }
+
+    return fine::Term(enif_make_list_from_array(env, devices.data(), (unsigned)devices.size()));
+}
+FINE_NIF(device_list, ERL_NIF_DIRTY_JOB_IO_BOUND);
 
 // --- Model ---
 

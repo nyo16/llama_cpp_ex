@@ -297,15 +297,18 @@ defmodule LlamaCppEx.ModelManager do
         write_concurrency: true
       ])
 
+    # Idempotent native backend init; harmless if already initialized.
+    _ = safe_backend_init()
+
+    gpu_devices = gpu_devices()
+
     state = %{
       table: table,
       io: Keyword.get(opts, :io, ModelIO),
-      budget: Budget.resolve(Keyword.get(opts, :memory_budget, :infinity)),
+      budget: Budget.resolve(Keyword.get(opts, :memory_budget, :infinity), gpu_devices),
+      n_gpus: length(gpu_devices),
       monitors: %{}
     }
-
-    # Idempotent native backend init; harmless if already initialized.
-    _ = safe_backend_init()
 
     {:ok, state, {:continue, {:autoload, Keyword.get(opts, :models, [])}}}
   end
@@ -397,10 +400,20 @@ defmodule LlamaCppEx.ModelManager do
         capabilities = Keyword.get(opts, :capabilities, [:generate, :chat])
 
         with {:ok, path, file_bytes} <- state.io.resolve_source(source, opts),
-             est = Budget.estimate(file_bytes, [{:mode, mode} | opts]),
-             :ok <- Budget.check(state.budget, est, used_bytes(state)),
+             placement = Budget.distribute(file_bytes, [{:mode, mode} | opts], state.n_gpus),
+             :ok <- Budget.check(state.budget, placement, used_placement(state)),
              {:ok, entry, state} <-
-               start_backing(state, id, source, path, mode, capabilities, file_bytes, est, opts) do
+               start_backing(
+                 state,
+                 id,
+                 source,
+                 path,
+                 mode,
+                 capabilities,
+                 file_bytes,
+                 placement,
+                 opts
+               ) do
           :ets.insert(@table, {id, entry})
           maybe_set_default(id, opts)
           {:ok, id, state}
@@ -411,7 +424,7 @@ defmodule LlamaCppEx.ModelManager do
     end
   end
 
-  defp start_backing(state, id, source, path, :server, capabilities, file_bytes, est, opts) do
+  defp start_backing(state, id, source, path, :server, capabilities, file_bytes, placement, opts) do
     case state.io.start_server(id, path, opts) do
       {:ok, pid} ->
         ref = Process.monitor(pid)
@@ -426,7 +439,8 @@ defmodule LlamaCppEx.ModelManager do
           source: source,
           capabilities: capabilities,
           byte_size: file_bytes,
-          est_bytes: est,
+          est_bytes: placement_total(placement),
+          placement: placement,
           n_gpu_layers: Keyword.get(opts, :n_gpu_layers, 99),
           loaded_at: System.system_time(:second)
         }
@@ -438,7 +452,7 @@ defmodule LlamaCppEx.ModelManager do
     end
   end
 
-  defp start_backing(state, id, source, path, :direct, capabilities, file_bytes, est, opts) do
+  defp start_backing(state, id, source, path, :direct, capabilities, file_bytes, placement, opts) do
     case state.io.load_model(path, opts) do
       {:ok, model} ->
         entry = %Entry{
@@ -450,7 +464,8 @@ defmodule LlamaCppEx.ModelManager do
           source: source,
           capabilities: capabilities,
           byte_size: file_bytes,
-          est_bytes: est,
+          est_bytes: placement_total(placement),
+          placement: placement,
           n_gpu_layers: Keyword.get(opts, :n_gpu_layers, 99),
           loaded_at: System.system_time(:second)
         }
@@ -461,6 +476,8 @@ defmodule LlamaCppEx.ModelManager do
         {:error, reason, state}
     end
   end
+
+  defp placement_total(%{ram: ram, vram: vram}), do: ram + (vram |> Map.values() |> Enum.sum())
 
   defp do_unload(state, %Entry{} = entry) do
     state =
@@ -499,16 +516,26 @@ defmodule LlamaCppEx.ModelManager do
     if Keyword.get(opts, :default, false), do: :ets.insert(@table, {@default_key, id})
   end
 
-  defp used_bytes(_state) do
+  defp used_placement(_state) do
     @table
     |> safe_tab2list()
-    |> Enum.reduce(0, fn
-      {_id, %Entry{status: status, est_bytes: bytes}}, acc when status in [:ready, :loading] ->
-        acc + bytes
+    |> Enum.reduce(Budget.empty_usage(), fn
+      {_id, %Entry{status: status, placement: placement}}, acc
+      when status in [:ready, :loading] ->
+        Budget.add_usage(acc, placement)
 
       _, acc ->
         acc
     end)
+  end
+
+  defp gpu_devices do
+    LlamaCppEx.devices()
+    |> Enum.filter(&(&1.type in [:gpu, :igpu]))
+  rescue
+    _ -> []
+  catch
+    _, _ -> []
   end
 
   defp normalize_spec({id, source, opts}), do: {id, source, opts}
