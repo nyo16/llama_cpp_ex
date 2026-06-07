@@ -1,5 +1,16 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- **Multi-model manager** (`LlamaCppEx.ModelManager` + `LlamaCppEx.ModelSupervisor`) — keep several models resident at once and route requests to them by id. Builds on the existing `Hub` downloader and batching `Server`; adds named load/unload, capability-based routing, and an advisory memory budget. Opt-in and additive: no existing API changes, no new dependencies, and no auto-started application.
+  - **Routing** — a singleton GenServer owns an ETS table. Load/unload writes serialize through the GenServer; `generate`/`stream`/`chat`/`embed` read the ETS table directly from the caller, keeping the manager off the inference hot path. Route by explicit id or `:default`.
+  - **Backing modes** — `:server` (default for generation/chat) backs the model with a supervised `LlamaCppEx.Server` for batching, streaming, prefix caching, and telemetry; `:direct` (auto-selected when `:embed` is in `:capabilities`) holds the model for stateless calls and is required for embeddings.
+  - **Memory budget** — `:infinity` (default), `:auto` (~80% of system RAM), or a byte limit. Estimates a model's footprint from its GGUF size (plus a coarse KV-cache estimate for `:server` mode) and refuses over-budget loads with `{:error, {:insufficient_memory, ...}}`. No automatic eviction.
+  - **Unload** — stops the backing server (dropping context + model refs) and forces a GC. Reclamation is by GC, so a caller still holding a `%Model{}` from `fetch_model/1` keeps it alive; this is documented.
+  - See ADR 009 and the "Multiple Models (ModelManager)" section of the README. Example: `examples/model_manager.exs`. 38 new tests.
+
 ## v0.8.19
 
 ### Changed

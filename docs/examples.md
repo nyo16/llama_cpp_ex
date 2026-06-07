@@ -183,3 +183,38 @@ end)
 
 results = Task.await_many(tasks, 60_000)
 ```
+
+## Multiple Models (ModelManager)
+
+Keep several models resident and route requests by id with `LlamaCppEx.ModelManager`.
+
+```bash
+LLAMA_GEN_MODEL_PATH=/path/to/chat-model.gguf \
+LLAMA_EMB_MODEL_PATH=/path/to/embedding-model.gguf \
+  mix run examples/model_manager.exs
+```
+
+```elixir
+# Start the supervisor (or add {LlamaCppEx.ModelSupervisor, ...} to your tree)
+{:ok, _sup} = LlamaCppEx.ModelSupervisor.start_link(memory_budget: :auto)
+
+# Server-backed generation model (batching + streaming), set as the default route
+{:ok, "chat"} =
+  LlamaCppEx.ModelManager.load("chat", {:path, gen_path}, n_gpu_layers: -1, default: true)
+
+# Embedding model — :embed capability auto-selects :direct mode
+{:ok, "embed"} =
+  LlamaCppEx.ModelManager.load("embed", {:path, emb_path}, capabilities: [:embed])
+
+# Route by id (or :default)
+{:ok, text}  = LlamaCppEx.ModelManager.generate("chat", "What is Elixir?", max_tokens: 64)
+LlamaCppEx.ModelManager.stream(:default, "Count from 1 to 5:", max_tokens: 64)
+|> Enum.each(&IO.write/1)
+{:ok, vec}   = LlamaCppEx.ModelManager.embed("embed", "text to embed")
+
+# Inspect and free
+LlamaCppEx.ModelManager.list()
+:ok = LlamaCppEx.ModelManager.unload("chat")
+```
+
+A `{:hub, repo, file}` source downloads and caches via the Hub before loading. See the "Multiple Models" section of the README and ADR 009 for the design.

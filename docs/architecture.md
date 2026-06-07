@@ -37,6 +37,11 @@ graph LR
         I[Server]
     end
 
+    subgraph "Multi-Model"
+        J[ModelSupervisor]
+        K[ModelManager]
+    end
+
     subgraph "Internal"
         G[NIF]
     end
@@ -48,6 +53,10 @@ graph LR
     A --> F
     A --> H
     A --> I
+    J --> K
+    K --> I
+    K --> B
+    K --> H
     B --> G
     C --> G
     D --> G
@@ -56,6 +65,8 @@ graph LR
     H --> G
     I --> G
 ```
+
+`ModelManager` is an opt-in layer (started via `ModelSupervisor`) that keeps multiple models resident and routes requests to them by id — server-backed (`:server`) or held directly (`:direct`). It owns an ETS table; load/unload serialize through the GenServer while inference lookups read ETS directly. See ADR 009.
 
 ## Resource Lifecycle
 
@@ -349,12 +360,22 @@ llama_cpp_ex/
 │       │       ├── decode_maximal.ex  # Decode-first (default)
 │       │       ├── prefill_priority.ex # Prefill-first (throughput)
 │       │       └── balanced.ex        # Equal split
-│       └── hub.ex                   # HuggingFace Hub downloads
+│       ├── hub.ex                   # HuggingFace Hub downloads
+│       ├── model_supervisor.ex       # Opt-in Registry + DynamicSupervisor + ModelManager
+│       ├── model_manager.ex          # Multi-model registry, routing, memory budget
+│       └── model_manager/
+│           ├── backend.ex            # Backend behaviour (injectable model I/O)
+│           ├── model_io.ex           # Default backend (Hub/Model/Server)
+│           ├── entry.ex              # ETS entry struct + sanitized view
+│           └── budget.ex             # Advisory memory estimate + fit-check
 ├── priv/                            # Build output (.so / .dylib)
 ├── bench/                           # Benchee benchmarks
 ├── docs/                            # Architecture docs + ADRs
 └── test/
     ├── llama_cpp_ex_test.exs        # Model-dependent tests
     ├── batch_strategy_test.exs      # Strategy unit tests (no model)
+    ├── model_manager_test.exs       # Manager lifecycle/routing tests (fake backend)
+    ├── model_manager/
+    │   └── budget_test.exs          # Budget unit tests (pure)
     └── hub_test.exs                 # Hub unit tests (no network)
 ```

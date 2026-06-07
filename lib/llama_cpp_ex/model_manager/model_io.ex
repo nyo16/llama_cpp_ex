@@ -39,9 +39,6 @@ defmodule LlamaCppEx.ModelManager.ModelIO do
     with {:ok, path} <- Hub.download(repo_id, filename, hub_opts),
          {:ok, %{size: size}} <- File.stat(path) do
       {:ok, path, size}
-    else
-      {:error, %File.Error{} = e} -> {:error, Exception.message(e)}
-      {:error, _reason} = error -> error
     end
   end
 
