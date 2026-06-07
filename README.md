@@ -21,6 +21,7 @@ Built with C++ NIFs using [fine](https://github.com/elixir-nx/fine) for ergonomi
 - Structured output via JSON Schema (auto-converted to GBNF grammar)
 - Optional Ecto schema to JSON Schema conversion
 - Continuous batching server for concurrent inference
+- **Multi-model manager** — keep several models resident, route requests by id, with an advisory memory budget
 - **Multi-Token Prediction (MTP) speculative decoding** — ~2x token-generation speedup on Qwen 3.6 with live acceptance-rate stats
 - **Prefix caching** — same-slot KV cache reuse for multi-turn chat (1.23x faster)
 - **Pluggable batching strategies** — DecodeMaximal, PrefillPriority, Balanced
@@ -321,6 +322,77 @@ These also work with the high-level API:
 ```
 
 See [Performance Guide](docs/performance.md) for all available parameters including RoPE context extension, GPU offload control, attention type, and more.
+
+## Multiple Models (ModelManager)
+
+`LlamaCppEx.ModelManager` keeps several models resident at once and routes requests to them by id. It reuses the HuggingFace Hub downloader and the batching `Server`, and adds named load/unload, capability-based routing, and an advisory memory budget.
+
+Add `LlamaCppEx.ModelSupervisor` to your application's supervision tree (it starts a `Registry`, a `DynamicSupervisor`, and the manager):
+
+```elixir
+children = [
+  {LlamaCppEx.ModelSupervisor,
+   memory_budget: :auto,
+   models: [
+     # Server-backed (batching + streaming), marked as the default route
+     {"chat", {:hub, "Qwen/Qwen3-0.6B-GGUF", "Qwen3-0.6B-Q8_0.gguf"},
+      n_gpu_layers: -1, default: true},
+     # Embedding model — :embed capability auto-selects :direct mode
+     {"embed", {:path, "/models/nomic-embed.gguf"}, capabilities: [:embed]}
+   ]}
+]
+```
+
+For scripts or IEx, start it directly and load at runtime:
+
+```elixir
+{:ok, _sup} = LlamaCppEx.ModelSupervisor.start_link([])
+
+# Download from the Hub (cached in ~/.cache/llama_cpp_ex/models/) and keep resident
+{:ok, "chat"} = LlamaCppEx.ModelManager.load(
+  "chat", {:hub, "Qwen/Qwen3-0.6B-GGUF", "Qwen3-0.6B-Q8_0.gguf"}, n_gpu_layers: -1
+)
+# Or from a local path
+{:ok, "embed"} = LlamaCppEx.ModelManager.load(
+  "embed", {:path, "/models/nomic-embed.gguf"}, capabilities: [:embed]
+)
+
+# Route by id
+{:ok, text} = LlamaCppEx.ModelManager.generate("chat", "Once upon a time", max_tokens: 100)
+LlamaCppEx.ModelManager.stream("chat", "Tell me a story") |> Enum.each(&IO.write/1)
+{:ok, reply} = LlamaCppEx.ModelManager.chat("chat", [%{role: "user", content: "Hi!"}])
+{:ok, vector} = LlamaCppEx.ModelManager.embed("embed", "text to embed")
+
+# Route to the default model
+{:ok, text} = LlamaCppEx.ModelManager.generate(:default, "Hello")
+
+# Inspect and manage
+LlamaCppEx.ModelManager.list()        # sanitized views, no raw refs
+LlamaCppEx.ModelManager.loaded?("chat")
+LlamaCppEx.ModelManager.unload("chat")  # stops the backing server, frees memory
+```
+
+### Backing modes
+
+- **`:server`** (default for generation/chat) — backs the model with a supervised `LlamaCppEx.Server`, so you get continuous batching, streaming, prefix caching, and telemetry.
+- **`:direct`** (auto-selected when `:embed` is in `:capabilities`) — holds the model and runs stateless calls. Required for embeddings, since the server has no embedding path.
+
+Override with `mode: :server | :direct`.
+
+### Memory budget
+
+`:memory_budget` accepts `:infinity` (default), `:auto` (~80% of system RAM), or a byte limit. The manager estimates a model's footprint from its GGUF size (plus a coarse KV-cache estimate for `:server` mode) and **refuses** loads that would exceed the budget:
+
+```elixir
+{:error, {:insufficient_memory, required: r, available: a}} =
+  LlamaCppEx.ModelManager.load("too-big", {:path, "70b.gguf"})
+```
+
+There is no automatic eviction — unload a model yourself to make room.
+
+### Unloading and memory reclamation
+
+Model cleanup is garbage-collection based. `unload/1` stops the backing server (dropping its context and model references) and forces a GC. Because reclamation is by GC, **any caller still holding a `%LlamaCppEx.Model{}` obtained via `fetch_model/1` keeps the model alive** past `unload/1` — prefer id-based routing and avoid holding raw refs.
 
 ## Speculative decoding (MTP)
 
