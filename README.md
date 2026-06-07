@@ -391,7 +391,7 @@ All of llama.cpp's placement options pass straight through `load/3` (per model) 
 | `:tensor_split` | A **list of per-device proportions** — one float per GPU, indexed by device order. Zeros exclude a device. |
 | `:main_gpu` | Primary device: the single GPU under `:none`, or the device holding non-split tensors under `:layer` |
 
-`:tensor_split` is the "array of GPUs": it's a weight per device (llama.cpp normalizes the values), **not** a list of indices. Device order follows `CUDA_VISIBLE_DEVICES`.
+`:tensor_split` is the "array of GPUs": it's a weight per device (llama.cpp normalizes the values), **not** a list of indices. Device order follows `CUDA_VISIBLE_DEVICES`. See [docs/multi-gpu.md](docs/multi-gpu.md) for a full multi-GPU guide and verification steps.
 
 ```elixir
 # Pin a model to one specific GPU
