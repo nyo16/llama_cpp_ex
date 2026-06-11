@@ -1,5 +1,25 @@
 # Changelog
 
+## v0.8.21
+
+### Changed
+
+- **llama.cpp submodule** — Updated from 04eb4c446 to 4c6595503 (52 commits, tag b9601). No NIF changes were required. `include/llama.h`, `common/chat.h`, `common/json-schema-to-grammar.h`, and `common/speculative.h` are all unchanged. `common/common.h` adds a `path_prompts_log_dir` field to `common_params` (server prompt logging — not used by the binding), and `common/sampling.h` drops the `allow_alt_names` parameter from `common_sampler_types_from_names` (the NIF does not call any `common_sampler_*` functions). The full test suite passes, formatting is clean, and Dialyzer reports 0 errors.
+  - **vocab**: adopt leading TemplateProcessing special token as BOS (#24428); refactor normalizer flags into an options struct and add `strip_accents` (#24371).
+  - **model/graph/convert**: fix plamo2 `attention_key/value_length` regression (#24317); fix Granite Speech inference by applying embedding scale when deepstack is not used (#24357); guard iswa `kq_mask` on its own buffer (#24294); fix conversion for Mistral-Medium-3.5-128B (#24268).
+  - **mtmd**: add video input support (#24269); refactor video subproc handling (#24316); `build_vit` batching (#24352).
+  - **MTP/speculative**: Gemma-4 E2B and E4B assistants (#24282); remove padding and multiple D2D copies (#24086); fix "ngram-map-k4v" name in logging (#24253).
+  - **common/chat**: fix LFM2/LFM2.5 ignoring `json_schema` (#24377); relax sampler name matching (#23744).
+  - **kv-cache**: avoid kv cells copies (#24277); follow the source cache size when sharing cells (#24267); skip checkpoints beyond `pos_next` (#24411); do not clear slots without unified KV cache (#24190).
+  - **server**: log prompts to a directory (#22031); skip unused log lines in router mode (#24463); do not parse when flushing http headers (#24281).
+  - **CUDA/HIP**: fix `ssm_scan_f32` data races (#24360); reset CUDA context after reading memory size (#23935); remove the GGML_TYPE_Q4_K case in mmvq.cu (#23528); add gfx1152/gfx1153 to RDNA3.5 (#24129).
+  - **vulkan**: fast path for contiguous buffer transfers (#23973); medium matmul tile on Asahi Linux (#24306); reduce iq1 shared memory usage for mul_mm (#24287); `v_dot2_f32_f16` support in matmul and Flash Attention (#24123); cm2 `decode_vector` for `mul_mat_id` B-matrix loads (#23991); eMesaHoneykrisp ifdef build fix (#24479).
+  - **metal**: fix im2col 1D case for audio models (#24220).
+  - **webgpu**: improve prefill speeds for k-quants and refactor matmul for Q4/Q5/Q8 (#24225); handle buffer aliasing for concat (#24000); 2D workgroups for scale/binary/unary ops (#24044).
+  - **ggml**: add `GGML_OP_COL2IM_1D` (#24206); fix `rms_norm_back` wrong output under in-place aliasing (#24305); version bumps to 0.14.0/0.15.0.
+  - **webui/cli**: pinned conversations (#21387); opt-in `run_javascript` frontend tool (#24244); fix excessive style recalculation on hover (#24243); fix mobile chat form overflow and stale bundle cache (#24158); fix spinner during prompt processing (#24283).
+  - **vendor/ci/docker**: update LibreSSL to 4.3.2 (#24397); install ffmpeg in released Docker images (#24302); SYCL compute runtime 26.x in Docker (#24070); fix Windows release CI (#24369); bump komac (#24396).
+
 ## v0.8.20
 
 ### Changed
