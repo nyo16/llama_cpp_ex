@@ -1,5 +1,11 @@
 # Changelog
 
+## v0.8.22
+
+### Fixed
+
+- **Precompiled NIF 2.18 artifacts** — `mix.exs` advertises precompiled NIFs for NIF versions 2.17 and 2.18, but the precompile workflow built each target on OTP 27 *and* OTP 28, and both of those report NIF 2.17 (2.18 only arrived with OTP 29). The two jobs therefore produced identically named `nif-2.17` tarballs that overwrote each other on upload, and no 2.18 artifact was ever published — so installing on OTP 29 (NIF 2.18) failed with a 404 when fetching the precompiled binary. The precompile matrix now builds on OTP 27 (NIF 2.17) and OTP 29 (NIF 2.18), publishing both NIF versions for each target. The llama.cpp submodule is unchanged (4c6595503, tag b9601).
+
 ## v0.8.21
 
 ### Changed
