@@ -32,11 +32,31 @@ defmodule LlamaCppEx.ModelManagerTest do
     def resolve_source(source, opts) do
       case Keyword.get(opts, :fake_resolve_error) do
         nil ->
-          path = with {:path, p} <- source, do: p
-          {:ok, to_string(path), Keyword.get(opts, :fake_bytes, 1_000)}
+          maybe_block(opts)
+          {:ok, resolve_path(source), Keyword.get(opts, :fake_bytes, 1_000)}
 
         reason ->
           {:error, reason}
+      end
+    end
+
+    defp resolve_path({:path, p}), do: p
+    defp resolve_path({:hub, _repo, file}), do: file
+
+    # Optional rendezvous: when `:fake_block` is a pid, notify it and park here
+    # until released, so a test can hold a load mid-resolve and prove the manager
+    # stays responsive to other calls.
+    defp maybe_block(opts) do
+      case Keyword.get(opts, :fake_block) do
+        nil ->
+          :ok
+
+        notify ->
+          send(notify, {:resolving, self()})
+
+          receive do
+            :release -> :ok
+          end
       end
     end
 
@@ -154,6 +174,16 @@ defmodule LlamaCppEx.ModelManagerTest do
       assert {:ok, {:server, pid, _}} = ModelManager.route("s")
       assert is_pid(pid)
       assert {:ok, {:direct, %LlamaCppEx.Model{}, _}} = ModelManager.route("d")
+    end
+
+    test "fetch_model returns the raw model for server and direct modes" do
+      {:ok, _} = ModelManager.load("s", {:path, "s.gguf"}, mode: :server)
+      assert {:ok, %LlamaCppEx.Model{}} = ModelManager.fetch_model("s")
+
+      {:ok, _} = ModelManager.load("d", {:path, "d.gguf"}, mode: :direct)
+      assert {:ok, %LlamaCppEx.Model{}} = ModelManager.fetch_model("d")
+
+      assert {:error, :not_loaded} = ModelManager.fetch_model("missing")
     end
 
     test "embed refuses non-embedding models" do
@@ -282,21 +312,80 @@ defmodule LlamaCppEx.ModelManagerTest do
       {:ok, _} = ModelManager.load("chat", {:path, "chat.gguf"})
       {:ok, {:server, pid, _}} = ModelManager.route("chat")
 
+      # Monitor from the test too. When we receive our own :DOWN, the manager's
+      # monitor message is already enqueued at the same process-death event,
+      # ahead of the sync call below — so once that call returns, the entry has
+      # been marked :error. Deterministic, no polling.
+      ref = Process.monitor(pid)
       Process.exit(pid, :kill)
+      assert_receive {:DOWN, ^ref, :process, ^pid, _}
 
-      # The :DOWN is delivered by the runtime asynchronously, so poll until the
-      # manager has marked the entry :error.
-      eventually(fn -> match?({:ok, %{status: :error}}, ModelManager.info("chat")) end)
+      # A sync call drains the manager mailbox after the :DOWN it handled.
+      assert {:error, :not_loaded} = ModelManager.unload(make_ref())
 
+      assert {:ok, %{status: :error}} = ModelManager.info("chat")
       assert {:error, {:not_ready, :error}} = ModelManager.generate("chat", "hi")
     end
   end
 
-  defp eventually(fun, retries \\ 100) do
-    cond do
-      fun.() -> :ok
-      retries == 0 -> flunk("condition not met within timeout")
-      true -> Process.sleep(10) && eventually(fun, retries - 1)
+  describe "autoload" do
+    test "loads models listed in the :models option on start" do
+      start_manager(
+        models: [
+          {"a", {:path, "a.gguf"}},
+          {"b", {:path, "b.gguf"}, mode: :direct}
+        ]
+      )
+
+      # Autoload runs synchronously in handle_continue, before any external call
+      # is served; a sync call guarantees it has completed before we assert.
+      assert {:error, :not_loaded} = ModelManager.unload(make_ref())
+
+      assert {:ok, %{mode: :server, status: :ready}} = ModelManager.info("a")
+      assert {:ok, %{mode: :direct, status: :ready}} = ModelManager.info("b")
+    end
+  end
+
+  describe "async load" do
+    setup do
+      start_manager()
+      :ok
+    end
+
+    test "a slow load does not block other manager calls" do
+      parent = self()
+
+      slow =
+        Task.async(fn ->
+          ModelManager.load("slow", {:path, "slow.gguf"}, fake_block: parent)
+        end)
+
+      # "slow" is now parked inside resolve_source, mid-load.
+      assert_receive {:resolving, resolver_pid}, 1_000
+      assert {:ok, %{status: :loading}} = ModelManager.info("slow")
+
+      # The manager mailbox is free: another load completes and reads answer.
+      assert {:ok, "fast"} = ModelManager.load("fast", {:path, "fast.gguf"})
+      assert ModelManager.loaded?("fast")
+
+      send(resolver_pid, :release)
+      assert {:ok, "slow"} = Task.await(slow)
+      assert ModelManager.loaded?("slow")
+    end
+
+    test "rejects a second load of the same id while the first is in flight" do
+      parent = self()
+
+      first =
+        Task.async(fn ->
+          ModelManager.load("dup", {:path, "dup.gguf"}, fake_block: parent)
+        end)
+
+      assert_receive {:resolving, resolver_pid}, 1_000
+      assert {:error, :already_loaded} = ModelManager.load("dup", {:path, "dup.gguf"})
+
+      send(resolver_pid, :release)
+      assert {:ok, "dup"} = Task.await(first)
     end
   end
 end

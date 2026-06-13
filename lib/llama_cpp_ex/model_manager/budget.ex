@@ -123,17 +123,15 @@ defmodule LlamaCppEx.ModelManager.Budget do
     n_gpu_layers = Keyword.get(opts, :n_gpu_layers, 99)
     offloaded? = n_gpu_layers != 0 and n_gpus > 0
 
-    cond do
-      not offloaded? ->
-        %{ram: file_bytes + kv, vram: %{}}
-
-      true ->
-        kqv_on_gpu? = Keyword.get(opts, :offload_kqv, true)
-        vram_total = file_bytes + if(kqv_on_gpu?, do: kv, else: 0)
-        ram_total = if kqv_on_gpu?, do: 0, else: kv
-        weights = device_weights(opts, n_gpus)
-        vram = Map.new(weights, fn {i, w} -> {i, round(vram_total * w)} end)
-        %{ram: ram_total, vram: vram}
+    if not offloaded? do
+      %{ram: file_bytes + kv, vram: %{}}
+    else
+      kqv_on_gpu? = Keyword.get(opts, :offload_kqv, true)
+      vram_total = file_bytes + if(kqv_on_gpu?, do: kv, else: 0)
+      ram_total = if kqv_on_gpu?, do: 0, else: kv
+      weights = device_weights(opts, n_gpus)
+      vram = Map.new(weights, fn {i, w} -> {i, round(vram_total * w)} end)
+      %{ram: ram_total, vram: vram}
     end
   end
 
@@ -220,7 +218,7 @@ defmodule LlamaCppEx.ModelManager.Budget do
     end
   end
 
-  defp sum_vram(%{vram: vram}), do: vram |> Map.values() |> Enum.sum()
+  defp sum_vram(%{vram: vram}), do: Enum.sum(Map.values(vram))
 
   # Coarse KV-cache size: 2 (K+V) * n_ctx * n_parallel * bytes-per-context-token.
   defp kv_cache_estimate(opts) do
@@ -246,8 +244,17 @@ defmodule LlamaCppEx.ModelManager.Budget do
 
   defp darwin_memory do
     case System.cmd("sysctl", ["-n", "hw.memsize"], stderr_to_stdout: true) do
-      {out, 0} -> out |> String.trim() |> String.to_integer()
+      {out, 0} -> parse_bytes(out)
       _ -> nil
+    end
+  end
+
+  # `sysctl` output should be a plain integer, but parse defensively so unexpected
+  # output (virtualized hosts, odd macOS builds) degrades to nil rather than raising.
+  defp parse_bytes(out) do
+    case out |> String.trim() |> Integer.parse() do
+      {bytes, _rest} -> bytes
+      :error -> nil
     end
   end
 

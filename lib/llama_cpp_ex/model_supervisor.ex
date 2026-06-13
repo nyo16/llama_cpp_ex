@@ -26,7 +26,10 @@ defmodule LlamaCppEx.ModelSupervisor do
       `:auto`, or a byte limit).
     * `:models` - Models to auto-load after start (loaded by the manager so the
       supervisor itself does not block on downloads).
-    * `:name` - Supervisor name. Defaults to `LlamaCppEx.ModelSupervisor`.
+    * `:name` - Names **this supervisor**. Defaults to `LlamaCppEx.ModelSupervisor`.
+      It does not rename the manager: `LlamaCppEx.ModelManager` is a node-wide
+      singleton registered under its module name (the client API targets it
+      there), so only one `ModelSupervisor` should run per node.
   """
 
   use Supervisor
@@ -49,6 +52,10 @@ defmodule LlamaCppEx.ModelSupervisor do
       {LlamaCppEx.ModelManager, manager_opts}
     ]
 
-    Supervisor.init(children, strategy: :one_for_one)
+    # :rest_for_one encodes the dependency chain: the manager looks models up via
+    # the Registry and starts servers under the DynamicSupervisor, so if either
+    # restarts, the manager (and anything after it) must restart too. On a manager
+    # crash, only it restarts — and its init reclaims orphaned servers.
+    Supervisor.init(children, strategy: :rest_for_one)
   end
 end

@@ -29,6 +29,9 @@ defmodule LlamaCppEx.DevicesTest do
       |> Enum.filter(&(&1.type in [:gpu, :igpu]))
       |> Enum.map(& &1.gpu_index)
 
-    assert gpu_indices == Enum.to_list(0..(length(gpu_indices) - 1)//1)
+    # Contiguous 0..n-1, and trivially [] on CPU-only machines (avoids relying on
+    # the empty 0..-1//1 range).
+    expected = if gpu_indices == [], do: [], else: Enum.to_list(0..(length(gpu_indices) - 1))
+    assert gpu_indices == expected
   end
 end

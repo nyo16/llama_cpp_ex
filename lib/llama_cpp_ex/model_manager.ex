@@ -2,11 +2,24 @@ defmodule LlamaCppEx.ModelManager do
   @moduledoc """
   Holds multiple models resident and routes requests to them by id.
 
-  The manager is a singleton `GenServer` that owns an ETS table of loaded
-  models. Following the otp-thinking ETS pattern, **load/unload writes serialize
-  through the GenServer, while inference-time lookups read the ETS table directly
-  from the caller** — so the manager never becomes a throughput bottleneck for
-  `generate/3`, `stream/3`, `chat/3`, or `embed/3`.
+  The manager is a node-wide singleton `GenServer` that owns an ETS table of
+  loaded models. Following the otp-thinking ETS pattern, **lifecycle writes
+  serialize through the GenServer, while inference-time lookups read the ETS
+  table directly from the caller** — so the manager never becomes a throughput
+  bottleneck for `generate/3`, `stream/3`, `chat/3`, or `embed/3`.
+
+  It is a singleton by design: the client API targets the manager by its module
+  name, and the backing `Registry`/`DynamicSupervisor` use fixed names. Start at
+  most one per node — `init/1` refuses a second instance with a clear error.
+
+  Because the slow parts of `load/3` (Hub download + native model load) run in a
+  supervised `Task` rather than the GenServer process, a long load does **not**
+  block other lifecycle calls (`unload/1`, `set_default/1`, or concurrent
+  `load/3`s). The memory-budget reservation and the ETS commit are still
+  serialized on the GenServer, so resident models are always accounted for. (The
+  budget remains advisory: a model's footprint is only reserved once its size is
+  known — after resolve — so two models *downloading* at once may momentarily
+  under-count each other.)
 
   Start it as part of `LlamaCppEx.ModelSupervisor`, which also starts the
   `Registry` and `DynamicSupervisor` that server-backed models need:
@@ -59,6 +72,11 @@ defmodule LlamaCppEx.ModelManager do
   @lru :llama_cpp_ex_models_lru
   @default_key {:__meta__, :default}
 
+  @typedoc """
+  A model identifier. Any term works as a key; strings (e.g. `"chat"`) or atoms
+  are conventional. Ids flow through as raw terms and are never converted to
+  atoms, so user-supplied strings are safe.
+  """
   @type id :: term()
   @type source :: Entry.source()
 
@@ -103,9 +121,14 @@ defmodule LlamaCppEx.ModelManager do
     GenServer.call(__MODULE__, {:load, id, source, opts}, :infinity)
   end
 
-  @doc "Unloads a model and frees its backing resources (GC-based)."
-  @spec unload(id()) :: :ok | {:error, :not_loaded}
-  def unload(id), do: GenServer.call(__MODULE__, {:unload, id})
+  @doc """
+  Unloads a model and frees its backing resources (GC-based).
+
+  Stopping a backing server can take a moment for large models, so this accepts
+  an optional `timeout` (default 30s) rather than the 5s `GenServer` default.
+  """
+  @spec unload(id(), timeout()) :: :ok | {:error, :not_loaded}
+  def unload(id, timeout \\ 30_000), do: GenServer.call(__MODULE__, {:unload, id}, timeout)
 
   @doc "Sets the default model used by `:default` routing."
   @spec set_default(id()) :: :ok | {:error, :not_loaded}
@@ -220,8 +243,9 @@ defmodule LlamaCppEx.ModelManager do
         {chat_opts, gen_opts} =
           Keyword.split(opts, [:add_assistant, :enable_thinking, :chat_template_kwargs])
 
-        with model <- LlamaCppEx.Server.get_model(pid),
-             {:ok, prompt} <- LlamaCppEx.Chat.apply_template(model, messages, chat_opts) do
+        model = LlamaCppEx.Server.get_model(pid)
+
+        with {:ok, prompt} <- LlamaCppEx.Chat.apply_template(model, messages, chat_opts) do
           LlamaCppEx.Server.generate(pid, prompt, gen_opts)
         end
 
@@ -284,33 +308,50 @@ defmodule LlamaCppEx.ModelManager do
 
   @impl true
   def init(opts) do
-    Process.flag(:trap_exit, true)
+    if :ets.whereis(@table) != :undefined do
+      {:stop,
+       "LlamaCppEx.ModelManager is a node-wide singleton and is already running " <>
+         "(it owns the #{inspect(@table)} ETS table). Start at most one per node."}
+    else
+      Process.flag(:trap_exit, true)
 
-    table = :ets.new(@table, [:named_table, :protected, :set, read_concurrency: true])
+      # A previous manager incarnation may have left backing servers behind under
+      # the (process-independent) DynamicSupervisor; reclaim their VRAM now that
+      # our ETS table starts empty. No-op when started standalone (no DynSup).
+      cleanup_orphaned_servers()
 
-    _lru =
-      :ets.new(@lru, [
-        :named_table,
-        :public,
-        :set,
-        read_concurrency: true,
-        write_concurrency: true
-      ])
+      # Supervises the per-load tasks that run the slow resolve/native-load off
+      # the GenServer process. Linked here so it dies with the manager.
+      {:ok, task_sup} = Task.Supervisor.start_link()
 
-    # Idempotent native backend init; harmless if already initialized.
-    _ = safe_backend_init()
+      table = :ets.new(@table, [:named_table, :protected, :set, read_concurrency: true])
 
-    gpu_devices = gpu_devices()
+      _lru =
+        :ets.new(@lru, [
+          :named_table,
+          :public,
+          :set,
+          read_concurrency: true,
+          write_concurrency: true
+        ])
 
-    state = %{
-      table: table,
-      io: Keyword.get(opts, :io, ModelIO),
-      budget: Budget.resolve(Keyword.get(opts, :memory_budget, :infinity), gpu_devices),
-      n_gpus: length(gpu_devices),
-      monitors: %{}
-    }
+      # Idempotent native backend init; harmless if already initialized.
+      _ = safe_backend_init()
 
-    {:ok, state, {:continue, {:autoload, Keyword.get(opts, :models, [])}}}
+      gpu_devices = gpu_devices()
+
+      state = %{
+        table: table,
+        io: Keyword.get(opts, :io, ModelIO),
+        budget: Budget.resolve(Keyword.get(opts, :memory_budget, :infinity), gpu_devices),
+        n_gpus: length(gpu_devices),
+        monitors: %{},
+        task_sup: task_sup,
+        loads: %{}
+      }
+
+      {:ok, state, {:continue, {:autoload, Keyword.get(opts, :models, [])}}}
+    end
   end
 
   @impl true
@@ -333,10 +374,13 @@ defmodule LlamaCppEx.ModelManager do
   end
 
   @impl true
-  def handle_call({:load, id, source, opts}, _from, state) do
-    case do_load(state, id, source, opts) do
-      {:ok, id, new_state} -> {:reply, {:ok, id}, new_state}
-      {:error, reason, new_state} -> {:reply, {:error, reason}, new_state}
+  def handle_call({:load, id, source, opts}, from, state) do
+    case lookup_entry(id) do
+      {:ok, %Entry{status: status}} when status in [:ready, :loading] ->
+        {:reply, {:error, :already_loaded}, state}
+
+      _ ->
+        {:noreply, start_async_load(state, id, source, opts, from)}
     end
   end
 
@@ -351,15 +395,58 @@ defmodule LlamaCppEx.ModelManager do
   end
 
   def handle_call({:set_default, id}, _from, state) do
-    if match?({:ok, _}, lookup_entry(id)) do
-      :ets.insert(@table, {@default_key, id})
-      {:reply, :ok, state}
-    else
-      {:reply, {:error, :not_loaded}, state}
+    case lookup_entry(id) do
+      {:ok, _entry} ->
+        :ets.insert(@table, {@default_key, id})
+        {:reply, :ok, state}
+
+      {:error, _} ->
+        {:reply, {:error, :not_loaded}, state}
+    end
+  end
+
+  # Serialized memory-budget reservation, called by a load task once it knows the
+  # model's placement. Recording the placement on the :loading entry means
+  # concurrent reservations account for it, so the budget can't be oversubscribed.
+  def handle_call({:reserve, id, placement}, _from, state) do
+    case Budget.check(state.budget, placement, used_placement(state)) do
+      :ok ->
+        case lookup_entry(id) do
+          {:ok, entry} ->
+            :ets.insert(
+              @table,
+              {id, %{entry | placement: placement, est_bytes: placement_total(placement)}}
+            )
+
+          {:error, _} ->
+            :ok
+        end
+
+        {:reply, :ok, state}
+
+      {:error, _} = error ->
+        {:reply, error, state}
     end
   end
 
   @impl true
+  # A load task finished. async_nolink delivers {ref, result}; flush the paired
+  # :DOWN so it doesn't fall through to the server-monitor clause below.
+  def handle_info({ref, result}, state) when is_map_key(state.loads, ref) do
+    Process.demonitor(ref, [:flush])
+    {load, loads} = Map.pop(state.loads, ref)
+    {:noreply, finalize_load(%{state | loads: loads}, load, result)}
+  end
+
+  # A load task crashed before returning a result.
+  def handle_info({:DOWN, ref, :process, _pid, reason}, state)
+      when is_map_key(state.loads, ref) do
+    {load, loads} = Map.pop(state.loads, ref)
+    :ets.delete(@table, load.id)
+    reply_load(load.from, {:error, {:load_crashed, reason}})
+    {:noreply, %{state | loads: loads}}
+  end
+
   def handle_info({:DOWN, ref, :process, pid, reason}, state) do
     case Map.pop(state.monitors, ref) do
       {nil, _} ->
@@ -390,94 +477,182 @@ defmodule LlamaCppEx.ModelManager do
 
   # --- Load / unload internals ---
 
+  # Synchronous load used only by boot-time autoload (`handle_continue`), where
+  # blocking the manager until models are resident is acceptable. Interactive
+  # `load/3` goes through the async path (`start_async_load/5`) instead.
   defp do_load(state, id, source, opts) do
-    cond do
-      match?({:ok, %Entry{status: status}} when status in [:ready, :loading], lookup_entry(id)) ->
+    case lookup_entry(id) do
+      {:ok, %Entry{status: status}} when status in [:ready, :loading] ->
         {:error, :already_loaded, state}
 
-      true ->
+      _ ->
         mode = resolve_mode(opts)
         capabilities = Keyword.get(opts, :capabilities, [:generate, :chat])
 
         with {:ok, path, file_bytes} <- state.io.resolve_source(source, opts),
              placement = Budget.distribute(file_bytes, [{:mode, mode} | opts], state.n_gpus),
              :ok <- Budget.check(state.budget, placement, used_placement(state)),
-             {:ok, entry, state} <-
-               start_backing(
-                 state,
-                 id,
-                 source,
-                 path,
-                 mode,
-                 capabilities,
-                 file_bytes,
-                 placement,
-                 opts
-               ) do
+             {:ok, backing} <- start_backing_io(state.io, id, path, mode, opts) do
+          {entry, state} =
+            build_ready_entry(
+              state,
+              id,
+              source,
+              backing,
+              file_bytes,
+              placement,
+              capabilities,
+              opts
+            )
+
           :ets.insert(@table, {id, entry})
           maybe_set_default(id, opts)
           {:ok, id, state}
         else
           {:error, reason} -> {:error, reason, state}
-          {:error, reason, state} -> {:error, reason, state}
         end
     end
   end
 
-  defp start_backing(state, id, source, path, :server, capabilities, file_bytes, placement, opts) do
-    case state.io.start_server(id, path, opts) do
-      {:ok, pid} ->
-        ref = Process.monitor(pid)
+  # --- Async interactive load ---
 
-        entry = %Entry{
-          id: id,
-          status: :ready,
-          mode: :server,
-          model: nil,
-          server_pid: pid,
-          monitor_ref: ref,
-          source: source,
-          capabilities: capabilities,
-          byte_size: file_bytes,
-          est_bytes: placement_total(placement),
-          placement: placement,
-          n_gpu_layers: Keyword.get(opts, :n_gpu_layers, 99),
-          loaded_at: System.system_time(:second)
-        }
+  defp start_async_load(state, id, source, opts, from) do
+    mode = resolve_mode(opts)
+    capabilities = Keyword.get(opts, :capabilities, [:generate, :chat])
 
-        {:ok, entry, %{state | monitors: Map.put(state.monitors, ref, id)}}
+    # Claim the id synchronously so a concurrent load of the same id is rejected
+    # while this one is in flight.
+    :ets.insert(
+      @table,
+      {id,
+       %Entry{id: id, status: :loading, mode: mode, source: source, capabilities: capabilities}}
+    )
 
-      {:error, reason} ->
-        {:error, reason, state}
+    manager = self()
+
+    task =
+      Task.Supervisor.async_nolink(state.task_sup, fn ->
+        run_load(manager, state.io, id, source, opts, mode, state.n_gpus)
+      end)
+
+    load = %{id: id, source: source, capabilities: capabilities, opts: opts, from: from}
+    %{state | loads: Map.put(state.loads, task.ref, load)}
+  end
+
+  # Runs in the task process: the slow resolve + native load, with a serialized
+  # budget reservation in between, keeping the GenServer mailbox free.
+  defp run_load(manager, io, id, source, opts, mode, n_gpus) do
+    with {:ok, path, file_bytes} <- io.resolve_source(source, opts),
+         placement = Budget.distribute(file_bytes, [{:mode, mode} | opts], n_gpus),
+         :ok <- GenServer.call(manager, {:reserve, id, placement}, :infinity),
+         {:ok, backing} <- start_backing_io(io, id, path, mode, opts) do
+      {:ok, backing, file_bytes, placement}
     end
   end
 
-  defp start_backing(state, id, source, path, :direct, capabilities, file_bytes, placement, opts) do
-    case state.io.load_model(path, opts) do
-      {:ok, model} ->
-        entry = %Entry{
-          id: id,
-          status: :ready,
-          mode: :direct,
-          model: model,
-          server_pid: nil,
-          source: source,
-          capabilities: capabilities,
-          byte_size: file_bytes,
-          est_bytes: placement_total(placement),
-          placement: placement,
-          n_gpu_layers: Keyword.get(opts, :n_gpu_layers, 99),
-          loaded_at: System.system_time(:second)
-        }
+  defp finalize_load(state, load, {:ok, backing, file_bytes, placement}) do
+    {entry, state} =
+      build_ready_entry(
+        state,
+        load.id,
+        load.source,
+        backing,
+        file_bytes,
+        placement,
+        load.capabilities,
+        load.opts
+      )
 
-        {:ok, entry, state}
+    :ets.insert(@table, {load.id, entry})
+    maybe_set_default(load.id, load.opts)
+    reply_load(load.from, {:ok, load.id})
+    state
+  end
 
-      {:error, reason} ->
-        {:error, reason, state}
+  defp finalize_load(state, load, {:error, reason}) do
+    # Drop the :loading placeholder, releasing any reservation it held.
+    :ets.delete(@table, load.id)
+    reply_load(load.from, {:error, reason})
+    state
+  end
+
+  defp reply_load(nil, _msg), do: :ok
+  defp reply_load(from, msg), do: GenServer.reply(from, msg)
+
+  # --- Backing start (shared by the sync and async load paths) ---
+
+  defp start_backing_io(io, _id, path, :direct, opts) do
+    case io.load_model(path, opts) do
+      {:ok, model} -> {:ok, {:direct, model}}
+      {:error, _} = err -> err
     end
   end
 
-  defp placement_total(%{ram: ram, vram: vram}), do: ram + (vram |> Map.values() |> Enum.sum())
+  defp start_backing_io(io, id, path, :server, opts) do
+    case io.start_server(id, path, opts) do
+      {:ok, pid} -> {:ok, {:server, pid}}
+      {:error, _} = err -> err
+    end
+  end
+
+  defp build_ready_entry(
+         state,
+         id,
+         source,
+         {:server, pid},
+         file_bytes,
+         placement,
+         capabilities,
+         opts
+       ) do
+    ref = Process.monitor(pid)
+
+    entry = %Entry{
+      id: id,
+      status: :ready,
+      mode: :server,
+      server_pid: pid,
+      monitor_ref: ref,
+      source: source,
+      capabilities: capabilities,
+      byte_size: file_bytes,
+      est_bytes: placement_total(placement),
+      placement: placement,
+      n_gpu_layers: Keyword.get(opts, :n_gpu_layers, 99),
+      loaded_at: System.system_time(:second)
+    }
+
+    {entry, %{state | monitors: Map.put(state.monitors, ref, id)}}
+  end
+
+  defp build_ready_entry(
+         state,
+         id,
+         source,
+         {:direct, model},
+         file_bytes,
+         placement,
+         capabilities,
+         opts
+       ) do
+    entry = %Entry{
+      id: id,
+      status: :ready,
+      mode: :direct,
+      model: model,
+      source: source,
+      capabilities: capabilities,
+      byte_size: file_bytes,
+      est_bytes: placement_total(placement),
+      placement: placement,
+      n_gpu_layers: Keyword.get(opts, :n_gpu_layers, 99),
+      loaded_at: System.system_time(:second)
+    }
+
+    {entry, state}
+  end
+
+  defp placement_total(%{ram: ram, vram: vram}), do: ram + Enum.sum(Map.values(vram))
 
   defp do_unload(state, %Entry{} = entry) do
     state =
@@ -491,10 +666,12 @@ defmodule LlamaCppEx.ModelManager do
           state
       end
 
+    # Clear the default pointer before the entry row, so a crash mid-unload can't
+    # leave @default_key referencing a removed model.
+    if default() == entry.id, do: :ets.delete(@table, @default_key)
+
     :ets.delete(@table, entry.id)
     :ets.delete(@lru, entry.id)
-
-    if default() == entry.id, do: :ets.delete(@table, @default_key)
 
     :erlang.garbage_collect()
     state
@@ -533,9 +710,25 @@ defmodule LlamaCppEx.ModelManager do
     LlamaCppEx.devices()
     |> Enum.filter(&(&1.type in [:gpu, :igpu]))
   rescue
-    _ -> []
-  catch
-    _, _ -> []
+    # The device NIF isn't loaded (test env / unsupported platform): degrade to
+    # "no GPUs" so budgeting treats everything as RAM. Other errors propagate.
+    _ in [ErlangError, UndefinedFunctionError] -> []
+  end
+
+  # Reclaim backing servers left under the (process-independent) DynamicSupervisor
+  # by a previous manager incarnation. Our ETS table starts empty on init, so any
+  # surviving children are orphans holding VRAM with no owner. No-op when started
+  # standalone (e.g. tests), where the DynamicSupervisor isn't running.
+  defp cleanup_orphaned_servers do
+    dynsup = ModelIO.dynamic_supervisor()
+
+    if is_pid(Process.whereis(dynsup)) do
+      for {_, pid, _, _} <- DynamicSupervisor.which_children(dynsup), is_pid(pid) do
+        DynamicSupervisor.terminate_child(dynsup, pid)
+      end
+    end
+
+    :ok
   end
 
   defp normalize_spec({id, source, opts}), do: {id, source, opts}
