@@ -25,6 +25,8 @@ Add an opt-in `LlamaCppEx.ModelManager` (a singleton GenServer) plus a `LlamaCpp
 
 The manager owns a named, `:protected`, `read_concurrency: true` ETS table of model entries. **Load/unload writes serialize through the GenServer; inference-time lookups (`generate`/`stream`/`chat`/`embed`) read the ETS table directly from the caller process.** This keeps the manager off the inference hot path — a generation request never enters the manager's mailbox, so the singleton is not a throughput bottleneck.
 
+The slow part of a load (Hub download + native model load) runs in a supervised `Task`, not on the manager process, so a long load does not head-of-line-block other lifecycle calls (`unload`, `set_default`, concurrent `load`s). Only the budget reservation and the ETS commit happen on the GenServer; a load in flight is recorded with `status: :loading` so a duplicate `load` of the same id is refused while it runs.
+
 `last_used` (for diagnostics/LRU) is kept in a separate `:public` table so callers can bump it with `:ets.insert/2` without writing to the protected entries table.
 
 ### Two backing modes

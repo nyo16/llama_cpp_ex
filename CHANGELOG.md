@@ -5,12 +5,13 @@
 ### Added
 
 - **Multi-model manager** (`LlamaCppEx.ModelManager` + `LlamaCppEx.ModelSupervisor`) — keep several models resident at once and route requests to them by id. Builds on the existing `Hub` downloader and batching `Server`; adds named load/unload, capability-based routing, and an advisory memory budget. Opt-in and additive: no existing API changes, no new dependencies, and no auto-started application.
-  - **Routing** — a singleton GenServer owns an ETS table. Load/unload writes serialize through the GenServer; `generate`/`stream`/`chat`/`embed` read the ETS table directly from the caller, keeping the manager off the inference hot path. Route by explicit id or `:default`.
+  - **Routing** — a node-wide singleton GenServer owns an ETS table. State changes (load/unload/set_default) serialize through it; `generate`/`stream`/`chat`/`embed` read the ETS table directly from the caller, keeping the manager off the inference hot path. Route by explicit id or `:default`.
+  - **Non-blocking loads** — `load/3` runs the Hub download and native model load in a supervised `Task`, so a slow load never blocks other lifecycle calls (concurrent `load`/`unload`/`set_default`) or ETS reads. The caller still blocks until the model is ready; a model in flight reports `status: :loading` and re-loading the same id is refused. The budget reservation and ETS commit stay serialized on the manager.
   - **Backing modes** — `:server` (default for generation/chat) backs the model with a supervised `LlamaCppEx.Server` for batching, streaming, prefix caching, and telemetry; `:direct` (auto-selected when `:embed` is in `:capabilities`) holds the model for stateless calls and is required for embeddings.
   - **Placement-aware memory budget** — knows whether a model lands in RAM or on specific GPUs (from `:n_gpu_layers`/`:split_mode`/`:tensor_split`/`:main_gpu`) and checks each pool independently. `:infinity` (default), an integer (combined RAM+VRAM pool), `:auto` (~80% system RAM + per-GPU free VRAM), or `%{ram: …, vram: [..]|%{i => ..}}`. Refuses over-budget loads naming the device: `{:error, {:insufficient_memory, device: :total | :ram | {:gpu, i}, required:, available:}}`. No automatic eviction.
   - **`LlamaCppEx.devices/0`** — lists ggml backend devices (GPUs, integrated GPUs, accelerators, CPU) with `:gpu_index`, `:memory_total`, and `:memory_free`, via a new backend-agnostic `device_list` NIF (CUDA/Metal/Vulkan). Powers the per-GPU `:auto` budget.
   - **Unload** — stops the backing server (dropping context + model refs) and forces a GC. Reclamation is by GC, so a caller still holding a `%Model{}` from `fetch_model/1` keeps it alive; this is documented.
-  - See ADR 009 and the "Multiple Models (ModelManager)" section of the README. Example: `examples/model_manager.exs`. 38 new tests.
+  - See ADR 009 and the "Multiple Models (ModelManager)" section of the README. Runnable example: `examples/model_manager.exs`. Covered by tests for routing, capability-based dispatch, the memory budget, lifecycle, and async-load concurrency.
 
 ## v0.8.22
 

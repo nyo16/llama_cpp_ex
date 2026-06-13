@@ -380,6 +380,12 @@ LlamaCppEx.ModelManager.loaded?("chat")
 LlamaCppEx.ModelManager.unload("chat")  # stops the backing server, frees memory
 ```
 
+### Loading and concurrency
+
+`ModelManager` is a **node-wide singleton** — run one `ModelSupervisor` per node. The client API targets the manager by module name, and the backing `Registry`/`DynamicSupervisor` use fixed names, so a second instance is refused at startup.
+
+`load/3` blocks the *calling* process until the model is ready (returning `{:ok, id}` or `{:error, reason}`), but the slow work — the Hub download and the native model load — runs in a supervised `Task`, **not** on the manager process. So a long load never blocks other lifecycle calls: a concurrent `load/3`, an `unload/1`, a `set_default/1`, or reads like `list/0`/`info/1` all proceed while it runs. A model in flight shows `status: :loading`, and re-loading the same id returns `{:error, :already_loaded}`. The memory-budget check and the ETS commit are serialized on the manager, so resident models are always accounted for.
+
 ### Backing modes
 
 - **`:server`** (default for generation/chat) — backs the model with a supervised `LlamaCppEx.Server`, so you get continuous batching, streaming, prefix caching, and telemetry.
