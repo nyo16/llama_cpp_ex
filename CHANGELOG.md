@@ -304,7 +304,7 @@
 
 ### Added
 
-- **`LlamaCppEx.NIF.context_can_seq_rm/1`** — exposes `common_context_can_seq_rm`, returning `:no | :part | :full | :rs`. Clears KV memory as a side effect, so call once before any decode.
+- **`LlamaCppEx.NIF.context_can_seq_rm`/1** — exposes `common_context_can_seq_rm`, returning `:no | :part | :full | :rs`. Clears KV memory as a side effect, so call once before any decode.
 
 ## v0.8.7
 

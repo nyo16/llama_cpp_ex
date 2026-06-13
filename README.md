@@ -120,6 +120,13 @@ Download GGUF models directly from HuggingFace Hub. Requires the optional `:req`
   "Qwen/Qwen3-0.6B-GGUF", "Qwen3-0.6B-Q8_0.gguf",
   n_gpu_layers: -1
 )
+
+# Private or gated repo — pass a HuggingFace token explicitly
+{:ok, model} = LlamaCppEx.load_model_from_hub(
+  "Qwen/Qwen3-0.6B-GGUF", "Qwen3-0.6B-Q8_0.gguf",
+  token: "hf_xxx",
+  n_gpu_layers: -1
+)
 ```
 
 For private/gated models, set `HF_TOKEN` or pass `token: "hf_..."`. Set `LLAMA_OFFLINE=1` for offline-only cached access.
