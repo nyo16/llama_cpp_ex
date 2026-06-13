@@ -72,6 +72,34 @@ defmodule LlamaCppEx do
   end
 
   @doc """
+  Lists the available ggml backend devices (GPUs, integrated GPUs, accelerators,
+  and the CPU).
+
+  Each entry is a map with `:index` (ggml device order), `:gpu_index` (0-based
+  among GPU/IGPU devices, matching `:tensor_split`'s index space, or `nil` for
+  non-GPU devices), `:name`, `:description`, `:type` (`:gpu`, `:igpu`, `:cpu`,
+  `:accel`, or `:other`), `:backend` (e.g. `"CUDA"`, `"Metal"`), `:memory_total`,
+  and `:memory_free` (bytes). On Metal, unified memory means a single device.
+
+  ## Examples
+
+      :ok = LlamaCppEx.init()
+      LlamaCppEx.devices()
+      #=> [%{gpu_index: 0, type: :gpu, name: "NVIDIA RTX 4090",
+      #      memory_total: 24_000_000_000, memory_free: 23_500_000_000, ...}, ...]
+
+  """
+  @spec devices() :: [map()]
+  def devices do
+    LlamaCppEx.NIF.backend_init()
+
+    LlamaCppEx.NIF.device_list()
+    |> Enum.map(fn %{gpu_index: gi} = dev ->
+      %{dev | gpu_index: if(gi < 0, do: nil, else: gi)}
+    end)
+  end
+
+  @doc """
   Loads a GGUF model from the given file path.
 
   See `LlamaCppEx.Model.load/2` for options.

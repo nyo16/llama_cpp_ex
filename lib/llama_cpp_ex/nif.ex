@@ -11,6 +11,9 @@ defmodule LlamaCppEx.NIF do
   def backend_init, do: :erlang.nif_error(:not_loaded)
   def backend_free, do: :erlang.nif_error(:not_loaded)
 
+  # Devices
+  def device_list, do: :erlang.nif_error(:not_loaded)
+
   # Model
   def model_load(
         _path,

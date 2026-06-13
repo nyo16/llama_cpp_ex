@@ -21,6 +21,8 @@ Built with C++ NIFs using [fine](https://github.com/elixir-nx/fine) for ergonomi
 - Structured output via JSON Schema (auto-converted to GBNF grammar)
 - Optional Ecto schema to JSON Schema conversion
 - Continuous batching server for concurrent inference
+- **Multi-model manager** — keep several models resident, route requests by id, with a placement-aware (per-GPU VRAM) memory budget
+- **Device introspection** — `LlamaCppEx.devices/0` lists GPUs/accelerators with per-device VRAM
 - **Multi-Token Prediction (MTP) speculative decoding** — ~2x token-generation speedup on Qwen 3.6 with live acceptance-rate stats
 - **Prefix caching** — same-slot KV cache reuse for multi-turn chat (1.23x faster)
 - **Pluggable batching strategies** — DecodeMaximal, PrefillPriority, Balanced
@@ -328,6 +330,133 @@ These also work with the high-level API:
 ```
 
 See [Performance Guide](docs/performance.md) for all available parameters including RoPE context extension, GPU offload control, attention type, and more.
+
+## Multiple Models (ModelManager)
+
+`LlamaCppEx.ModelManager` keeps several models resident at once and routes requests to them by id. It reuses the HuggingFace Hub downloader and the batching `Server`, and adds named load/unload, capability-based routing, and an advisory memory budget.
+
+Add `LlamaCppEx.ModelSupervisor` to your application's supervision tree (it starts a `Registry`, a `DynamicSupervisor`, and the manager):
+
+```elixir
+children = [
+  {LlamaCppEx.ModelSupervisor,
+   memory_budget: :auto,
+   models: [
+     # Server-backed (batching + streaming), marked as the default route
+     {"chat", {:hub, "Qwen/Qwen3-0.6B-GGUF", "Qwen3-0.6B-Q8_0.gguf"},
+      n_gpu_layers: -1, default: true},
+     # Embedding model — :embed capability auto-selects :direct mode
+     {"embed", {:path, "/models/nomic-embed.gguf"}, capabilities: [:embed]}
+   ]}
+]
+```
+
+For scripts or IEx, start it directly and load at runtime:
+
+```elixir
+{:ok, _sup} = LlamaCppEx.ModelSupervisor.start_link([])
+
+# Download from the Hub (cached in ~/.cache/llama_cpp_ex/models/) and keep resident
+{:ok, "chat"} = LlamaCppEx.ModelManager.load(
+  "chat", {:hub, "Qwen/Qwen3-0.6B-GGUF", "Qwen3-0.6B-Q8_0.gguf"}, n_gpu_layers: -1
+)
+# Or from a local path
+{:ok, "embed"} = LlamaCppEx.ModelManager.load(
+  "embed", {:path, "/models/nomic-embed.gguf"}, capabilities: [:embed]
+)
+
+# Route by id
+{:ok, text} = LlamaCppEx.ModelManager.generate("chat", "Once upon a time", max_tokens: 100)
+LlamaCppEx.ModelManager.stream("chat", "Tell me a story") |> Enum.each(&IO.write/1)
+{:ok, reply} = LlamaCppEx.ModelManager.chat("chat", [%{role: "user", content: "Hi!"}])
+{:ok, vector} = LlamaCppEx.ModelManager.embed("embed", "text to embed")
+
+# Route to the default model
+{:ok, text} = LlamaCppEx.ModelManager.generate(:default, "Hello")
+
+# Inspect and manage
+LlamaCppEx.ModelManager.list()        # sanitized views, no raw refs
+LlamaCppEx.ModelManager.loaded?("chat")
+LlamaCppEx.ModelManager.unload("chat")  # stops the backing server, frees memory
+```
+
+### Loading and concurrency
+
+`ModelManager` is a **node-wide singleton** — run one `ModelSupervisor` per node. The client API targets the manager by module name, and the backing `Registry`/`DynamicSupervisor` use fixed names, so a second instance is refused at startup.
+
+`load/3` blocks the *calling* process until the model is ready (returning `{:ok, id}` or `{:error, reason}`), but the slow work — the Hub download and the native model load — runs in a supervised `Task`, **not** on the manager process. So a long load never blocks other lifecycle calls: a concurrent `load/3`, an `unload/1`, a `set_default/1`, or reads like `list/0`/`info/1` all proceed while it runs. A model in flight shows `status: :loading`, and re-loading the same id returns `{:error, :already_loaded}`. The memory-budget check and the ETS commit are serialized on the manager, so resident models are always accounted for.
+
+### Backing modes
+
+- **`:server`** (default for generation/chat) — backs the model with a supervised `LlamaCppEx.Server`, so you get continuous batching, streaming, prefix caching, and telemetry.
+- **`:direct`** (auto-selected when `:embed` is in `:capabilities`) — holds the model and runs stateless calls. Required for embeddings, since the server has no embedding path.
+
+Override with `mode: :server | :direct`.
+
+### GPU placement
+
+All of llama.cpp's placement options pass straight through `load/3` (per model) to `Model.load/2`/`Server.start_link/1`:
+
+| Option | Meaning |
+|---|---|
+| `:n_gpu_layers` | Layers to offload (`-1` = all, `0` = CPU only) |
+| `:split_mode` | `:none` (single GPU), `:layer` (split layers across GPUs), `:row` (split tensor rows) |
+| `:tensor_split` | A **list of per-device proportions** — one float per GPU, indexed by device order. Zeros exclude a device. |
+| `:main_gpu` | Primary device: the single GPU under `:none`, or the device holding non-split tensors under `:layer` |
+
+`:tensor_split` is the "array of GPUs": it's a weight per device (llama.cpp normalizes the values), **not** a list of indices. Device order follows `CUDA_VISIBLE_DEVICES`. See [docs/multi-gpu.md](docs/multi-gpu.md) for a full multi-GPU guide and verification steps.
+
+```elixir
+# Pin a model to one specific GPU
+LlamaCppEx.ModelManager.load("a", {:path, m}, n_gpu_layers: -1, split_mode: :none, main_gpu: 5)
+
+# Spread one big model across all 8 GPUs equally
+LlamaCppEx.ModelManager.load("big", {:path, m},
+  n_gpu_layers: -1, split_mode: :layer,
+  tensor_split: [1, 1, 1, 1, 1, 1, 1, 1]
+)
+
+# Use only a subset — e.g. "big" on GPUs 0–3, "embed" on GPUs 4–7
+LlamaCppEx.ModelManager.load("big", {:path, m1},
+  n_gpu_layers: -1, split_mode: :layer,
+  tensor_split: [1, 1, 1, 1, 0, 0, 0, 0]
+)
+
+LlamaCppEx.ModelManager.load("embed", {:path, m2},
+  capabilities: [:embed], n_gpu_layers: -1, split_mode: :layer,
+  tensor_split: [0, 0, 0, 0, 1, 1, 1, 1]
+)
+```
+
+> On a multi-GPU box, `memory_budget: :auto` reads each card's free VRAM and tracks placement per device — `:tensor_split` and `:main_gpu` are accounted for (see Memory budget below).
+
+### Memory budget
+
+`:memory_budget` is **placement-aware** — it knows whether a model lands in RAM or on specific GPUs (from `:n_gpu_layers`/`:split_mode`/`:tensor_split`/`:main_gpu`) and checks each pool independently. It accepts:
+
+- `:infinity` (default) — no limit.
+- an **integer** — a single combined pool (RAM + all VRAM count against one number).
+- `:auto` — RAM ≈ 80% of system memory, and **per-GPU VRAM from each card's free memory** (via `LlamaCppEx.devices/0`).
+- a map `%{ram: …, vram: …}` — explicit per-device limits. `vram` is a list `[b0, b1, …]` indexed by GPU, or a map `%{gpu_index => bytes}`; `ram`/`vram` may be `:auto` or `:infinity`.
+
+The manager estimates footprint from GGUF size (plus a coarse KV-cache estimate for `:server` mode) and **refuses** over-budget loads, naming the device that didn't fit:
+
+```elixir
+# combined (integer) budget
+{:error, {:insufficient_memory, device: :total, required: r, available: a}} = ...
+
+# per-device (:auto / map) budget — e.g. GPU 3 is full
+{:error, {:insufficient_memory, device: {:gpu, 3}, required: r, available: a}} =
+  LlamaCppEx.ModelManager.load("too-big", {:path, "70b.gguf"}, n_gpu_layers: -1, main_gpu: 3)
+```
+
+`device` is `:total` (combined), `:ram`, or `{:gpu, index}`. There is no automatic eviction — unload a model yourself to make room. `LlamaCppEx.devices/0` lists each GPU's `:memory_total`/`:memory_free` and its `:gpu_index` (the same index space as `:tensor_split`).
+
+> **Coarse estimation:** footprint is advisory. Partial offload (`0 < n_gpu_layers < n_layers`) is treated as fully on GPU; compute buffers and fragmentation aren't modeled.
+
+### Unloading and memory reclamation
+
+Model cleanup is garbage-collection based. `unload/1` stops the backing server (dropping its context and model references) and forces a GC. Because reclamation is by GC, **any caller still holding a `%LlamaCppEx.Model{}` obtained via `fetch_model/1` keeps the model alive** past `unload/1` — prefer id-based routing and avoid holding raw refs.
 
 ## Speculative decoding (MTP)
 
