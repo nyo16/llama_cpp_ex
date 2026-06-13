@@ -96,7 +96,7 @@ git push origin vX.Y.Z
 ```
 
 The tag push triggers the **precompile workflow** (`.github/workflows/precompile.yml`) which:
-1. Builds precompiled NIFs for macOS (Metal) and Linux (CPU) across OTP 27 and 28
+1. Builds precompiled NIFs for macOS (Metal) and Linux (CPU) across OTP 27 (NIF 2.17) and OTP 29 (NIF 2.18)
 2. Uploads `.tar.gz` artifacts to the GitHub release
 3. Runs `mix elixir_make.checksum --all --ignore-unavailable` and auto-commits `checksum.exs` to master
 

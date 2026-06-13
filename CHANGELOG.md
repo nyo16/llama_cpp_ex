@@ -12,6 +12,43 @@
   - **Unload** — stops the backing server (dropping context + model refs) and forces a GC. Reclamation is by GC, so a caller still holding a `%Model{}` from `fetch_model/1` keeps it alive; this is documented.
   - See ADR 009 and the "Multiple Models (ModelManager)" section of the README. Example: `examples/model_manager.exs`. 38 new tests.
 
+## v0.8.22
+
+### Fixed
+
+- **Precompiled NIF 2.18 artifacts** — `mix.exs` advertises precompiled NIFs for NIF versions 2.17 and 2.18, but the precompile workflow built each target on OTP 27 *and* OTP 28, and both of those report NIF 2.17 (2.18 only arrived with OTP 29). The two jobs therefore produced identically named `nif-2.17` tarballs that overwrote each other on upload, and no 2.18 artifact was ever published — so installing on OTP 29 (NIF 2.18) failed with a 404 when fetching the precompiled binary. The precompile matrix now builds on OTP 27 (NIF 2.17) and OTP 29 (NIF 2.18), publishing both NIF versions for each target. The llama.cpp submodule is unchanged (4c6595503, tag b9601).
+
+## v0.8.21
+
+### Changed
+
+- **llama.cpp submodule** — Updated from 04eb4c446 to 4c6595503 (52 commits, tag b9601). No NIF changes were required. `include/llama.h`, `common/chat.h`, `common/json-schema-to-grammar.h`, and `common/speculative.h` are all unchanged. `common/common.h` adds a `path_prompts_log_dir` field to `common_params` (server prompt logging — not used by the binding), and `common/sampling.h` drops the `allow_alt_names` parameter from `common_sampler_types_from_names` (the NIF does not call any `common_sampler_*` functions). The full test suite passes, formatting is clean, and Dialyzer reports 0 errors.
+  - **vocab**: adopt leading TemplateProcessing special token as BOS (#24428); refactor normalizer flags into an options struct and add `strip_accents` (#24371).
+  - **model/graph/convert**: fix plamo2 `attention_key/value_length` regression (#24317); fix Granite Speech inference by applying embedding scale when deepstack is not used (#24357); guard iswa `kq_mask` on its own buffer (#24294); fix conversion for Mistral-Medium-3.5-128B (#24268).
+  - **mtmd**: add video input support (#24269); refactor video subproc handling (#24316); `build_vit` batching (#24352).
+  - **MTP/speculative**: Gemma-4 E2B and E4B assistants (#24282); remove padding and multiple D2D copies (#24086); fix "ngram-map-k4v" name in logging (#24253).
+  - **common/chat**: fix LFM2/LFM2.5 ignoring `json_schema` (#24377); relax sampler name matching (#23744).
+  - **kv-cache**: avoid kv cells copies (#24277); follow the source cache size when sharing cells (#24267); skip checkpoints beyond `pos_next` (#24411); do not clear slots without unified KV cache (#24190).
+  - **server**: log prompts to a directory (#22031); skip unused log lines in router mode (#24463); do not parse when flushing http headers (#24281).
+  - **CUDA/HIP**: fix `ssm_scan_f32` data races (#24360); reset CUDA context after reading memory size (#23935); remove the GGML_TYPE_Q4_K case in mmvq.cu (#23528); add gfx1152/gfx1153 to RDNA3.5 (#24129).
+  - **vulkan**: fast path for contiguous buffer transfers (#23973); medium matmul tile on Asahi Linux (#24306); reduce iq1 shared memory usage for mul_mm (#24287); `v_dot2_f32_f16` support in matmul and Flash Attention (#24123); cm2 `decode_vector` for `mul_mat_id` B-matrix loads (#23991); eMesaHoneykrisp ifdef build fix (#24479).
+  - **metal**: fix im2col 1D case for audio models (#24220).
+  - **webgpu**: improve prefill speeds for k-quants and refactor matmul for Q4/Q5/Q8 (#24225); handle buffer aliasing for concat (#24000); 2D workgroups for scale/binary/unary ops (#24044).
+  - **ggml**: add `GGML_OP_COL2IM_1D` (#24206); fix `rms_norm_back` wrong output under in-place aliasing (#24305); version bumps to 0.14.0/0.15.0.
+  - **webui/cli**: pinned conversations (#21387); opt-in `run_javascript` frontend tool (#24244); fix excessive style recalculation on hover (#24243); fix mobile chat form overflow and stale bundle cache (#24158); fix spinner during prompt processing (#24283).
+  - **vendor/ci/docker**: update LibreSSL to 4.3.2 (#24397); install ffmpeg in released Docker images (#24302); SYCL compute runtime 26.x in Docker (#24070); fix Windows release CI (#24369); bump komac (#24396).
+
+## v0.8.20
+
+### Changed
+
+- **llama.cpp submodule** — Updated from 6b80c74f2 to 04eb4c446 (7 commits, tag b9549). No NIF changes were required. `common/chat.h`, `common/json-schema-to-grammar.h`, `common/speculative.h`, `common/sampling.h`, and `common/common.h` are all unchanged. The only changed header the binding compiles against is `include/llama.h`, which appends a `ctx_other` field to `llama_context_params` (used by the new Gemma4 MTP path to share `llama_memory`/results between two contexts); the NIF initializes via `llama_context_default_params()` and sets fields by name, so the new field simply defaults to `nullptr` and the binding is unaffected. The full test suite passes, formatting is clean, and Dialyzer reports 0 errors.
+  - **model/mtmd**: add Gemma4 MTP — multi-token prediction / speculative decoding for dense Gemma4, adding the `ctx_other` context-sharing mechanism (#23398); fix Gemma4 conversion when there is no audio encoder (#24242); support "frame merge" for qwen-vl-based models (#21858).
+  - **common/chat**: fix LFM2/LFM2.5 reasoning round-trip and `<think>` leak (#24234).
+  - **spec**: fix the vocab compatibility check (#24256).
+  - **common/arg**: skip the mmproj download when the user supplied an mmproj (#24239).
+  - **docker/ci**: bump cuda13 to 13.3.0 (#24228).
+
 ## v0.8.19
 
 ### Changed
@@ -279,7 +316,7 @@
 
 ### Added
 
-- **`LlamaCppEx.NIF.context_can_seq_rm/1`** — exposes `common_context_can_seq_rm`, returning `:no | :part | :full | :rs`. Clears KV memory as a side effect, so call once before any decode.
+- **`LlamaCppEx.NIF.context_can_seq_rm`/1** — exposes `common_context_can_seq_rm`, returning `:no | :part | :full | :rs`. Clears KV memory as a side effect, so call once before any decode.
 
 ## v0.8.7
 
