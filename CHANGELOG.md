@@ -1,6 +1,21 @@
 # Changelog
 
-## Unreleased
+## v0.8.24
+
+### Changed
+
+- **llama.cpp submodule** — Updated from 4c6595503 to 597b6672e (20 commits, tag b9621). No NIF changes were required. `include/llama.h`, `common/chat.h`, `common/json-schema-to-grammar.h`, `common/speculative.h`, and `common/sampling.h` are all unchanged. `common/common.h` adds an `mtmd_batch_max_tokens` field to `common_params` (a multimodal batching cap — not used by the binding, which constructs `common_params_speculative`, not `common_params`). The full test suite passes (196 tests), formatting is clean, and Dialyzer reports 0 errors.
+  - **mtmd**: add a batching API (#24384).
+  - **MTP/speculative**: add EAGLE3 speculative decoding support (#18039).
+  - **ggml**: sync ggml and bump to 0.15.1 (ggml/1541); support `concat` for scalar types on the CUDA backend (#24011).
+  - **vulkan**: add pipeline barriers for memcpy read operations (#23770).
+  - **opencl**: add q5_0/q5_1 GEMM and GEMV kernels for Adreno (#24319).
+  - **server**: clean up static asset handling (#24550); fix reasoning-budget WebUI precedence over `model.ini` (#24517).
+  - **webui**: keep the original file name and path (#24568); add PWA support (#23871); honor JPEG EXIF orientation (#24196).
+  - **fit** (finetuning): wrap `llama_device_memory_data` (#24522); avoid including `llama-ext.h` in `fit.h` (#24506).
+  - **vendor/ci/docker**: update cpp-httplib to 0.47.0 (#24395); fix the SYCL CI build & release (#24387) and release-note links (#24527); unbreak the release workflow (#24544, #24545); allow specifying the CUDA GCC version in Docker (#24447).
+
+## v0.8.23
 
 ### Added
 
