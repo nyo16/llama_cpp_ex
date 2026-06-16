@@ -1,5 +1,31 @@
 # Changelog
 
+## v0.8.26
+
+### Changed
+
+- **llama.cpp submodule** — Updated from 597b6672e to 74ade5274 (51 commits, tag b9672). No NIF changes were required. Every header the binding compiles against is unchanged: `include/llama.h`, `ggml/include/ggml.h`, `ggml/include/ggml-backend.h`, `common/chat.h`, `common/speculative.h`, `common/json-schema-to-grammar.h`, `common/sampling.h`, and `common/common.h` all have zero diff in this range — the cleanest bump in a while (even `common_params`, which gained a field in v0.8.24, is untouched). The full test suite passes (158 tests + 4 skipped), all 7 end-to-end smoke tests pass against the freshly built NIF (generation, streaming, chat templates, JSON-schema grammar, raw GBNF, and embeddings), formatting is clean, and Dialyzer reports 0 errors.
+  - **model/vocab**: add arch support for Cohere2-MoE (#24260); register `cohere2moe` in llama-vocab for TINY_AYA (#24601); add a dedicated Cohere2MoE (North Code) chat parser (#24615).
+  - **MTP/speculative**: add backend sampling support for EAGLE3 (#24655); add spec metrics — mean acceptance length and acceptance rate per position (#24536).
+  - **common/chat**: fix LFM2 tool-call parsing double-escaping (#24667); harden peg-native tool-call parsing (#24329); fix an "oldie but goodie" grammar-generator bug (#24653); fix whitespace handling "once and for all" (#24624); include the full unparsed prompt in debug output (#24650).
+  - **jinja** (template engine used by chat templates): add `count`/`d`/`e` filter aliases (#24606); fix negative-step slice with start/stop values (#24580); fix `split`/`replace` with an empty first arg (#24574).
+  - **mtmd**: fix `n_tokens` miscount (#24656); add a post-decode callback (#24645).
+  - **ggml/graph**: fix and restrict NVFP4 edge-cases in llama-graph (#24331).
+  - **CUDA**: only support F32/F16 for `GGML_OP_REPEAT` (#24533).
+  - **metal**: add `repeat` for bf16 (#24638).
+  - **vulkan**: prefer host-visible memory buffers on UMA devices (#22930); support `gated_delta_net` with S_v=16 (#24581); add `col2im_1d` op (#24425); support more `CONCAT` types (#24579); support non-contig unary/glu ops (#24215).
+  - **SYCL**: reordered Q4_K/Q5_K/Q6_K MoE `MUL_MAT_ID` (#24452); support `EXPM1` + all `FLOOR`/`TRUNC`/`ROUND` cases (#24363); make `GGML_SYCL_F16=ON` the default (#23996); native subgroup size for K-quant DMMV (#21700); fix `soft_max_f32` max reduction (#24451); fix reorder + add fp32/fp16 to build script (#24578); `set_rows` for q1_0/mxfp4/nvfp4 (#24564); add `pool_1d` (#24584); remove per-allocation Level Zero runtime checks (#23399).
+  - **webgpu**: improve i-quant `mul_mat` performance and speed up prefill (#24530).
+  - **wasm/convert/cli/bench**: fix wasm fallback symbol collision (#24639); fix lora base-model arch retrieval in convert (#24621); fix CLI not copying preserved tokens (#24258); add `--offline` to bench (#24511).
+  - **webui**: mermaid/svg source toggle (#24652); svg block rendering (#24080); render thinking/reasoning blocks as markdown (#24611); HEIC/HEIF image support (#24137); mobile keyboard + PWA popup fixes (#24610); fix mobile UI clipping (#24605); fix `llama-ui-embed` crash with no asset dir (#24597); build-time gzip compression (#24571).
+  - **vendor/ci/docker/docs**: update BoringSSL to 0.20260616.0 (#24693); specify registry for Podman builds (#24607); use the CUDA label for the cuda backend in CI (#24594); add SYCL to check-release (#24583); add conda-forge install docs (#22219); fix typos in CUDA-FEDORA.md and grammars/README.md (#24459).
+
+## v0.8.25
+
+### Fixed
+
+- **`LlamaCppEx.Hub` honors HTTP/HTTPS proxy env vars** (#57) — `Hub` uses Req → Finch → Mint, which (unlike curl/wget) does not read proxy environment variables, so on proxy-only networks every HuggingFace request went direct and timed out. Added `proxy_request_options/2`, resolving a proxy from the `:proxy` option (URL string, Mint `{scheme, host, port, opts}` tuple, or `false`) or the standard env vars: `HTTPS_PROXY`/`HTTP_PROXY` (and lowercase) take precedence over `ALL_PROXY`, with `NO_PROXY`/`:no_proxy` host bypass and basic-auth userinfo support (redacted in logs). Wired into `search`, `list_gguf_files`, `get_model_info`, and the streaming download. SOCKS proxies are detected and skipped with an actionable warning (Mint supports HTTP/1 CONNECT proxies only), documented in a new Proxies moduledoc section with a Privoxy/gost bridge workaround. The llama.cpp submodule is unchanged (597b6672e, tag b9621).
+
 ## v0.8.24
 
 ### Changed
