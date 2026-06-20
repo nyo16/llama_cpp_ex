@@ -1,5 +1,27 @@
 # Changelog
 
+## v0.8.27
+
+### Changed
+
+- **llama.cpp submodule** — Updated from 74ade5274 to 845282461 (67 commits, tag b9739). No NIF changes were required. `include/llama.h`, `ggml/include/ggml.h`, `ggml/include/ggml-backend.h`, `common/chat.h`, `common/json-schema-to-grammar.h`, and `common/sampling.h` are all unchanged. `common/speculative.h` only gains two optional declarations — `common_speculative_get_state` / `common_speculative_set_state` (for stashing and restoring internal speculative state) — which the binding does not call. `common/common.h` changes do not touch the binding either: `common_params_model` swaps its `name` field for a `get_name()` method, the deprecated `webui` / `webui_mcp_proxy` / `webui_config_json` fields are dropped from `common_params`, a `models_preset_hf` field and an `fs_open_ifstream` helper are added, and `common_prompt_checkpoint` gains a `data_spec` blob — but the NIF constructs only `common_params_speculative` (setting `types` and `draft.*`), never `common_params` or `common_params_model`, and the sole `common_params_speculative` change is internal `need_n_rs_seq()` logic that now also reserves a recurrent-state seq for EAGLE3 drafts. The full test suite passes (158 tests + 4 skipped), all 7 end-to-end smoke tests pass against the freshly built NIF (generation, streaming, chat templates, JSON-schema grammar, raw GBNF, and embeddings — the embedding paths fully exercised with a Qwen3-Embedding model), formatting is clean, and Dialyzer reports 0 errors.
+  - **model/convert**: load GLM-DSA indexer tensors as optional (#24770); more consistent `rope_parameters` handling in convert (#24833); skip `main_gpu` validation when no devices are available (#23405).
+  - **MTP/speculative**: support EAGLE3 for Qwen3.5 & 3.6 (#24593); fix a segfault on long prompts for EAGLE3 (#24707).
+  - **mtmd**: fix UTF-8 handling on Windows (#24779); several bug fixes (#24784); add batching support for InternVL (#24775) and for `mtmd-cli` plus video tests (#24778); refactor the preprocessor and add `mtmd_image_preproc_out` (#24736); refactor llava-uhd overview image handling to always use `ov_img_first` (#24769); stop using the batch dim in llava_uhd (#24732).
+  - **server**: avoid forwarding auth headers in the CORS proxy (#24373); refactor child→router communication (#24821); optimize `get_token_probabilities` (#24796); fix an unbounded `n_discard` during context shifting (#24786); consolidate slot selection into `get_available_slot` (#24755); add an `X-Accel-Buffering: no` header to streaming endpoints (#24774); add request `schema` validation (#24150); return HTTP 400 on invalid grammar (#24154); add a last-5-seconds generation-speed display (#24291); router fixes — stopping-thread hang (#24728), forward args to child instances (#24760), rework `-hf` preset repos (#24739), add a model-management API (#23976); drop internal "webui" naming and add an `--agent` arg (#24817, #24801).
+  - **ggml/ggml-cpu**: optimize AMX (#24806); sync ggml and bump to 0.15.2 (ggml/1548); power10 Q8/Q4 MMA matmul K-tail support (#24753); conditionally enable the power11 backend based on compiler support (#24687).
+  - **CUDA**: add `col2im` 1D (#24417); revert "reset CUDA context after reading memory size" (#24715).
+  - **metal**: check for BF16 support in the concat kernel (#24747); add f16/bf16 support to the concat operator (#24724); implement the `rope_back` operator (#24725).
+  - **vulkan**: record actual memory properties during buffer creation (#24326).
+  - **SYCL**: support `MUL_MAT`/`OUT_PROD` with Q1_0 (#24721); add `conv_2d`/`conv_2d_dw`/`conv2d_transpose` (#24600) and `conv_3d` (#24691); enable fp16 for SQR/SQRT/LOG/SIN/COS/CLAMP (#24692); add dev-to-dev memcpy via the SYCL API (#24476); fix a use-after-free with async memcpy in MoE prefill (#24676); optional USM system allocations (#22526); rename `GGML_SYCL_SUPPORT_LEVEL_ZERO` (#24719).
+  - **webgpu**: add adapter toggles for F16 on Vulkan + NVIDIA (f449e0553).
+  - **opencl**: optimize `mul_mat_f16_f32_l4` for decode (#24504).
+  - **hexagon**: add op-trace — fine-grained HVX/HMX/DMA event tracing (#24592).
+  - **openvino**: OV 2026.2, context-shift, Q5_1 support, Gemma4 dense/embedding, and `-fa off` (#24503).
+  - **common/cli**: enforce `max_capacity` and optimize queue resizing in logging (#24490); support comment lines in `--api-key-file` (#23168); the `pi` interactive tool drops docs from its system prompt (#24791); enable app self-update only when built with `llama-install.sh` (#24754).
+  - **webui**: export conversations as JSONL (#24688); touch-accessible model selection (#24604); fix SSE transport detection and routing through the CORS proxy (#24500).
+  - **vendor/ci/docker/build/docs**: update cpp-httplib to 0.48.0 (#24787); build/prebuild the web UI in Docker (#24794, #24829) and fix the cmake UI build against a read-only source tree (#24752); CI fixes — check-release message parsing (#24751), Windows x64 OpenVINO release link (#24731), Vulkan docker images (#24595), Adreno arm64 OpenCL release link (#24809); fix the export-lora `--lora-scaled` docs (#24703).
+
 ## v0.8.26
 
 ### Changed
