@@ -1,5 +1,22 @@
 # Changelog
 
+## v0.8.28
+
+### Changed
+
+- **llama.cpp submodule** — Updated from 845282461 to dec5ca557 (24 commits, tag b9763). No NIF changes were required. `ggml/include/ggml.h`, `ggml/include/ggml-backend.h`, `common/chat.h`, `common/json-schema-to-grammar.h`, `common/sampling.h`, `common/speculative.h`, and `common/common.h` are all unchanged. The only touched header the binding compiles against is `include/llama.h`, and the sole functional change there is one new accessor — `llama_model_n_layer_nextn` (the number of next-token / MTP prediction layers) — added alongside the existing `llama_model_n_layer`; the rest of the diff is whitespace realignment. The binding does not call the new function. Notably, this range refactors the grammar generators that the binding's `json_schema_to_grammar_nif` links against (the `common/peg` AC parser and the JSON-schema-to-GBNF spacing rules below) even though `common/json-schema-to-grammar.h` itself is unchanged, so both the JSON-schema and raw-GBNF smoke paths were exercised against the freshly built NIF. The full test suite passes (158 tests + 4 skipped), all 7 end-to-end smoke tests pass (generation, streaming, chat templates, JSON-schema grammar, raw GBNF, and embeddings — the embedding paths exercised with a Qwen3-Embedding model), formatting is clean, and Dialyzer reports 0 errors.
+  - **model/quantization**: use `LLM_KV` for `quantization_version` & `file_type` (#24802).
+  - **common/grammar**: implement an AC parser for stricter grammar generation (#24869); refactor the until→GBNF grammar generation (#24839); align `json-schema-to-grammar` spacing rules with the parsers (#24835) — these underlie the binding's structured-output / GBNF path.
+  - **sampling**: remove the unconditional softmax+sort in the top-n-sigma sampler (#22645).
+  - **jinja** (template engine used by chat templates): implement the `call` statement (#24847).
+  - **MTP/speculative**: support Step3.5/3.7 flash mtp3 (#24340).
+  - **mtmd**: fix `mtmd_get_memory_usage` (#24867); add a load-progress callback (#24865).
+  - **server**: add an `id` to tool-call responses API (#24882); move model downloading to a dedicated process in the router (#24834); refactor/generalize the input-file schema (#24299); fix an `edit_file` crash on append at end of file (`line_start` -1) (#24893); report progress for loading spec models and add a "stages" list (#24870); refactor batch construction (#24843); add a "verbose" field to the schema (#24864); real-time model load-progress tracking via `/models/sse` (#24828).
+  - **SYCL**: support bf16 on the `bin_bcast` op and unary ops (#24838).
+  - **hexagon**: use a padded stride for ssm-conv weights (#24470).
+  - **webui**: prioritize favorite models in model selection (#24766); show model status and load progress via the `/models/sse` feed (#24878).
+  - **common/cli/build/docs**: stabilize the randomly-failing `test-args-parser` (#24826); add the `libandroid-spawn` dependency for Termux builds (#21812); whitespace clean-up (#24862).
+
 ## v0.8.27
 
 ### Changed
