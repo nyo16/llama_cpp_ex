@@ -1,5 +1,23 @@
 # Changelog
 
+## v0.8.29
+
+### Changed
+
+- **llama.cpp submodule** — Updated from dec5ca557 to b3ce5cedf (26 commits, tag b9789). No NIF changes were required. `include/llama.h`, `ggml/include/ggml.h`, `ggml/include/ggml-backend.h`, `common/json-schema-to-grammar.h`, `common/sampling.h`, and `common/speculative.h` are all unchanged. Two headers the binding compiles against did change, but neither touches the symbols the NIF uses: `common/common.h` only bumps a server-side default (`checkpoint_min_step` 256 → 8192), and `common/chat.h` reworks the chat message-splitting API (the `common_chat_msg_span.role` field becomes a `common_chat_role` enum, new `common_chat_msg_spans` / `common_chat_msg_delimiters` containers replace the free-standing `common_chat_split_by_role`, and `common_chat_params.message_spans` is renamed to `message_delimiters`) — all consumed by the server, not the binding, which only calls `common_chat_templates_inputs`, `common_chat_msg`, and `common_chat_templates_apply`. The implementation behind that last call, `common/chat.cpp`, was refactored as part of the same message-splitting work, so the chat-template smoke path was re-exercised against the freshly built NIF. The full test suite passes (158 tests + 4 skipped), all 7 end-to-end smoke tests pass (generation, streaming, chat templates, JSON-schema grammar, raw GBNF, and embeddings — the embedding paths exercised with a Qwen3-Embedding model), formatting is clean, and Dialyzer reports 0 errors.
+  - **model**: add LFM2.5-ColBERT-350M and LFM2.5-Embedding-350M (#24913); Granite Speech Plus (#24818).
+  - **quant**: fix quantizing MoE with MTP (#24986).
+  - **chat**: harden the capabilities check (#24973).
+  - **server**: check for draft-context creation errors (#24922); fix remote preset handling and add a test (#24938); improve user-message detection and create checkpoints at every user message (#24176).
+  - **mtmd**: unlimited-OCR model converter plus a parity test (#24969).
+  - **vulkan**: apply bias before softmax in flash attention to avoid overflow (#24909); allow reducing graph submission batches to avoid timeouts (#24872); support `GET_ROWS_BACK` (#24883) and `CONV_3D` (#24612); cover more backend tests for SQR/SQRT/SIN/COS/CLAMP/LEAKY_RELU/NORM (#24582); make `mul_mm` ALIGNED a spec constant (#24689); fail the build when a shader fails to compile (#24450); link ggml-cpu when `GGML_VULKAN_CHECK_RESULTS` / `RUN_TESTS` are enabled (#24444).
+  - **SYCL**: support `--split-mode tensor` (#24152); fix the failed `conv_3d` unit-test cases (#24900).
+  - **opencl**: support non-contiguous rows in `norm` (#24965); improve q8_0 gemv precision (#24923).
+  - **hexagon**: MUL_MAT / MUL_MAT_ID rework — 32x32 tiled weight repack, kernel params, and cached graphs (#24954).
+  - **ggml-webgpu**: improve MTP inference by using the mat-vec path for small batches (#24811).
+  - **webui**: new logo plus navigation cleanup and mobile UI/UX improvements (#24897); loading bar below the model picker (#24931).
+  - **common/build/docs**: remove the unused json-partial helper (#24968); add yomaytk to ggml-webgpu CODEOWNERS (#24930).
+
 ## v0.8.28
 
 ### Changed
