@@ -1,5 +1,23 @@
 # Changelog
 
+## v0.8.30
+
+### Changed
+
+- **llama.cpp submodule** — Updated from b3ce5cedf to 9bebfcb4b (37 commits, tag b9826). No NIF changes were required. `include/llama.h`, `ggml/include/ggml.h`, `ggml/include/ggml-backend.h`, `common/chat.h`, `common/json-schema-to-grammar.h`, `common/sampling.h`, and `common/speculative.h` are all unchanged. The only touched header the binding compiles against is `common/common.h`, and its diff is server/CLI-only: a new `LLAMA_EXAMPLE_DOWNLOAD` enum value, `common_params_model::get_name()` gaining a `const` qualifier plus a new `empty()` helper, `common_params_speculative::has_dft()` refactored to call that helper, and the removal of the server-side `skip_download` flag — none of which the binding consumes (it only calls `common_chat_templates_inputs`, `common_chat_msg`, `common_chat_templates_apply`, and `json_schema_to_grammar`). This range also resyncs `ggml` (bumped to 0.15.3) underneath the statically-linked `ggml`/`ggml-backend` libraries the NIF links against, so the binding was rebuilt clean and re-exercised end to end. The full test suite passes (216 tests + 1 skipped, with the generation paths run against a Qwen3.5-0.8B model and the embedding paths against a Qwen3-Embedding model), all 7 end-to-end smoke tests pass (generation, streaming, chat templates, JSON-schema grammar, raw GBNF, and embeddings), formatting is clean, and Dialyzer reports 0 errors.
+  - **ggml**: sync ggml and bump to version 0.15.3 (ggml/1550); address integer overflows in the binary-op CUDA implementation (#24706).
+  - **CUDA**: add a `cublasSgemmBatched` mapping for the HIP/MUSA vendor headers (#25033); batch the `out_prod` broadcast (dps2>1) path with `cublasSgemmBatched` (#24426); various fixes to `cpy.cu` (#25000).
+  - **vulkan**: fix the step operator for 0 input (#25036); optimize `mul_mat_vecq` for mi50 (#22933); add the `INTEL_XE1` arch enum and enable coopmat1 on Intel Xe-LPG Plus (#24404); work around a compiler bug in the conv2d coopmat2 path (#24924).
+  - **SYCL**: fix the failed `norm` unit-test cases (#25044); clamp softmax input to avoid underflow (#24941).
+  - **ggml-cpu**: fix the SVE leftover path in `ggml_vec_dot_f32` (#24699).
+  - **opencl**: flush the profiling batch at shutdown for incomplete batches (#25016).
+  - **model**: add a label for LFM2.5-230M (#25008); mamba2 — remove the hardcoded 2x expansion factor and the invalid `d_inner % d_state` check (#23082).
+  - **sched**: reintroduce fewer synchronizations during split compute (#20793).
+  - **common/server/mtmd**: refactor model handling (#24980); add more `mtmd` validations (#25013); server SSE replay buffer (#23226); return status code 403 for disabled server features (#24970).
+  - **app/cli**: allow `--version`, `--licenses` & `--help` (#25054); add the `llama download` subcommand (#24982); fix handling of `--spec-draft-hf` and `--hf-repo-v` (#25043).
+  - **build/devops**: include `libmtmd` in the Apple XCFramework (#21935); add `llama` to all docker images (#25035); update OpenVINO to OV 2026.2.1 with self-contained release packages (#24974); disable mtmd video on i/tv/visionOS in the xcframework (#25018); improve the `rpc-server` and `export-graph-ops` binary names (#25045).
+  - **ui/ci/docs/tests/misc**: webui accessibility fix for hover-gated interactive elements (#24727) and the always-show-sidebar-on-desktop setting (#24979); CI windows-openvino in check-release (#25022); fix `test-chat-template --no-common` (#25075) and synchronize contexts at the end of `test-thread-safety` (#24935); Eagle3 qwen3 draft-model docs (#24977); labeler fixes (#25012, #24920).
+
 ## v0.8.29
 
 ### Changed
