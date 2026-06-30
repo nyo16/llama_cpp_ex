@@ -1,5 +1,21 @@
 # Changelog
 
+## v0.8.31
+
+### Changed
+
+- **llama.cpp submodule** — Updated from 9bebfcb4b to f708a5b2c (20 commits, tag b9846). No NIF changes were required. `include/llama.h`, `ggml/include/ggml.h`, `ggml/include/ggml-backend.h`, `common/chat.h`, `common/json-schema-to-grammar.h`, `common/sampling.h`, and `common/speculative.h` are all unchanged. The only touched header the binding compiles against is `common/common.h`, and its diff does not reach anything the binding consumes: a block of internal `COM_*` logging macros (`COM_DBG`/`COM_TRC`/`COM_INF`/`COM_WRN`/`COM_ERR`/`COM_CNT`) is added, a new `COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH` value is appended to the `common_speculative_type` enum (the DFlash speculative-decoding work below), and `common_params_speculative::need_n_rs_seq()` is extended to also reserve a recurrent-state seq for that new DFlash draft type. The binding only constructs `common_params_speculative` for its MTP path (setting `types` and `draft.*`) and otherwise calls `common_chat_templates_*`, `common_context_can_seq_rm`, `common_batch_add`, and `json_schema_to_grammar` — so the new enum value and the internal `need_n_rs_seq` logic are inert for it. The full test suite passes (158 tests + 4 skipped, with the generation paths run against a Qwen3.5-0.8B model and the embedding paths against a Qwen3-Embedding-0.6B model), all 7 end-to-end smoke tests pass (generation, streaming, chat templates, JSON-schema grammar, raw GBNF, and embeddings), formatting is clean, and Dialyzer reports 0 errors.
+  - **model**: add DeepSeek V4 (#24162); implement the MiniCPM5 chat parser (#24889).
+  - **spec/dflash**: add DFlash speculative decoding (#22105); refactor DFlash draft-model conversion (#25110).
+  - **CUDA/HIP**: add a `cudaMemcpy2DAsync` fast path to `ggml_cuda_cpy` (#25057); use hipBLAS for dense prefill on gfx900 while keeping MMQ for MoE (#24588).
+  - **vulkan**: roll the bk loop in matmul for Asahi Linux (#24663); use flops instead of weight-tensor size for the submission heuristic (#25005).
+  - **opencl**: flash-attention improvement (#25069).
+  - **ggml-webgpu**: add NVFP4 support (#25143).
+  - **sched**: revert "reintroduce less synchronizations during split compute" (#25138, reverting #20793 which had landed in v0.8.30).
+  - **chat/jinja**: add a `--reasoning-preserve` flag (#25105); add `jinja --dump-prog` for debugging (#25086).
+  - **common/server/cli**: dedup preset and cached model entries in `/v1/models` (#25131); remove the unused regex-partial helper (#25118); allow `--offline` in `llama download` (#25091); reduce logs (v2) (#25078).
+  - **ui/tools**: restore Tailwind scanning in ignored worktrees (#24879); fix stop and reasoning skip in single-model mode (#25084); revert the hover-gated interactive-elements accessibility change (#25098, reverting #24727).
+
 ## v0.8.30
 
 ### Changed
