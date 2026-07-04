@@ -150,7 +150,12 @@ defmodule LlamaCppEx.Server do
     * `:n_gpu_layers` - GPU layers. Defaults to `99`.
     * `:n_ctx` - Total context size (shared across slots). Defaults to `8192`.
     * `:n_parallel` - Number of concurrent slots. Defaults to `4`.
-    * `:n_batch` - Batch size. Defaults to `n_ctx`.
+    * `:n_batch` - Max tokens per forward pass. Defaults to `min(n_ctx, 2048)`.
+      Bounds worst-case tick latency: one huge prompt can occupy at most
+      `n_batch` tokens of a tick, so decode tokens of other slots are never
+      delayed by more than one `n_batch`-sized pass. Raise it for pure batch
+      throughput (fewer, larger passes); lower it (or lower `:chunk_size`) for
+      smoother streaming latency under mixed load.
     * `:chunk_size` - Max prefill tokens per slot per tick. Defaults to `512`.
     * `:max_queue` - Max queued requests. `0` for unlimited. Defaults to `0`.
     * `:cache_prompt` - Retain KV cache between requests on the same slot for
@@ -309,7 +314,7 @@ defmodule LlamaCppEx.Server do
     n_gpu_layers = Keyword.get(opts, :n_gpu_layers, 99)
     n_parallel = Keyword.get(opts, :n_parallel, 4)
     n_ctx = Keyword.get(opts, :n_ctx, 8192)
-    n_batch = Keyword.get(opts, :n_batch, n_ctx)
+    n_batch = Keyword.get(opts, :n_batch, min(n_ctx, 2048))
     chunk_size = Keyword.get(opts, :chunk_size, 512)
     cache_prompt = Keyword.get(opts, :cache_prompt, false)
     batch_strategy = Keyword.get(opts, :batch_strategy, LlamaCppEx.Server.Strategy.DecodeMaximal)
