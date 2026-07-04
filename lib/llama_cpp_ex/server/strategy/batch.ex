@@ -6,6 +6,11 @@ defmodule LlamaCppEx.Server.Strategy.Batch do
   the order and budget split between decode and prefill — the per-slot assembly
   of decode tokens and prefill chunks is identical, so it lives here.
 
+  Sampling, detokenization, and stream delivery all happen after the forward
+  pass (fused into the `batch_eval_sample` NIF and the server's post-tick
+  result handling) — these helpers only assemble batch entries and update
+  slot bookkeeping.
+
   ## Performance notes
 
   These helpers run on every tick of the server loop, once per active slot, and
@@ -26,9 +31,14 @@ defmodule LlamaCppEx.Server.Strategy.Batch do
 
   @doc """
   Adds one decode token for each generating slot (lowest seq_id first) until the
-  budget is exhausted. Streams each token piece to the slot's subscriber.
+  budget is exhausted.
+
+  `generated_token_ids` is updated here — at feed time — so it tracks exactly
+  the tokens present in the slot's KV cache (the prefix-cache bookkeeping
+  depends on that invariant; a sampled-but-never-fed final token must not
+  appear in `cached_tokens`).
   """
-  def add_decode_tokens(slots, entries, n_entries, budget, model_ref) do
+  def add_decode_tokens(slots, entries, n_entries, budget) do
     generating_slots =
       slots
       |> Enum.filter(fn {_id, slot} ->
@@ -44,17 +54,9 @@ defmodule LlamaCppEx.Server.Strategy.Batch do
         slot = slots[seq_id]
         token = slot.pending_token
 
-        piece = LlamaCppEx.NIF.token_to_piece(model_ref, token)
-
-        if slot.stream_pid && slot.stream_ref do
-          send(slot.stream_pid, {slot.stream_ref, {:token, piece}})
-        end
-
         slot = %{
           slot
-          | accumulated_pieces: [piece | slot.accumulated_pieces],
-            batch_idx: n_entries,
-            tokens_generated: slot.tokens_generated + 1,
+          | batch_idx: n_entries,
             generated_token_ids: [token | slot.generated_token_ids]
         }
 

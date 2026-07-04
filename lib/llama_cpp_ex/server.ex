@@ -82,6 +82,22 @@ defmodule LlamaCppEx.Server do
     * `:stop_reason` - `:eog` (end-of-generation token sampled) or
       `:max_tokens` (request `max_tokens` reached).
 
+  ### `[:llama_cpp_ex, :server, :kv_pressure]`
+
+  Emitted when a forward pass hit KV-cache pressure (`llama_decode == 1`) and
+  the server recovered by purging idle slots' cached prefixes and/or splitting
+  the batch.
+
+  Measurements:
+
+    * `:purged_slots` - Number of idle slots whose cached KV was dropped.
+    * `:batch_splits` - Number of times the batch was halved to fit.
+
+  Metadata:
+
+    * `:server` - PID of the server process.
+    * `:purged_seq_ids` - Sequence IDs whose caches were purged.
+
   ### `[:llama_cpp_ex, :server, :request, :exception]`
 
   Emitted when an inference error aborts an active request (e.g. the
@@ -561,6 +577,7 @@ defmodule LlamaCppEx.Server do
         prefill_pos: n_match,
         pos: n_match,
         pending_token: nil,
+        pending_eog: false,
         batch_idx: -1,
         tokens_generated: 0,
         max_tokens: max_tokens,
@@ -631,12 +648,6 @@ defmodule LlamaCppEx.Server do
     # Phase 2: Build batch
     {entries, state} = build_batch(state)
 
-    # Capture TTFT immediately after the strategy ran. The strategy sends
-    # each decode token piece to its stream consumer before returning, so
-    # by now any slot whose first decode just streamed has tokens_generated
-    # == 1 — that's the user-perceived first-token timestamp.
-    state = mark_first_tokens(state)
-
     if entries == [] do
       state
     else
@@ -644,25 +655,32 @@ defmodule LlamaCppEx.Server do
     end
   end
 
-  # Phases 3-5: forward pass, sampling, telemetry, and continuation
+  # Phases 3-5: fused forward pass + sampling, result handling, telemetry,
+  # and continuation. One dirty-CPU NIF per tick does decode, per-slot
+  # sampling, detokenization, and EOG checks; streaming sends happen here,
+  # right after the NIF returns — one tick earlier than the previous design,
+  # which deferred them to the next tick's batch building.
   defp run_forward_pass(state, entries) do
-    # Count decode tokens before sampling (slots may transition after)
+    # Count decode tokens before result handling (slots may transition after)
     n_decode =
       Enum.count(state.slots, fn {_id, s} ->
         s.state == :generating and s.batch_idx >= 0
       end)
 
-    # Phase 3: Forward pass
+    samplers = active_samplers(state)
+    purgeable = purgeable_seq_ids(state)
+
+    # Phase 3: Fused forward pass + sample
     tick_start = System.monotonic_time()
 
-    case LlamaCppEx.NIF.batch_eval(state.ctx.ref, entries) do
-      :ok ->
+    case LlamaCppEx.NIF.batch_eval_sample(state.ctx.ref, entries, samplers, purgeable) do
+      {:ok, results, purged, n_splits} ->
         tick_end = System.monotonic_time()
 
-        # Phase 4: Sample
-        state = sample_generating_slots(state)
-        state = sample_completed_prefills(state)
-        state = advance_incomplete_prefills(state)
+        # Phase 4: Apply sampled results, stream pieces, clear tick markers
+        state = handle_kv_pressure(state, purged, n_splits)
+        state = apply_sample_results(state, results)
+        state = clear_batch_indices(state)
 
         emit_tick_telemetry(state, entries, n_decode, tick_end - tick_start)
 
@@ -673,6 +691,97 @@ defmodule LlamaCppEx.Server do
         Logger.error("batch forward pass failed: #{reason}")
         fail_all_active_slots(state, reason)
     end
+  end
+
+  # Samplers for all active slots, keyed by seq_id — the NIF samples every
+  # logits-requesting entry whose seq_id is registered here.
+  defp active_samplers(state) do
+    for {seq_id, slot} <- state.slots, slot.state != :idle do
+      {seq_id, slot.sampler.ref}
+    end
+  end
+
+  # Idle slots whose retained prefix-cache KV may be dropped by the NIF under
+  # KV pressure (llama_decode == 1). Active slots are never purgeable.
+  defp purgeable_seq_ids(state) do
+    for {seq_id, slot} <- state.slots, slot.state == :idle, slot.cached_pos > 0 do
+      seq_id
+    end
+  end
+
+  # The NIF purged these idle slots' KV to relieve pressure — drop the
+  # corresponding prefix-cache bookkeeping and surface telemetry.
+  defp handle_kv_pressure(state, [], 0), do: state
+
+  defp handle_kv_pressure(state, purged, n_splits) do
+    Logger.warning(
+      "LlamaCppEx.Server: KV pressure — purged #{length(purged)} idle slot cache(s), " <>
+        "#{n_splits} batch split(s)"
+    )
+
+    :telemetry.execute(
+      [:llama_cpp_ex, :server, :kv_pressure],
+      %{purged_slots: length(purged), batch_splits: n_splits},
+      %{server: self(), purged_seq_ids: purged}
+    )
+
+    Enum.reduce(purged, state, fn seq_id, state ->
+      slot = state.slots[seq_id]
+      put_in(state.slots[seq_id], %{slot | cached_tokens: [], cached_pos: 0})
+    end)
+  end
+
+  # Phase 4: apply per-slot sampled tokens from the fused NIF. Each result is
+  # {seq_id, token, piece, is_eog} for a slot that had a logits-requesting
+  # entry this tick — either a generating slot's decode token or a slot whose
+  # prefill just completed. Non-EOG pieces are streamed/accumulated
+  # immediately; the token itself is fed to the KV on the NEXT tick (unless
+  # the slot finishes first — see finish_completed_slots/1).
+  defp apply_sample_results(state, results) do
+    now = System.monotonic_time()
+
+    Enum.reduce(results, state, fn {seq_id, token, piece, is_eog}, state ->
+      slot = state.slots[seq_id]
+
+      slot =
+        case slot.state do
+          :prefilling -> %{slot | state: :generating, pos: slot.n_prompt_tokens}
+          :generating -> %{slot | pos: slot.pos + 1}
+        end
+
+      slot = %{slot | pending_token: token, pending_eog: is_eog}
+
+      slot =
+        if is_eog do
+          slot
+        else
+          if slot.stream_pid && slot.stream_ref do
+            send(slot.stream_pid, {slot.stream_ref, {:token, piece}})
+          end
+
+          %{
+            slot
+            | accumulated_pieces: [piece | slot.accumulated_pieces],
+              tokens_generated: slot.tokens_generated + 1,
+              t_first_token: slot.t_first_token || now
+          }
+        end
+
+      put_in(state.slots[seq_id], slot)
+    end)
+  end
+
+  # batch_idx is only meaningful within a single tick (it marks slots the
+  # strategy fed this batch). Clear it so the next tick's bookkeeping starts
+  # clean even for slots that were skipped by budget limits.
+  defp clear_batch_indices(state) do
+    slots =
+      Map.new(state.slots, fn
+        {id, %{batch_idx: -1} = slot} -> {id, slot}
+        {id, slot} -> {id, %{slot | batch_idx: -1}}
+      end)
+
+    %{state | slots: slots}
   end
 
   # Schedules the next tick while any slot is still active.
@@ -699,7 +808,10 @@ defmodule LlamaCppEx.Server do
     )
   end
 
-  # Phase 1: Check generating slots for completion
+  # Phase 1: Check generating slots for completion. EOG was determined by the
+  # fused NIF at sample time (pending_eog) — no per-token NIF call here. A slot
+  # whose pending token is EOG or whose streamed output hit max_tokens finishes
+  # without feeding that pending token to the KV.
   defp finish_completed_slots(state) do
     generating_slots =
       state.slots
@@ -709,11 +821,9 @@ defmodule LlamaCppEx.Server do
 
     Enum.reduce(generating_slots, state, fn {seq_id, _slot}, state ->
       slot = state.slots[seq_id]
-      token = slot.pending_token
-      is_eog = LlamaCppEx.NIF.vocab_is_eog(state.model.ref, token)
 
       cond do
-        is_eog ->
+        slot.pending_eog ->
           # pending_token is the EOG control token — finish without streaming it.
           finish_slot(state, seq_id, :eog)
 
@@ -735,91 +845,6 @@ defmodule LlamaCppEx.Server do
       state.batch_strategy.build_batch(state.slots, state.n_batch, state.chunk_size, opts)
 
     {entries, %{state | slots: updated_slots}}
-  end
-
-  defp mark_first_tokens(state) do
-    now = System.monotonic_time()
-
-    slots =
-      Enum.reduce(state.slots, state.slots, fn {seq_id, slot}, acc ->
-        if slot.t_first_token == nil and slot.tokens_generated >= 1 do
-          Map.put(acc, seq_id, %{slot | t_first_token: now})
-        else
-          acc
-        end
-      end)
-
-    %{state | slots: slots}
-  end
-
-  # Phase 4a: Sample for generating slots
-  defp sample_generating_slots(state) do
-    generating_slots =
-      state.slots
-      |> Enum.filter(fn {_id, slot} ->
-        slot.state == :generating and slot.batch_idx >= 0
-      end)
-
-    Enum.reduce(generating_slots, state, fn {seq_id, _slot}, state ->
-      slot = state.slots[seq_id]
-
-      # sampler_sample_at/3 already accepts the selected token into the sampler
-      # (advancing grammar/penalty state); a second accept would double-advance.
-      next_token =
-        LlamaCppEx.NIF.sampler_sample_at(slot.sampler.ref, state.ctx.ref, slot.batch_idx)
-
-      slot = %{
-        slot
-        | pos: slot.pos + 1,
-          pending_token: next_token,
-          batch_idx: -1
-      }
-
-      put_in(state.slots[seq_id], slot)
-    end)
-  end
-
-  # Phase 4b: Sample for prefilling slots that completed
-  defp sample_completed_prefills(state) do
-    completed_prefills =
-      state.slots
-      |> Enum.filter(fn {_id, slot} ->
-        slot.state == :prefilling and slot.batch_idx >= 0 and
-          slot.prefill_pos >= slot.n_prompt_tokens
-      end)
-
-    Enum.reduce(completed_prefills, state, fn {seq_id, _slot}, state ->
-      slot = state.slots[seq_id]
-
-      # sampler_sample_at/3 already accepts the token internally — no extra accept.
-      first_token =
-        LlamaCppEx.NIF.sampler_sample_at(slot.sampler.ref, state.ctx.ref, slot.batch_idx)
-
-      slot = %{
-        slot
-        | state: :generating,
-          pending_token: first_token,
-          pos: slot.n_prompt_tokens,
-          batch_idx: -1
-      }
-
-      put_in(state.slots[seq_id], slot)
-    end)
-  end
-
-  # Phase 4c: Advance incomplete prefills (no sampling needed)
-  defp advance_incomplete_prefills(state) do
-    incomplete_prefills =
-      state.slots
-      |> Enum.filter(fn {_id, slot} ->
-        slot.state == :prefilling and slot.prefill_pos < slot.n_prompt_tokens
-      end)
-
-    Enum.reduce(incomplete_prefills, state, fn {seq_id, _slot}, state ->
-      slot = state.slots[seq_id]
-      slot = %{slot | batch_idx: -1}
-      put_in(state.slots[seq_id], slot)
-    end)
   end
 
   # --- Internal: Slot completion ---
@@ -944,6 +969,7 @@ defmodule LlamaCppEx.Server do
       prefill_pos: 0,
       pos: 0,
       pending_token: nil,
+      pending_eog: false,
       batch_idx: -1,
       tokens_generated: 0,
       max_tokens: 0,

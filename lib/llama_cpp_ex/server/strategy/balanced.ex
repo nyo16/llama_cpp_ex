@@ -15,9 +15,7 @@ defmodule LlamaCppEx.Server.Strategy.Balanced do
   alias LlamaCppEx.Server.Strategy.Batch
 
   @impl true
-  def build_batch(slots, budget, chunk_size, opts) do
-    model_ref = Keyword.fetch!(opts, :model_ref)
-
+  def build_batch(slots, budget, chunk_size, _opts) do
     n_generating =
       Enum.count(slots, fn {_id, slot} ->
         slot.state == :generating and slot.pending_token != nil
@@ -28,7 +26,7 @@ defmodule LlamaCppEx.Server.Strategy.Balanced do
     prefill_budget = budget - decode_budget
 
     {entries, n_entries, slots, decode_remaining} =
-      Batch.add_decode_tokens(slots, [], 0, decode_budget, model_ref)
+      Batch.add_decode_tokens(slots, [], 0, decode_budget)
 
     # Prefill gets its half plus any unused decode budget.
     effective_prefill_budget = prefill_budget + decode_remaining
