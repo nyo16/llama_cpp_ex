@@ -37,32 +37,31 @@ defmodule LlamaCppEx.Server.Strategy.Batch do
       |> Enum.sort_by(&elem(&1, 0))
 
     Enum.reduce(generating_slots, {entries, n_entries, slots, budget}, fn
+      {_seq_id, _slot}, {entries, n_entries, slots, budget} when budget <= 0 ->
+        {entries, n_entries, slots, budget}
+
       {seq_id, _slot}, {entries, n_entries, slots, budget} ->
-        if budget <= 0 do
-          {entries, n_entries, slots, budget}
-        else
-          slot = slots[seq_id]
-          token = slot.pending_token
+        slot = slots[seq_id]
+        token = slot.pending_token
 
-          piece = LlamaCppEx.NIF.token_to_piece(model_ref, token)
+        piece = LlamaCppEx.NIF.token_to_piece(model_ref, token)
 
-          if slot.stream_pid && slot.stream_ref do
-            send(slot.stream_pid, {slot.stream_ref, {:token, piece}})
-          end
-
-          slot = %{
-            slot
-            | accumulated_pieces: [piece | slot.accumulated_pieces],
-              batch_idx: n_entries,
-              tokens_generated: slot.tokens_generated + 1,
-              generated_token_ids: [token | slot.generated_token_ids]
-          }
-
-          entry = {token, slot.pos, seq_id, true}
-          slots = Map.put(slots, seq_id, slot)
-
-          {[entry | entries], n_entries + 1, slots, budget - 1}
+        if slot.stream_pid && slot.stream_ref do
+          send(slot.stream_pid, {slot.stream_ref, {:token, piece}})
         end
+
+        slot = %{
+          slot
+          | accumulated_pieces: [piece | slot.accumulated_pieces],
+            batch_idx: n_entries,
+            tokens_generated: slot.tokens_generated + 1,
+            generated_token_ids: [token | slot.generated_token_ids]
+        }
+
+        entry = {token, slot.pos, seq_id, true}
+        slots = Map.put(slots, seq_id, slot)
+
+        {[entry | entries], n_entries + 1, slots, budget - 1}
     end)
   end
 
@@ -78,40 +77,35 @@ defmodule LlamaCppEx.Server.Strategy.Batch do
       |> Enum.sort_by(&elem(&1, 0))
 
     Enum.reduce(prefilling_slots, {entries, n_entries, slots, budget}, fn
+      {_seq_id, _slot}, {entries, n_entries, slots, budget} when budget <= 0 ->
+        {entries, n_entries, slots, budget}
+
       {seq_id, _slot}, {entries, n_entries, slots, budget} ->
-        if budget <= 0 do
-          {entries, n_entries, slots, budget}
-        else
-          slot = slots[seq_id]
-          remaining = slot.n_prompt_tokens - slot.prefill_pos
-          chunk_len = min(budget, min(chunk_size, remaining))
-          is_last_chunk = slot.prefill_pos + chunk_len >= slot.n_prompt_tokens
+        slot = slots[seq_id]
+        remaining = slot.n_prompt_tokens - slot.prefill_pos
+        chunk_len = min(budget, min(chunk_size, remaining))
+        is_last_chunk = slot.prefill_pos + chunk_len >= slot.n_prompt_tokens
 
-          tuple = slot.prompt_tokens_tuple
+        tuple = slot.prompt_tokens_tuple
 
-          # Build this chunk's entries in O(chunk_len): elem/2 is O(1) on a tuple,
-          # and n_entries gives each entry's final batch index without length/1.
-          {entries, n_entries, last_batch_idx} =
-            Enum.reduce(0..(chunk_len - 1)//1, {entries, n_entries, -1}, fn i,
-                                                                            {entries, n_entries,
-                                                                             _last} ->
-              pos = slot.prefill_pos + i
-              token = elem(tuple, pos)
-              logits = is_last_chunk and i == chunk_len - 1
-              entry = {token, pos, seq_id, logits}
-              {[entry | entries], n_entries + 1, n_entries}
-            end)
+        # Build this chunk's entries in O(chunk_len): elem/2 is O(1) on a tuple,
+        # and n_entries gives each entry's final batch index without length/1.
+        {entries, n_entries, last_batch_idx} =
+          Enum.reduce(0..(chunk_len - 1)//1, {entries, n_entries, -1}, fn i,
+                                                                          {entries, n_entries,
+                                                                           _last} ->
+            pos = slot.prefill_pos + i
+            token = elem(tuple, pos)
+            logits = is_last_chunk and i == chunk_len - 1
+            entry = {token, pos, seq_id, logits}
+            {[entry | entries], n_entries + 1, n_entries}
+          end)
 
-          slot =
-            if is_last_chunk do
-              %{slot | batch_idx: last_batch_idx, prefill_pos: slot.prefill_pos + chunk_len}
-            else
-              %{slot | batch_idx: -1, prefill_pos: slot.prefill_pos + chunk_len}
-            end
+        batch_idx = if is_last_chunk, do: last_batch_idx, else: -1
+        slot = %{slot | batch_idx: batch_idx, prefill_pos: slot.prefill_pos + chunk_len}
 
-          slots = Map.put(slots, seq_id, slot)
-          {entries, n_entries, slots, budget - chunk_len}
-        end
+        slots = Map.put(slots, seq_id, slot)
+        {entries, n_entries, slots, budget - chunk_len}
     end)
   end
 end

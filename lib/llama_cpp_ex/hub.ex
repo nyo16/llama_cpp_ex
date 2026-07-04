@@ -95,37 +95,17 @@ defmodule LlamaCppEx.Hub do
   @spec search(String.t(), keyword()) :: {:ok, [map()]} | {:error, String.t()}
   def search(query, opts \\ []) do
     with :ok <- ensure_req() do
-      limit = Keyword.get(opts, :limit, 10)
-      sort = Keyword.get(opts, :sort, "downloads")
-      direction = Keyword.get(opts, :direction, -1)
-      headers = auth_headers(opts)
-
       params = [
         search: query,
         filter: "gguf",
-        sort: sort,
-        direction: direction,
-        limit: limit
+        sort: Keyword.get(opts, :sort, "downloads"),
+        direction: Keyword.get(opts, :direction, -1),
+        limit: Keyword.get(opts, :limit, 10)
       ]
 
-      req_opts = [headers: headers, params: params] ++ proxy_request_options(@hf_api_url, opts)
-
-      case Req.get(@hf_api_url, req_opts) do
+      case hf_get(@hf_api_url, opts, params: params) do
         {:ok, %{status: 200, body: body}} when is_list(body) ->
-          models =
-            Enum.map(body, fn m ->
-              %{
-                id: m["id"] || m["modelId"],
-                downloads: m["downloads"] || 0,
-                likes: m["likes"] || 0,
-                last_modified: m["lastModified"],
-                tags: m["tags"] || [],
-                private: m["private"] || false,
-                gated: m["gated"] || false
-              }
-            end)
-
-          {:ok, models}
+          {:ok, parse_search_results(body)}
 
         {:ok, %{status: status}} ->
           {:error, "HuggingFace search returned status #{status}"}
@@ -134,6 +114,20 @@ defmodule LlamaCppEx.Hub do
           {:error, "network error: #{Exception.message(exception)}"}
       end
     end
+  end
+
+  defp parse_search_results(body) do
+    Enum.map(body, fn m ->
+      %{
+        id: m["id"] || m["modelId"],
+        downloads: m["downloads"] || 0,
+        likes: m["likes"] || 0,
+        last_modified: m["lastModified"],
+        tags: m["tags"] || [],
+        private: m["private"] || false,
+        gated: m["gated"] || false
+      }
+    end)
   end
 
   # --- Download ---
@@ -206,37 +200,19 @@ defmodule LlamaCppEx.Hub do
     with :ok <- ensure_req() do
       revision = Keyword.get(opts, :revision, "main")
       url = "#{@hf_api_url}/#{repo_id}/tree/#{revision}"
-      headers = auth_headers(opts)
 
-      case Req.get(url, [headers: headers] ++ proxy_request_options(url, opts)) do
-        {:ok, %{status: 200, body: body}} when is_list(body) ->
-          files =
-            body
-            |> Enum.filter(
-              &(&1["type"] == "file" and String.ends_with?(&1["path"] || "", ".gguf"))
-            )
-            |> Enum.map(fn f -> %{filename: f["path"], size: f["size"] || 0} end)
-            |> Enum.sort_by(& &1.size)
-
-          {:ok, files}
-
-        {:ok, %{status: 401}} ->
-          {:error, "authentication required — set HF_TOKEN or pass :token option"}
-
-        {:ok, %{status: 403}} ->
-          {:error,
-           "access denied — this may be a gated model requiring access approval at #{@hf_base_url}/#{repo_id}"}
-
-        {:ok, %{status: 404}} ->
-          {:error, "repository not found: #{repo_id}"}
-
-        {:ok, %{status: status}} ->
-          {:error, "HuggingFace API returned status #{status}"}
-
-        {:error, exception} ->
-          {:error, "network error: #{Exception.message(exception)}"}
+      case hf_get(url, opts) do
+        {:ok, %{status: 200, body: body}} when is_list(body) -> {:ok, parse_gguf_tree(body)}
+        other -> hf_api_error(other, repo_id)
       end
     end
+  end
+
+  defp parse_gguf_tree(body) do
+    body
+    |> Enum.filter(&(&1["type"] == "file" and String.ends_with?(&1["path"] || "", ".gguf")))
+    |> Enum.map(fn f -> %{filename: f["path"], size: f["size"] || 0} end)
+    |> Enum.sort_by(& &1.size)
   end
 
   # --- Model Info ---
@@ -253,30 +229,39 @@ defmodule LlamaCppEx.Hub do
   def get_model_info(repo_id, opts \\ []) do
     with :ok <- ensure_req() do
       url = "#{@hf_api_url}/#{repo_id}"
-      headers = auth_headers(opts)
 
-      case Req.get(url, [headers: headers] ++ proxy_request_options(url, opts)) do
-        {:ok, %{status: 200, body: body}} ->
-          {:ok, body}
-
-        {:ok, %{status: 401}} ->
-          {:error, "authentication required — set HF_TOKEN or pass :token option"}
-
-        {:ok, %{status: 403}} ->
-          {:error,
-           "access denied — this may be a gated model requiring access approval at #{@hf_base_url}/#{repo_id}"}
-
-        {:ok, %{status: 404}} ->
-          {:error, "repository not found: #{repo_id}"}
-
-        {:ok, %{status: status}} ->
-          {:error, "HuggingFace API returned status #{status}"}
-
-        {:error, exception} ->
-          {:error, "network error: #{Exception.message(exception)}"}
+      case hf_get(url, opts) do
+        {:ok, %{status: 200, body: body}} -> {:ok, body}
+        other -> hf_api_error(other, repo_id)
       end
     end
   end
+
+  # --- Shared HF API request helpers ---
+
+  # Issues a GET with auth headers and proxy options applied.
+  defp hf_get(url, opts, extra_req_opts \\ []) do
+    req_opts = [headers: auth_headers(opts)] ++ extra_req_opts ++ proxy_request_options(url, opts)
+    Req.get(url, req_opts)
+  end
+
+  # Maps a non-200 HF API response or transport error to an error tuple.
+  defp hf_api_error({:ok, %{status: 401}}, _repo_id),
+    do: {:error, "authentication required — set HF_TOKEN or pass :token option"}
+
+  defp hf_api_error({:ok, %{status: 403}}, repo_id),
+    do:
+      {:error,
+       "access denied — this may be a gated model requiring access approval at #{@hf_base_url}/#{repo_id}"}
+
+  defp hf_api_error({:ok, %{status: 404}}, repo_id),
+    do: {:error, "repository not found: #{repo_id}"}
+
+  defp hf_api_error({:ok, %{status: status}}, _repo_id),
+    do: {:error, "HuggingFace API returned status #{status}"}
+
+  defp hf_api_error({:error, exception}, _repo_id),
+    do: {:error, "network error: #{Exception.message(exception)}"}
 
   # --- Public Helpers ---
 

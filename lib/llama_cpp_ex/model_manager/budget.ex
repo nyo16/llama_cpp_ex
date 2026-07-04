@@ -123,39 +123,38 @@ defmodule LlamaCppEx.ModelManager.Budget do
     n_gpu_layers = Keyword.get(opts, :n_gpu_layers, 99)
     offloaded? = n_gpu_layers != 0 and n_gpus > 0
 
-    if not offloaded? do
-      %{ram: file_bytes + kv, vram: %{}}
-    else
+    if offloaded? do
       kqv_on_gpu? = Keyword.get(opts, :offload_kqv, true)
       vram_total = file_bytes + if(kqv_on_gpu?, do: kv, else: 0)
       ram_total = if kqv_on_gpu?, do: 0, else: kv
       weights = device_weights(opts, n_gpus)
       vram = Map.new(weights, fn {i, w} -> {i, round(vram_total * w)} end)
       %{ram: ram_total, vram: vram}
+    else
+      %{ram: file_bytes + kv, vram: %{}}
     end
   end
 
   # Returns %{gpu_index => fraction}, summing to 1.0.
   defp device_weights(opts, n_gpus) do
     case Keyword.get(opts, :split_mode, :none) do
-      :none ->
-        %{Keyword.get(opts, :main_gpu, 0) => 1.0}
-
-      _layer_or_row ->
-        case Keyword.get(opts, :tensor_split, []) do
-          [] ->
-            frac = 1.0 / n_gpus
-            Map.new(0..(n_gpus - 1), fn i -> {i, frac} end)
-
-          weights ->
-            sum = Enum.sum(weights)
-
-            weights
-            |> Enum.with_index()
-            |> Enum.reject(fn {w, _i} -> w == 0 end)
-            |> Map.new(fn {w, i} -> {i, w / sum} end)
-        end
+      :none -> %{Keyword.get(opts, :main_gpu, 0) => 1.0}
+      _layer_or_row -> split_weights(Keyword.get(opts, :tensor_split, []), n_gpus)
     end
+  end
+
+  defp split_weights([], n_gpus) do
+    frac = 1.0 / n_gpus
+    Map.new(0..(n_gpus - 1), fn i -> {i, frac} end)
+  end
+
+  defp split_weights(weights, _n_gpus) do
+    sum = Enum.sum(weights)
+
+    weights
+    |> Enum.with_index()
+    |> Enum.reject(fn {w, _i} -> w == 0 end)
+    |> Map.new(fn {w, i} -> {i, w / sum} end)
   end
 
   # --- Fit check ---
@@ -193,13 +192,15 @@ defmodule LlamaCppEx.ModelManager.Budget do
   def check(%{mode: :per_device, ram: ram_limit, vram: vram}, placement, used) do
     with :ok <- fits(ram_limit, placement.ram, used.ram, :ram) do
       Enum.reduce_while(placement.vram, :ok, fn {gi, required}, :ok ->
-        limit = vram_limit(vram, gi)
-
-        case fits(limit, required, Map.get(used.vram, gi, 0), {:gpu, gi}) do
-          :ok -> {:cont, :ok}
-          error -> {:halt, error}
-        end
+        check_gpu(vram, gi, required, used)
       end)
+    end
+  end
+
+  defp check_gpu(vram, gi, required, used) do
+    case fits(vram_limit(vram, gi), required, Map.get(used.vram, gi, 0), {:gpu, gi}) do
+      :ok -> {:cont, :ok}
+      error -> {:halt, error}
     end
   end
 

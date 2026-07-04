@@ -79,24 +79,8 @@ defmodule LlamaCppEx.Schema do
 
     {properties, required} =
       Enum.reduce(fields, {%{}, []}, fn field, {props, req} ->
-        if field in embeds do
-          embed_schema = module.__schema__(:embed, field)
-          embed_mod = embed_schema.related
-
-          case embed_schema.cardinality do
-            :one ->
-              nested = to_json_schema(embed_mod)
-              {Map.put(props, to_string(field), nested), [to_string(field) | req]}
-
-            :many ->
-              nested = to_json_schema(embed_mod)
-              item = %{"type" => "array", "items" => nested}
-              {Map.put(props, to_string(field), item), [to_string(field) | req]}
-          end
-        else
-          json_type = ecto_type_to_json(types[field])
-          {Map.put(props, to_string(field), json_type), [to_string(field) | req]}
-        end
+        property = field_property(module, field, types, embeds)
+        {Map.put(props, to_string(field), property), [to_string(field) | req]}
       end)
 
     %{
@@ -105,6 +89,19 @@ defmodule LlamaCppEx.Schema do
       "required" => Enum.reverse(required)
     }
   end
+
+  defp field_property(module, field, types, embeds) do
+    if field in embeds do
+      embed_property(module.__schema__(:embed, field))
+    else
+      ecto_type_to_json(types[field])
+    end
+  end
+
+  defp embed_property(%{cardinality: :one, related: embed_mod}), do: to_json_schema(embed_mod)
+
+  defp embed_property(%{cardinality: :many, related: embed_mod}),
+    do: %{"type" => "array", "items" => to_json_schema(embed_mod)}
 
   defp ecto_type_to_json(:string), do: %{"type" => "string"}
   defp ecto_type_to_json(:binary), do: %{"type" => "string"}

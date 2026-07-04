@@ -28,16 +28,16 @@ defmodule LlamaCppEx do
   """
 
   alias LlamaCppEx.{
-    Model,
-    Context,
-    Sampler,
-    Tokenizer,
     Chat,
-    Embedding,
-    Grammar,
     ChatCompletion,
     ChatCompletionChunk,
-    Thinking
+    Context,
+    Embedding,
+    Grammar,
+    Model,
+    Sampler,
+    Thinking,
+    Tokenizer
   }
 
   @context_opt_keys [

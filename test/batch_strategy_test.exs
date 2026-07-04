@@ -1,7 +1,7 @@
 defmodule LlamaCppEx.Server.BatchStrategyTest do
   use ExUnit.Case, async: true
 
-  alias LlamaCppEx.Server.Strategy.{DecodeMaximal, PrefillPriority, Balanced}
+  alias LlamaCppEx.Server.Strategy.{Balanced, DecodeMaximal, PrefillPriority}
 
   # We need a mock model_ref for token_to_piece calls.
   # Since strategies call NIF.token_to_piece, we need a real model for integration.

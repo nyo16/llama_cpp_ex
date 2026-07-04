@@ -103,7 +103,7 @@ defmodule LlamaCppEx.Server do
 
   require Logger
 
-  alias LlamaCppEx.{Model, Context, Sampler, Tokenizer}
+  alias LlamaCppEx.{Context, Model, Sampler, Tokenizer}
 
   defstruct [
     :model,
@@ -666,50 +666,63 @@ defmodule LlamaCppEx.Server do
     if entries == [] do
       state
     else
-      # Count decode tokens before sampling (slots may transition after)
-      n_decode =
-        Enum.count(state.slots, fn {_id, s} ->
-          s.state == :generating and s.batch_idx >= 0
-        end)
-
-      # Phase 3: Forward pass
-      tick_start = System.monotonic_time()
-
-      case LlamaCppEx.NIF.batch_eval(state.ctx.ref, entries) do
-        :ok ->
-          tick_end = System.monotonic_time()
-
-          # Phase 4: Sample
-          state = sample_generating_slots(state)
-          state = sample_completed_prefills(state)
-          state = advance_incomplete_prefills(state)
-
-          # Emit tick telemetry
-          :telemetry.execute(
-            [:llama_cpp_ex, :server, :tick],
-            %{
-              batch_size: length(entries),
-              decode_tokens: n_decode,
-              prefill_tokens: length(entries) - n_decode,
-              active_slots: Enum.count(state.slots, fn {_id, s} -> s.state != :idle end),
-              queue_depth: :queue.len(state.queue),
-              eval_ms: (tick_end - tick_start) / 1_000_000
-            },
-            %{server: self()}
-          )
-
-          # Phase 5: Continue
-          if Enum.any?(state.slots, fn {_id, slot} -> slot.state != :idle end) do
-            maybe_schedule_tick(state)
-          else
-            state
-          end
-
-        {:error, reason} ->
-          Logger.error("batch forward pass failed: #{reason}")
-          fail_all_active_slots(state, reason)
-      end
+      run_forward_pass(state, entries)
     end
+  end
+
+  # Phases 3-5: forward pass, sampling, telemetry, and continuation
+  defp run_forward_pass(state, entries) do
+    # Count decode tokens before sampling (slots may transition after)
+    n_decode =
+      Enum.count(state.slots, fn {_id, s} ->
+        s.state == :generating and s.batch_idx >= 0
+      end)
+
+    # Phase 3: Forward pass
+    tick_start = System.monotonic_time()
+
+    case LlamaCppEx.NIF.batch_eval(state.ctx.ref, entries) do
+      :ok ->
+        tick_end = System.monotonic_time()
+
+        # Phase 4: Sample
+        state = sample_generating_slots(state)
+        state = sample_completed_prefills(state)
+        state = advance_incomplete_prefills(state)
+
+        emit_tick_telemetry(state, entries, n_decode, tick_end - tick_start)
+
+        # Phase 5: Continue
+        continue_if_active(state)
+
+      {:error, reason} ->
+        Logger.error("batch forward pass failed: #{reason}")
+        fail_all_active_slots(state, reason)
+    end
+  end
+
+  # Schedules the next tick while any slot is still active.
+  defp continue_if_active(state) do
+    if Enum.any?(state.slots, fn {_id, slot} -> slot.state != :idle end) do
+      maybe_schedule_tick(state)
+    else
+      state
+    end
+  end
+
+  defp emit_tick_telemetry(state, entries, n_decode, eval_native) do
+    :telemetry.execute(
+      [:llama_cpp_ex, :server, :tick],
+      %{
+        batch_size: length(entries),
+        decode_tokens: n_decode,
+        prefill_tokens: length(entries) - n_decode,
+        active_slots: Enum.count(state.slots, fn {_id, s} -> s.state != :idle end),
+        queue_depth: :queue.len(state.queue),
+        eval_ms: eval_native / 1_000_000
+      },
+      %{server: self()}
+    )
   end
 
   # Phase 1: Check generating slots for completion

@@ -1,7 +1,7 @@
 defmodule LlamaCppEx.Embedding do
   @moduledoc "Generate embeddings from text using an embedding model."
 
-  alias LlamaCppEx.{Model, Context, Tokenizer}
+  alias LlamaCppEx.{Context, Model, Tokenizer}
 
   @type t :: [float()]
 
