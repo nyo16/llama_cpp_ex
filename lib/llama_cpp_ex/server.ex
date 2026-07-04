@@ -788,25 +788,25 @@ defmodule LlamaCppEx.Server do
         end
 
       slot = %{slot | pending_token: token, pending_eog: is_eog}
-
-      slot =
-        if is_eog do
-          slot
-        else
-          if slot.stream_pid && slot.stream_ref do
-            send(slot.stream_pid, {slot.stream_ref, {:token, piece}})
-          end
-
-          %{
-            slot
-            | accumulated_pieces: [piece | slot.accumulated_pieces],
-              tokens_generated: slot.tokens_generated + 1,
-              t_first_token: slot.t_first_token || now
-          }
-        end
+      slot = if is_eog, do: slot, else: emit_piece(slot, piece, now)
 
       put_in(state.slots[seq_id], slot)
     end)
+  end
+
+  # Streams a sampled piece to the slot's subscriber (if any) and folds it
+  # into the slot's accumulated output/counters.
+  defp emit_piece(slot, piece, now) do
+    if slot.stream_pid && slot.stream_ref do
+      send(slot.stream_pid, {slot.stream_ref, {:token, piece}})
+    end
+
+    %{
+      slot
+      | accumulated_pieces: [piece | slot.accumulated_pieces],
+        tokens_generated: slot.tokens_generated + 1,
+        t_first_token: slot.t_first_token || now
+    }
   end
 
   # batch_idx is only meaningful within a single tick (it marks slots the
