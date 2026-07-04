@@ -440,11 +440,13 @@ fine::Ok<> sampler_reset(ErlNifEnv* env, fine::ResourcePtr<LlamaSampler> sampler
 }
 FINE_NIF(sampler_reset, 0);
 
+// Dirty: the sampler chain runs a softmax over the full vocab (100k+ entries)
+// and grammar samplers can take multiple ms — too slow for a normal scheduler.
 int64_t sampler_sample(ErlNifEnv* env, fine::ResourcePtr<LlamaSampler> sampler,
                        fine::ResourcePtr<LlamaContext> ctx) {
     return llama_sampler_sample(sampler->sampler, ctx->ctx, -1);
 }
-FINE_NIF(sampler_sample, 0);
+FINE_NIF(sampler_sample, ERL_NIF_DIRTY_JOB_CPU_BOUND);
 
 // --- Decode ---
 
@@ -1031,6 +1033,8 @@ FINE_NIF(batch_eval_sample, ERL_NIF_DIRTY_JOB_CPU_BOUND);
 
 // --- Sampler sample at batch index ---
 
+// Dirty for the same reason as sampler_sample: full-vocab softmax + optional
+// grammar evaluation exceed the ~1 ms normal-scheduler guideline.
 int64_t sampler_sample_at(
     ErlNifEnv* env,
     fine::ResourcePtr<LlamaSampler> sampler,
@@ -1039,7 +1043,7 @@ int64_t sampler_sample_at(
 {
     return llama_sampler_sample(sampler->sampler, ctx->ctx, static_cast<int32_t>(idx));
 }
-FINE_NIF(sampler_sample_at, 0);
+FINE_NIF(sampler_sample_at, ERL_NIF_DIRTY_JOB_CPU_BOUND);
 
 // --- Chat template ---
 
@@ -1116,7 +1120,9 @@ std::string chat_apply_template_jinja(
     auto result = common_chat_templates_apply(model->chat_templates.get(), inputs);
     return result.prompt;
 }
-FINE_NIF(chat_apply_template_jinja, 0);
+// Dirty: minja template rendering allocates and walks a full AST per call —
+// multi-ms for large templates/histories.
+FINE_NIF(chat_apply_template_jinja, ERL_NIF_DIRTY_JOB_CPU_BOUND);
 
 // --- Speculative decoding (MTP) ---
 
@@ -1168,7 +1174,9 @@ speculative_init(
         spec, std::move(ctx_tgt), std::move(ctx_dft),
         static_cast<uint32_t>(n_draft), needs_ckpt));
 }
-FINE_NIF(speculative_init, 0);
+// Dirty: common_speculative_init probes the contexts (KV clear + setup work)
+// and can block well past the normal-scheduler budget.
+FINE_NIF(speculative_init, ERL_NIF_DIRTY_JOB_CPU_BOUND);
 
 // Build the live counter snapshot as a flat map { atom => term }. Used by
 // speculative_stats (queried from Elixir) and by the streaming NIF when it
@@ -1906,7 +1914,9 @@ json_schema_to_grammar_nif(ErlNifEnv* env, std::string json_str) {
         return fine::Error(std::string(e.what()));
     }
 }
-FINE_NIF(json_schema_to_grammar_nif, 0);
+// Dirty: JSON parsing + grammar construction scale with schema size and can
+// run for milliseconds on real-world schemas.
+FINE_NIF(json_schema_to_grammar_nif, ERL_NIF_DIRTY_JOB_CPU_BOUND);
 
 // --- Init ---
 
