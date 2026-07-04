@@ -1,5 +1,21 @@
 # Changelog
 
+## v0.8.32
+
+### Changed
+
+- **llama.cpp submodule** — Updated from f708a5b2c to 2d973636e (24 commits, tag b9870). No NIF changes were required. `ggml/include/ggml.h`, `ggml/include/ggml-backend.h`, `common/common.h`, `common/chat.h`, `common/json-schema-to-grammar.h`, `common/sampling.h`, and `common/speculative.h` are all unchanged. The only touched header the binding compiles against is `include/llama.h`, and its diff is purely additive: a new `llama_ftype_name()` helper that renders a `llama_ftype` quantization enum as a string (e.g. `"Q8_0"`) and a new `llama_model_ftype()` getter that returns a loaded model's file type (#25134) — the binding calls neither, so nothing it consumes changed shape. The full test suite passes (216 tests + 1 skipped, with the generation paths run against a Qwen3.5-0.8B model and the embedding paths against a Qwen3-Embedding-0.6B model), all 7 end-to-end smoke tests pass (generation, streaming, chat templates, JSON-schema grammar, raw GBNF, and embeddings), formatting is clean, and Dialyzer reports 0 errors.
+  - **llama API**: add `llama_model_ftype()` / `llama_ftype_name()` for reading a model's quantization type (#25134).
+  - **model**: register `t_layer_inp` for qwen3next (#25141).
+  - **chat**: trim messages sent to the StepFun parser, fixing long reasoning loops (#25238).
+  - **spec/dflash**: support `spec-draft-p-min` in DFlash (#25246).
+  - **CUDA**: enable topk-moe fusion for 288 experts (#25267); remove redundant copies after `gated_delta_net` (#23940); consistent use of `__restrict__` + PDL for FlashAttention (#25185); prevent integer truncation/overflow in the `flash_attn_mask_to_KV_max` kernel's KQ mask strides (#24945); fix `get_rows_back` for tables with more than 65535 rows (#25103); fix Gemma E4B MTP FlashAttention (#25148).
+  - **ggml-cpu**: add AVX2 optimization for the nvfp4 dot product using a UE4M3 LUT (#23961).
+  - **opencl**: allow loading precompiled binary kernels from a library (#23042); initial q1_0 support (#25160).
+  - **hexagon**: flash-attention rework with optimizations and accuracy improvements (#25085).
+  - **common/server**: use the HF primary split as the model path (#25194); handle bracketed IPv6 literals in URL authorities (#25140); ping silent SSE streams every 1s and kick only after 3s so slow prefill never drops healthy connections (#25241); update the vendored cpp-httplib to 0.49.0 (#25218).
+  - **ui**: improve streaming performance (#25225); strip path and weight extension from the model id in single-model mode (#25137); align persisted config with the strict server schema and enable thinking by default (#25242); add an MCP-servers opt-in for first-time visitors (#25239); prevent tool messages from appending to other conversations (#25177); remove the PWA navigate fallback to avoid caching API endpoint requests (#25174).
+
 ## v0.8.31
 
 ### Changed
