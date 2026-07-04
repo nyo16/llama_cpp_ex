@@ -704,12 +704,12 @@ prefill(
     }
 
     int n_batch = llama_n_batch(ctx->ctx);
+    llama_batch& batch = ctx->reserve_batch(std::min(n_tokens, n_batch));
 
     for (int i = 0; i < n_tokens; i += n_batch) {
         int n = std::min(n_tokens - i, n_batch);
         bool is_last_chunk = (i + n >= n_tokens);
 
-        llama_batch batch = llama_batch_init(n, 0, 1);
         batch.n_tokens = n;
 
         for (int j = 0; j < n; j++) {
@@ -722,7 +722,6 @@ prefill(
         }
 
         int ret = llama_decode(ctx->ctx, batch);
-        llama_batch_free(batch);
 
         if (ret != 0) {
             return fine::Error(std::string("prefill decode failed with code: " + std::to_string(ret)));
@@ -816,7 +815,7 @@ decode_token(
     int64_t pos,
     int64_t seq_id)
 {
-    llama_batch batch = llama_batch_init(1, 0, 1);
+    llama_batch& batch = ctx->reserve_batch(1);
     batch.n_tokens     = 1;
     batch.token[0]     = static_cast<llama_token>(token_id);
     batch.pos[0]       = static_cast<llama_pos>(pos);
@@ -825,7 +824,6 @@ decode_token(
     batch.logits[0]    = true;
 
     int ret = llama_decode(ctx->ctx, batch);
-    llama_batch_free(batch);
 
     if (ret != 0) {
         return fine::Error(std::string("decode_token failed with code: " + std::to_string(ret)));
@@ -848,7 +846,7 @@ batch_eval(
         return fine::Error(std::string("empty entries list"));
     }
 
-    llama_batch batch = llama_batch_init(n, 0, 1);
+    llama_batch& batch = ctx->reserve_batch(n);
     batch.n_tokens = n;
 
     for (int i = 0; i < n; i++) {
@@ -861,7 +859,6 @@ batch_eval(
     }
 
     int ret = llama_decode(ctx->ctx, batch);
-    llama_batch_free(batch);
 
     if (ret != 0) {
         return fine::Error(std::string("batch_eval failed with code: " + std::to_string(ret)));
@@ -901,11 +898,11 @@ static int bes_decode_range(
     size_t& purge_idx,
     std::vector<int64_t>& purged,
     int64_t& n_splits,
-    std::vector<std::tuple<int64_t, int64_t, std::string, bool>>& results)
+    std::vector<std::tuple<int64_t, int64_t, std::string, bool>>& results,
+    llama_batch& batch) // reserved by the caller for >= entries.size() tokens
 {
     size_t n = end - begin;
 
-    llama_batch batch = llama_batch_init(static_cast<int32_t>(n), 0, 1);
     batch.n_tokens = static_cast<int32_t>(n);
 
     for (size_t i = 0; i < n; i++) {
@@ -926,8 +923,6 @@ static int bes_decode_range(
         purged.push_back(victim);
         ret = llama_decode(ctx, batch);
     }
-
-    llama_batch_free(batch);
 
     if (ret == 0) {
         // Sample now: these logits belong to THIS decode call and the next
@@ -975,10 +970,10 @@ static int bes_decode_range(
         n_splits++;
         size_t mid = begin + n / 2;
         int rc = bes_decode_range(ctx, vocab, entries, begin, mid, samplers,
-                                  purgeable, purge_idx, purged, n_splits, results);
+                                  purgeable, purge_idx, purged, n_splits, results, batch);
         if (rc != 0) return rc;
         return bes_decode_range(ctx, vocab, entries, mid, end, samplers,
-                                purgeable, purge_idx, purged, n_splits, results);
+                                purgeable, purge_idx, purged, n_splits, results, batch);
     }
 
     return ret;
@@ -1015,9 +1010,11 @@ batch_eval_sample(
     int64_t n_splits = 0;
     size_t purge_idx = 0;
 
+    llama_batch& batch = ctx->reserve_batch(static_cast<int32_t>(entries.size()));
+
     int rc = bes_decode_range(ctx->ctx, vocab, entries, 0, entries.size(),
                               smpls, purgeable_seq_ids, purge_idx, purged,
-                              n_splits, results);
+                              n_splits, results, batch);
 
     if (rc == 1) {
         return fine::Error(std::string("kv_pressure"));
