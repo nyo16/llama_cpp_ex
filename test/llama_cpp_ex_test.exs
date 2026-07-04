@@ -209,7 +209,7 @@ defmodule LlamaCppExTest do
         text = "Hello, world!"
         {:ok, tokens} = LlamaCppEx.Tokenizer.encode(model, text, add_special: false)
         assert is_list(tokens)
-        assert length(tokens) > 0
+        assert tokens != []
 
         {:ok, decoded} = LlamaCppEx.Tokenizer.decode(model, tokens)
         assert decoded == text
@@ -259,7 +259,7 @@ defmodule LlamaCppExTest do
       end
 
       test "generate is deterministic with same seed", %{model: model} do
-        opts = [max_tokens: 16, seed: 12345, temp: 0.0]
+        opts = [max_tokens: 16, seed: 12_345, temp: 0.0]
         {:ok, text1} = LlamaCppEx.generate(model, "The answer is", opts)
         {:ok, text2} = LlamaCppEx.generate(model, "The answer is", opts)
         assert text1 == text2
@@ -279,7 +279,7 @@ defmodule LlamaCppExTest do
           |> LlamaCppEx.stream("Once upon a time", max_tokens: 16, seed: 42)
           |> Enum.to_list()
 
-        assert length(chunks) > 0
+        assert chunks != []
         assert Enum.all?(chunks, &is_binary/1)
 
         text = Enum.join(chunks)
@@ -389,7 +389,7 @@ defmodule LlamaCppExTest do
             )
             |> Enum.to_list()
 
-          assert length(chunks) > 0
+          assert chunks != []
         end
       end
 
@@ -710,7 +710,7 @@ defmodule LlamaCppExTest do
           LlamaCppEx.Server.stream(server, "Hello", max_tokens: 8)
           |> Enum.to_list()
 
-        assert length(chunks) > 0
+        assert chunks != []
         assert Enum.all?(chunks, &is_binary/1)
       end
 
@@ -896,7 +896,7 @@ defmodule LlamaCppExTest do
       test "embed single text", %{model: model} do
         {:ok, embedding} = LlamaCppEx.embed(model, "Hello world")
         assert is_list(embedding)
-        assert length(embedding) > 0
+        assert embedding != []
         assert Enum.all?(embedding, &is_float/1)
       end
 
@@ -958,7 +958,7 @@ defmodule LlamaCppExTest do
       test "embed with pooling_type option", %{model: model} do
         {:ok, embedding} = LlamaCppEx.embed(model, "Test", pooling_type: :last)
         assert is_list(embedding)
-        assert length(embedding) > 0
+        assert embedding != []
       end
     end
   else
@@ -981,10 +981,11 @@ defmodule LlamaCppExTest do
         %{model: model, mtp: mtp}
       end
 
-      test "draft context exposes rollback capacity", %{mtp: mtp} do
-        # n_rs_seq on the MTP draft ctx should be at least the configured n_draft;
-        # the default target ctx should report 0 (no rollback).
-        assert LlamaCppEx.Context.n_rs_seq(mtp.mtp_ctx) >= mtp.n_draft
+      test "contexts use no recurrent-state rollback slots", %{mtp: mtp} do
+        # Matching upstream server, the draft ctx is created with n_rs_seq=0 —
+        # MTP rolls back via cached hidden states (pending_h / verify_h), not
+        # recurrent-state snapshots. Both contexts report 0.
+        assert LlamaCppEx.Context.n_rs_seq(mtp.mtp_ctx) == 0
         assert LlamaCppEx.Context.n_rs_seq(mtp.main_ctx) == 0
       end
 

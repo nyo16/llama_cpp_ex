@@ -89,9 +89,7 @@ defmodule LlamaCppEx.MTP do
   def init(%Model{} = model, opts \\ []) do
     n_draft = Keyword.get(opts, :n_draft, 3)
 
-    if not (is_integer(n_draft) and n_draft > 0) do
-      {:error, ":n_draft must be a positive integer"}
-    else
+    if is_integer(n_draft) and n_draft > 0 do
       base_ctx_opts = Keyword.take(opts, @context_opt_keys)
       main_opts = Keyword.merge(base_ctx_opts, ctx_type: :default)
       # Match upstream server: MTP draft context is created with n_rs_seq=0.
@@ -111,6 +109,8 @@ defmodule LlamaCppEx.MTP do
            n_draft: n_draft
          }}
       end
+    else
+      {:error, ":n_draft must be a positive integer"}
     end
   end
 

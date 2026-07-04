@@ -28,16 +28,16 @@ defmodule LlamaCppEx do
   """
 
   alias LlamaCppEx.{
-    Model,
-    Context,
-    Sampler,
-    Tokenizer,
     Chat,
-    Embedding,
-    Grammar,
     ChatCompletion,
     ChatCompletionChunk,
-    Thinking
+    Context,
+    Embedding,
+    Grammar,
+    Model,
+    Sampler,
+    Thinking,
+    Tokenizer
   }
 
   @context_opt_keys [
@@ -62,6 +62,24 @@ defmodule LlamaCppEx do
     :no_perf,
     :swa_full
   ]
+
+  # Sampling options forwarded to Sampler.create/2 by the generation entry
+  # points. Keep in sync with the options documented on generate/3.
+  @sampler_opt_keys [
+    :seed,
+    :temp,
+    :top_k,
+    :top_p,
+    :min_p,
+    :penalty_repeat,
+    :penalty_freq,
+    :penalty_present,
+    :grammar,
+    :grammar_root
+  ]
+
+  # Chat-templating options split off before the rest flows to generation.
+  @chat_opt_keys [:add_assistant, :enable_thinking, :chat_template_kwargs]
 
   @doc """
   Initializes the llama.cpp backend. Call once at application start.
@@ -170,38 +188,11 @@ defmodule LlamaCppEx do
   """
   @spec generate(Model.t(), String.t(), keyword()) :: {:ok, String.t()} | {:error, String.t()}
   def generate(%Model{} = model, prompt, opts \\ []) when is_binary(prompt) do
-    opts = resolve_grammar_opts(opts)
-    max_tokens = Keyword.get(opts, :max_tokens, 256)
-    n_ctx = Keyword.get(opts, :n_ctx, 2048)
-
-    sampler_opts =
-      Keyword.take(opts, [
-        :seed,
-        :temp,
-        :top_k,
-        :top_p,
-        :min_p,
-        :penalty_repeat,
-        :penalty_freq,
-        :penalty_present,
-        :grammar,
-        :grammar_root
-      ])
-
-    # Tokenize prompt
+    cfg = opts |> resolve_grammar_opts() |> gen_config()
     {:ok, tokens} = Tokenizer.encode(model, prompt)
 
-    # Ensure context is large enough for prompt + generation
-    ctx_size = max(n_ctx, length(tokens) + max_tokens)
-
-    ctx_opts =
-      opts
-      |> Keyword.take([:n_threads, :n_threads_batch, :n_batch, :n_ubatch])
-      |> Keyword.put(:n_ctx, ctx_size)
-
-    with {:ok, ctx} <- Context.create(model, ctx_opts),
-         {:ok, sampler} <- Sampler.create(model, sampler_opts) do
-      Context.generate(ctx, sampler, tokens, max_tokens: max_tokens)
+    with {:ok, ctx, sampler} <- create_gen_resources(model, tokens, cfg) do
+      Context.generate(ctx, sampler, tokens, max_tokens: cfg.max_tokens)
     end
   end
 
@@ -222,70 +213,73 @@ defmodule LlamaCppEx do
   """
   @spec stream(Model.t(), String.t(), keyword()) :: Enumerable.t()
   def stream(%Model{} = model, prompt, opts \\ []) when is_binary(prompt) do
-    opts = resolve_grammar_opts(opts)
-    max_tokens = Keyword.get(opts, :max_tokens, 256)
-    n_ctx = Keyword.get(opts, :n_ctx, 2048)
-    timeout = Keyword.get(opts, :timeout, 60_000)
-
-    sampler_opts =
-      Keyword.take(opts, [
-        :seed,
-        :temp,
-        :top_k,
-        :top_p,
-        :min_p,
-        :penalty_repeat,
-        :penalty_freq,
-        :penalty_present,
-        :grammar,
-        :grammar_root
-      ])
-
-    ctx_opts =
-      Keyword.take(opts, @context_opt_keys)
+    cfg = opts |> resolve_grammar_opts() |> gen_config()
 
     Stream.resource(
       fn ->
         # Start: tokenize, create context+sampler, spawn generator
         {:ok, tokens} = Tokenizer.encode(model, prompt)
-        ctx_size = max(n_ctx, length(tokens) + max_tokens)
-        {:ok, ctx} = Context.create(model, Keyword.put(ctx_opts, :n_ctx, ctx_size))
-        {:ok, sampler} = Sampler.create(model, sampler_opts)
-
-        ref = make_ref()
-        parent = self()
-
-        gen_pid =
-          spawn_link(fn ->
-            LlamaCppEx.NIF.generate_tokens(
-              ctx.ref,
-              sampler.ref,
-              tokens,
-              max_tokens,
-              parent,
-              ref
-            )
-          end)
-
-        {ref, gen_pid, timeout}
+        {:ok, ctx, sampler} = create_gen_resources(model, tokens, cfg)
+        {ref, gen_pid} = spawn_generator(ctx, sampler, tokens, cfg.max_tokens)
+        {ref, gen_pid, cfg.timeout}
       end,
       fn {ref, _gen_pid, timeout} = state ->
         receive do
           {^ref, {:token, _id, text}} -> {[text], state}
-          {^ref, :eog} -> {:halt, state}
-          {^ref, :done} -> {:halt, state}
+          {^ref, outcome} when outcome in [:eog, :done] -> {:halt, state}
           {^ref, {:error, _reason}} -> {:halt, state}
         after
           timeout -> {:halt, state}
         end
       end,
-      fn {ref, gen_pid, _timeout} ->
-        # Kill generator if still running, flush remaining messages
-        Process.unlink(gen_pid)
-        Process.exit(gen_pid, :kill)
-        flush_stream_messages(ref)
-      end
+      fn {ref, gen_pid, _timeout} -> stop_generator(ref, gen_pid) end
     )
+  end
+
+  # --- Shared generation plumbing ---
+
+  # Option handling shared by the generation entry points.
+  defp gen_config(opts) do
+    %{
+      max_tokens: Keyword.get(opts, :max_tokens, 256),
+      n_ctx: Keyword.get(opts, :n_ctx, 2048),
+      timeout: Keyword.get(opts, :timeout, 60_000),
+      sampler_opts: Keyword.take(opts, @sampler_opt_keys),
+      ctx_opts: Keyword.take(opts, @context_opt_keys)
+    }
+  end
+
+  defp split_chat_opts(opts), do: Keyword.split(opts, @chat_opt_keys)
+
+  # Creates a context sized to fit prompt + generation, plus its sampler.
+  defp create_gen_resources(model, tokens, cfg) do
+    ctx_size = max(cfg.n_ctx, length(tokens) + cfg.max_tokens)
+
+    with {:ok, ctx} <- Context.create(model, Keyword.put(cfg.ctx_opts, :n_ctx, ctx_size)),
+         {:ok, sampler} <- Sampler.create(model, cfg.sampler_opts) do
+      {:ok, ctx, sampler}
+    end
+  end
+
+  # Runs the NIF token generator in a linked process that sends
+  # {ref, {:token, id, text} | :eog | :done | {:error, reason}} to the caller.
+  defp spawn_generator(ctx, sampler, tokens, max_tokens) do
+    ref = make_ref()
+    parent = self()
+
+    gen_pid =
+      spawn_link(fn ->
+        LlamaCppEx.NIF.generate_tokens(ctx.ref, sampler.ref, tokens, max_tokens, parent, ref)
+      end)
+
+    {ref, gen_pid}
+  end
+
+  # Kills a generator (if still running) and drains its remaining messages.
+  defp stop_generator(ref, gen_pid) do
+    Process.unlink(gen_pid)
+    Process.exit(gen_pid, :kill)
+    flush_stream_messages(ref)
   end
 
   defp flush_stream_messages(ref) do
@@ -295,6 +289,10 @@ defmodule LlamaCppEx do
       0 -> :ok
     end
   end
+
+  # OpenAI-style finish_reason for a generator outcome message.
+  defp finish_reason(:eog), do: "stop"
+  defp finish_reason(:done), do: "length"
 
   @doc """
   Applies the chat template and generates a response.
@@ -315,11 +313,7 @@ defmodule LlamaCppEx do
   """
   @spec chat(Model.t(), [Chat.message()], keyword()) :: {:ok, String.t()} | {:error, String.t()}
   def chat(%Model{} = model, messages, opts \\ []) when is_list(messages) do
-    opts = resolve_grammar_opts(opts)
-
-    {chat_opts, gen_opts} =
-      Keyword.split(opts, [:add_assistant, :enable_thinking, :chat_template_kwargs])
-
+    {chat_opts, gen_opts} = opts |> resolve_grammar_opts() |> split_chat_opts()
     {:ok, prompt} = Chat.apply_template(model, messages, chat_opts)
     generate(model, prompt, gen_opts)
   end
@@ -332,11 +326,7 @@ defmodule LlamaCppEx do
   """
   @spec stream_chat(Model.t(), [Chat.message()], keyword()) :: Enumerable.t()
   def stream_chat(%Model{} = model, messages, opts \\ []) when is_list(messages) do
-    opts = resolve_grammar_opts(opts)
-
-    {chat_opts, gen_opts} =
-      Keyword.split(opts, [:add_assistant, :enable_thinking, :chat_template_kwargs])
-
+    {chat_opts, gen_opts} = opts |> resolve_grammar_opts() |> split_chat_opts()
     {:ok, prompt} = Chat.apply_template(model, messages, chat_opts)
     stream(model, prompt, gen_opts)
   end
@@ -365,53 +355,19 @@ defmodule LlamaCppEx do
   @spec chat_completion(Model.t(), [Chat.message()], keyword()) ::
           {:ok, ChatCompletion.t()} | {:error, term()}
   def chat_completion(%Model{} = model, messages, opts \\ []) when is_list(messages) do
-    opts = resolve_grammar_opts(opts)
-
-    {chat_opts, gen_opts} =
-      Keyword.split(opts, [:add_assistant, :enable_thinking, :chat_template_kwargs])
-
-    max_tokens = Keyword.get(gen_opts, :max_tokens, 256)
-    n_ctx = Keyword.get(gen_opts, :n_ctx, 2048)
-    timeout = Keyword.get(gen_opts, :timeout, 60_000)
-
-    sampler_opts =
-      Keyword.take(gen_opts, [
-        :seed,
-        :temp,
-        :top_k,
-        :top_p,
-        :min_p,
-        :penalty_repeat,
-        :penalty_freq,
-        :penalty_present,
-        :grammar,
-        :grammar_root
-      ])
-
-    ctx_opts =
-      Keyword.take(gen_opts, @context_opt_keys)
+    {chat_opts, gen_opts} = opts |> resolve_grammar_opts() |> split_chat_opts()
+    cfg = gen_config(gen_opts)
 
     with {:ok, prompt} <- Chat.apply_template(model, messages, chat_opts),
          {:ok, prompt_tokens} <- Tokenizer.encode(model, prompt) do
-      ctx_size = max(n_ctx, length(prompt_tokens) + max_tokens)
-      {:ok, ctx} = Context.create(model, Keyword.put(ctx_opts, :n_ctx, ctx_size))
-      {:ok, sampler} = Sampler.create(model, sampler_opts)
+      {:ok, ctx, sampler} = create_gen_resources(model, prompt_tokens, cfg)
+      {ref, gen_pid} = spawn_generator(ctx, sampler, prompt_tokens, cfg.max_tokens)
 
-      ref = make_ref()
-      parent = self()
+      {texts, finish_reason, completion_tokens} = collect_completion_tokens(ref, cfg.timeout)
 
-      spawn_link(fn ->
-        LlamaCppEx.NIF.generate_tokens(
-          ctx.ref,
-          sampler.ref,
-          prompt_tokens,
-          max_tokens,
-          parent,
-          ref
-        )
-      end)
-
-      {texts, finish_reason, completion_tokens} = collect_completion_tokens(ref, timeout)
+      # On timeout the generator may still be running — kill it and drain any
+      # stragglers so they don't pollute the caller's mailbox.
+      stop_generator(ref, gen_pid)
 
       raw_text = Enum.join(texts)
       enable_thinking = Keyword.get(chat_opts, :enable_thinking, false)
@@ -475,68 +431,25 @@ defmodule LlamaCppEx do
   """
   @spec stream_chat_completion(Model.t(), [Chat.message()], keyword()) :: Enumerable.t()
   def stream_chat_completion(%Model{} = model, messages, opts \\ []) when is_list(messages) do
-    opts = resolve_grammar_opts(opts)
-
-    {chat_opts, gen_opts} =
-      Keyword.split(opts, [:add_assistant, :enable_thinking, :chat_template_kwargs])
-
-    max_tokens = Keyword.get(gen_opts, :max_tokens, 256)
-    n_ctx = Keyword.get(gen_opts, :n_ctx, 2048)
-    timeout = Keyword.get(gen_opts, :timeout, 60_000)
-
-    sampler_opts =
-      Keyword.take(gen_opts, [
-        :seed,
-        :temp,
-        :top_k,
-        :top_p,
-        :min_p,
-        :penalty_repeat,
-        :penalty_freq,
-        :penalty_present,
-        :grammar,
-        :grammar_root
-      ])
-
-    ctx_opts =
-      Keyword.take(gen_opts, @context_opt_keys)
+    {chat_opts, gen_opts} = opts |> resolve_grammar_opts() |> split_chat_opts()
+    cfg = gen_config(gen_opts)
 
     Stream.resource(
       fn ->
         {:ok, prompt} = Chat.apply_template(model, messages, chat_opts)
         {:ok, tokens} = Tokenizer.encode(model, prompt)
-        ctx_size = max(n_ctx, length(tokens) + max_tokens)
-        {:ok, ctx} = Context.create(model, Keyword.put(ctx_opts, :n_ctx, ctx_size))
-        {:ok, sampler} = Sampler.create(model, sampler_opts)
-
-        id = "chatcmpl-" <> random_hex(12)
-        created = System.os_time(:second)
-        model_name = Model.desc(model)
-
-        ref = make_ref()
-        parent = self()
-
-        gen_pid =
-          spawn_link(fn ->
-            LlamaCppEx.NIF.generate_tokens(
-              ctx.ref,
-              sampler.ref,
-              tokens,
-              max_tokens,
-              parent,
-              ref
-            )
-          end)
+        {:ok, ctx, sampler} = create_gen_resources(model, tokens, cfg)
+        {ref, gen_pid} = spawn_generator(ctx, sampler, tokens, cfg.max_tokens)
 
         enable_thinking = Keyword.get(chat_opts, :enable_thinking, false)
 
         %{
           ref: ref,
           gen_pid: gen_pid,
-          timeout: timeout,
-          id: id,
-          created: created,
-          model: model_name,
+          timeout: cfg.timeout,
+          id: "chatcmpl-" <> random_hex(12),
+          created: System.os_time(:second),
+          model: Model.desc(model),
           phase: :first,
           enable_thinking: enable_thinking,
           thinking_parser:
@@ -545,80 +458,15 @@ defmodule LlamaCppEx do
       end,
       fn
         %{phase: :first} = state ->
-          chunk = %ChatCompletionChunk{
-            id: state.id,
-            object: "chat.completion.chunk",
-            created: state.created,
-            model: state.model,
-            choices: [%{index: 0, delta: %{role: "assistant", content: ""}, finish_reason: nil}]
-          }
-
-          {[chunk], %{state | phase: :streaming}}
+          {[chunk(state, %{role: "assistant", content: ""}, nil)], %{state | phase: :streaming}}
 
         %{phase: :streaming, ref: ref, timeout: timeout} = state ->
           receive do
             {^ref, {:token, _id, text}} ->
-              if state.enable_thinking do
-                {events, new_parser} = Thinking.feed(state.thinking_parser, text)
-                state = %{state | thinking_parser: new_parser}
+              token_chunks(state, text)
 
-                chunks =
-                  Enum.map(events, fn
-                    {:thinking, t} ->
-                      %ChatCompletionChunk{
-                        id: state.id,
-                        object: "chat.completion.chunk",
-                        created: state.created,
-                        model: state.model,
-                        choices: [
-                          %{index: 0, delta: %{reasoning_content: t}, finish_reason: nil}
-                        ]
-                      }
-
-                    {:content, t} ->
-                      %ChatCompletionChunk{
-                        id: state.id,
-                        object: "chat.completion.chunk",
-                        created: state.created,
-                        model: state.model,
-                        choices: [%{index: 0, delta: %{content: t}, finish_reason: nil}]
-                      }
-                  end)
-
-                {chunks, state}
-              else
-                chunk = %ChatCompletionChunk{
-                  id: state.id,
-                  object: "chat.completion.chunk",
-                  created: state.created,
-                  model: state.model,
-                  choices: [%{index: 0, delta: %{content: text}, finish_reason: nil}]
-                }
-
-                {[chunk], state}
-              end
-
-            {^ref, :eog} ->
-              final_chunk = %ChatCompletionChunk{
-                id: state.id,
-                object: "chat.completion.chunk",
-                created: state.created,
-                model: state.model,
-                choices: [%{index: 0, delta: %{}, finish_reason: "stop"}]
-              }
-
-              {[final_chunk], %{state | phase: :done}}
-
-            {^ref, :done} ->
-              final_chunk = %ChatCompletionChunk{
-                id: state.id,
-                object: "chat.completion.chunk",
-                created: state.created,
-                model: state.model,
-                choices: [%{index: 0, delta: %{}, finish_reason: "length"}]
-              }
-
-              {[final_chunk], %{state | phase: :done}}
+            {^ref, outcome} when outcome in [:eog, :done] ->
+              {[chunk(state, %{}, finish_reason(outcome))], %{state | phase: :done}}
 
             {^ref, {:error, _reason}} ->
               {:halt, state}
@@ -629,12 +477,37 @@ defmodule LlamaCppEx do
         %{phase: :done} = state ->
           {:halt, state}
       end,
-      fn %{ref: ref, gen_pid: gen_pid} ->
-        Process.unlink(gen_pid)
-        Process.exit(gen_pid, :kill)
-        flush_stream_messages(ref)
-      end
+      fn %{ref: ref, gen_pid: gen_pid} -> stop_generator(ref, gen_pid) end
     )
+  end
+
+  # Emits the chunk(s) for one generated token, routing through the thinking
+  # parser when enabled (one token can yield reasoning and content chunks).
+  defp token_chunks(%{enable_thinking: true} = state, text) do
+    {events, new_parser} = Thinking.feed(state.thinking_parser, text)
+    state = %{state | thinking_parser: new_parser}
+
+    chunks =
+      Enum.map(events, fn
+        {:thinking, t} -> chunk(state, %{reasoning_content: t}, nil)
+        {:content, t} -> chunk(state, %{content: t}, nil)
+      end)
+
+    {chunks, state}
+  end
+
+  defp token_chunks(state, text) do
+    {[chunk(state, %{content: text}, nil)], state}
+  end
+
+  defp chunk(state, delta, finish_reason) do
+    %ChatCompletionChunk{
+      id: state.id,
+      object: "chat.completion.chunk",
+      created: state.created,
+      model: state.model,
+      choices: [%{index: 0, delta: delta, finish_reason: finish_reason}]
+    }
   end
 
   defp collect_completion_tokens(ref, timeout) do
@@ -646,11 +519,8 @@ defmodule LlamaCppEx do
       {^ref, {:token, _id, text}} ->
         collect_completion_tokens(ref, timeout, [text | texts], count + 1)
 
-      {^ref, :eog} ->
-        {Enum.reverse(texts), "stop", count}
-
-      {^ref, :done} ->
-        {Enum.reverse(texts), "length", count}
+      {^ref, outcome} when outcome in [:eog, :done] ->
+        {Enum.reverse(texts), finish_reason(outcome), count}
 
       {^ref, {:error, _reason}} ->
         {Enum.reverse(texts), "stop", count}

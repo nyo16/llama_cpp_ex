@@ -103,7 +103,7 @@ defmodule LlamaCppEx.Server do
 
   require Logger
 
-  alias LlamaCppEx.{Model, Context, Sampler, Tokenizer}
+  alias LlamaCppEx.{Context, Model, Sampler, Tokenizer}
 
   defstruct [
     :model,
@@ -371,33 +371,7 @@ defmodule LlamaCppEx.Server do
     slots =
       for seq_id <- 0..(n_parallel - 1), into: %{} do
         {:ok, sampler} = Sampler.create(model, sampler_opts)
-
-        slot = %{
-          state: :idle,
-          sampler: sampler,
-          from: nil,
-          stream_pid: nil,
-          stream_ref: nil,
-          prompt_tokens: [],
-          prompt_tokens_tuple: {},
-          prefill_pos: 0,
-          pos: 0,
-          pending_token: nil,
-          batch_idx: -1,
-          tokens_generated: 0,
-          max_tokens: 0,
-          accumulated_pieces: [],
-          t_start: nil,
-          t_first_token: nil,
-          n_prompt_tokens: 0,
-          # Prefix cache fields
-          cached_tokens: [],
-          cached_pos: 0,
-          generated_token_ids: [],
-          n_prefix_cache_tokens: 0
-        }
-
-        {seq_id, slot}
+        {seq_id, Map.put(idle_slot_fields([], 0), :sampler, sampler)}
       end
 
     state = %__MODULE__{
@@ -666,50 +640,63 @@ defmodule LlamaCppEx.Server do
     if entries == [] do
       state
     else
-      # Count decode tokens before sampling (slots may transition after)
-      n_decode =
-        Enum.count(state.slots, fn {_id, s} ->
-          s.state == :generating and s.batch_idx >= 0
-        end)
-
-      # Phase 3: Forward pass
-      tick_start = System.monotonic_time()
-
-      case LlamaCppEx.NIF.batch_eval(state.ctx.ref, entries) do
-        :ok ->
-          tick_end = System.monotonic_time()
-
-          # Phase 4: Sample
-          state = sample_generating_slots(state)
-          state = sample_completed_prefills(state)
-          state = advance_incomplete_prefills(state)
-
-          # Emit tick telemetry
-          :telemetry.execute(
-            [:llama_cpp_ex, :server, :tick],
-            %{
-              batch_size: length(entries),
-              decode_tokens: n_decode,
-              prefill_tokens: length(entries) - n_decode,
-              active_slots: Enum.count(state.slots, fn {_id, s} -> s.state != :idle end),
-              queue_depth: :queue.len(state.queue),
-              eval_ms: (tick_end - tick_start) / 1_000_000
-            },
-            %{server: self()}
-          )
-
-          # Phase 5: Continue
-          if Enum.any?(state.slots, fn {_id, slot} -> slot.state != :idle end) do
-            maybe_schedule_tick(state)
-          else
-            state
-          end
-
-        {:error, reason} ->
-          Logger.error("batch forward pass failed: #{reason}")
-          fail_all_active_slots(state, reason)
-      end
+      run_forward_pass(state, entries)
     end
+  end
+
+  # Phases 3-5: forward pass, sampling, telemetry, and continuation
+  defp run_forward_pass(state, entries) do
+    # Count decode tokens before sampling (slots may transition after)
+    n_decode =
+      Enum.count(state.slots, fn {_id, s} ->
+        s.state == :generating and s.batch_idx >= 0
+      end)
+
+    # Phase 3: Forward pass
+    tick_start = System.monotonic_time()
+
+    case LlamaCppEx.NIF.batch_eval(state.ctx.ref, entries) do
+      :ok ->
+        tick_end = System.monotonic_time()
+
+        # Phase 4: Sample
+        state = sample_generating_slots(state)
+        state = sample_completed_prefills(state)
+        state = advance_incomplete_prefills(state)
+
+        emit_tick_telemetry(state, entries, n_decode, tick_end - tick_start)
+
+        # Phase 5: Continue
+        continue_if_active(state)
+
+      {:error, reason} ->
+        Logger.error("batch forward pass failed: #{reason}")
+        fail_all_active_slots(state, reason)
+    end
+  end
+
+  # Schedules the next tick while any slot is still active.
+  defp continue_if_active(state) do
+    if Enum.any?(state.slots, fn {_id, slot} -> slot.state != :idle end) do
+      maybe_schedule_tick(state)
+    else
+      state
+    end
+  end
+
+  defp emit_tick_telemetry(state, entries, n_decode, eval_native) do
+    :telemetry.execute(
+      [:llama_cpp_ex, :server, :tick],
+      %{
+        batch_size: length(entries),
+        decode_tokens: n_decode,
+        prefill_tokens: length(entries) - n_decode,
+        active_slots: Enum.count(state.slots, fn {_id, s} -> s.state != :idle end),
+        queue_depth: :queue.len(state.queue),
+        eval_ms: eval_native / 1_000_000
+      },
+      %{server: self()}
+    )
   end
 
   # Phase 1: Check generating slots for completion
@@ -856,59 +843,40 @@ defmodule LlamaCppEx.Server do
   end
 
   defp emit_request_done(slot, seq_id, t_end, stop_reason) do
-    duration_ns = t_end - slot.t_start
-    duration_ms = duration_ns / 1_000_000
-
-    ttft_ms =
-      if slot.t_first_token do
-        (slot.t_first_token - slot.t_start) / 1_000_000
-      else
-        duration_ms
-      end
-
-    gen_duration_s = (t_end - (slot.t_first_token || slot.t_start)) / 1_000_000_000
-    prompt_duration_s = ttft_ms / 1000
-
-    prompt_eval_rate =
-      if prompt_duration_s > 0, do: slot.n_prompt_tokens / prompt_duration_s, else: 0.0
-
-    generation_rate =
-      if gen_duration_s > 0, do: slot.tokens_generated / gen_duration_s, else: 0.0
-
-    mode = slot_mode(slot)
+    m = request_measurements(slot, t_end)
 
     Logger.debug(
-      "slot #{seq_id} done (#{stop_reason}): #{slot.n_prompt_tokens} prompt tokens (#{Float.round(prompt_eval_rate, 1)} t/s), " <>
-        "#{slot.tokens_generated} generated (#{Float.round(generation_rate, 1)} t/s), " <>
-        "ttft #{Float.round(ttft_ms, 1)}ms, total #{Float.round(duration_ms, 1)}ms"
+      "slot #{seq_id} done (#{stop_reason}): #{slot.n_prompt_tokens} prompt tokens (#{Float.round(m.prompt_eval_rate, 1)} t/s), " <>
+        "#{slot.tokens_generated} generated (#{Float.round(m.generation_rate, 1)} t/s), " <>
+        "ttft #{Float.round(m.ttft_ms, 1)}ms, total #{Float.round(m.duration_ms, 1)}ms"
     )
-
-    prefix_cache_ratio =
-      if slot.n_prompt_tokens > 0,
-        do: slot.n_prefix_cache_tokens / slot.n_prompt_tokens,
-        else: 0.0
 
     :telemetry.execute(
       [:llama_cpp_ex, :server, :request, :done],
-      %{
-        prompt_tokens: slot.n_prompt_tokens,
-        generated_tokens: slot.tokens_generated,
-        duration_ms: duration_ms,
-        ttft_ms: ttft_ms,
-        prompt_eval_rate: prompt_eval_rate,
-        generation_rate: generation_rate,
-        prefix_cache_tokens: slot.n_prefix_cache_tokens,
-        prefix_cache_ratio: prefix_cache_ratio
-      },
-      %{server: self(), seq_id: seq_id, mode: mode, stop_reason: stop_reason}
+      m,
+      %{server: self(), seq_id: seq_id, mode: slot_mode(slot), stop_reason: stop_reason}
     )
   end
 
   defp emit_request_exception(slot, seq_id, reason) do
-    # Mirror `:done`'s measurement shape so dashboards can aggregate them.
-    # Timings are best-effort: if generation never started, ttft/duration
-    # fall back to the wall time since slot acquisition.
-    t_end = System.monotonic_time()
+    # Mirrors `:done`'s measurement shape so dashboards can aggregate them.
+    :telemetry.execute(
+      [:llama_cpp_ex, :server, :request, :exception],
+      request_measurements(slot, System.monotonic_time()),
+      %{
+        server: self(),
+        seq_id: seq_id,
+        mode: slot_mode(slot),
+        stop_reason: :error,
+        reason: reason
+      }
+    )
+  end
+
+  # Shared measurements for the :done / :exception request events. Timings are
+  # best-effort: if generation never started, ttft/duration fall back to the
+  # wall time since slot acquisition.
+  defp request_measurements(slot, t_end) do
     t_start = slot.t_start || t_end
     duration_ms = (t_end - t_start) / 1_000_000
 
@@ -929,26 +897,16 @@ defmodule LlamaCppEx.Server do
         do: slot.n_prefix_cache_tokens / slot.n_prompt_tokens,
         else: 0.0
 
-    :telemetry.execute(
-      [:llama_cpp_ex, :server, :request, :exception],
-      %{
-        prompt_tokens: slot.n_prompt_tokens,
-        generated_tokens: slot.tokens_generated,
-        duration_ms: duration_ms,
-        ttft_ms: ttft_ms,
-        prompt_eval_rate: prompt_eval_rate,
-        generation_rate: generation_rate,
-        prefix_cache_tokens: slot.n_prefix_cache_tokens,
-        prefix_cache_ratio: prefix_cache_ratio
-      },
-      %{
-        server: self(),
-        seq_id: seq_id,
-        mode: slot_mode(slot),
-        stop_reason: :error,
-        reason: reason
-      }
-    )
+    %{
+      prompt_tokens: slot.n_prompt_tokens,
+      generated_tokens: slot.tokens_generated,
+      duration_ms: duration_ms,
+      ttft_ms: ttft_ms,
+      prompt_eval_rate: prompt_eval_rate,
+      generation_rate: generation_rate,
+      prefix_cache_tokens: slot.n_prefix_cache_tokens,
+      prefix_cache_ratio: prefix_cache_ratio
+    }
   end
 
   defp reset_slot(state, seq_id) do
@@ -965,31 +923,39 @@ defmodule LlamaCppEx.Server do
         {[], 0}
       end
 
-    slot = %{
-      slot
-      | state: :idle,
-        from: nil,
-        stream_pid: nil,
-        stream_ref: nil,
-        prompt_tokens: [],
-        prompt_tokens_tuple: {},
-        prefill_pos: 0,
-        pos: 0,
-        pending_token: nil,
-        batch_idx: -1,
-        tokens_generated: 0,
-        max_tokens: 0,
-        accumulated_pieces: [],
-        t_start: nil,
-        t_first_token: nil,
-        n_prompt_tokens: 0,
-        cached_tokens: cached_tokens,
-        cached_pos: cached_pos,
-        generated_token_ids: [],
-        n_prefix_cache_tokens: 0
-    }
+    slot = Map.merge(slot, idle_slot_fields(cached_tokens, cached_pos))
 
     put_in(state.slots[seq_id], slot)
+  end
+
+  # The single source of truth for a slot's per-request fields. init/1,
+  # reset_slot/2, and fail_all_active_slots/2 all build from this map, so a
+  # new slot field cannot silently carry stale data across requests. The
+  # prefix-cache carry-over is the only caller-controlled part; :sampler is
+  # the only field that lives outside it.
+  defp idle_slot_fields(cached_tokens, cached_pos) do
+    %{
+      state: :idle,
+      from: nil,
+      stream_pid: nil,
+      stream_ref: nil,
+      prompt_tokens: [],
+      prompt_tokens_tuple: {},
+      prefill_pos: 0,
+      pos: 0,
+      pending_token: nil,
+      batch_idx: -1,
+      tokens_generated: 0,
+      max_tokens: 0,
+      accumulated_pieces: [],
+      t_start: nil,
+      t_first_token: nil,
+      n_prompt_tokens: 0,
+      cached_tokens: cached_tokens,
+      cached_pos: cached_pos,
+      generated_token_ids: [],
+      n_prefix_cache_tokens: 0
+    }
   end
 
   # Builds the final completion string from the reverse-ordered piece list.
@@ -1016,31 +982,7 @@ defmodule LlamaCppEx.Server do
       LlamaCppEx.NIF.memory_seq_rm(state.ctx.ref, seq_id, 0, -1)
       Sampler.reset(slot.sampler)
 
-      slot = %{
-        slot
-        | state: :idle,
-          from: nil,
-          stream_pid: nil,
-          stream_ref: nil,
-          prompt_tokens: [],
-          prompt_tokens_tuple: {},
-          prefill_pos: 0,
-          pos: 0,
-          pending_token: nil,
-          batch_idx: -1,
-          tokens_generated: 0,
-          max_tokens: 0,
-          accumulated_pieces: [],
-          t_start: nil,
-          t_first_token: nil,
-          n_prompt_tokens: 0,
-          cached_tokens: [],
-          cached_pos: 0,
-          generated_token_ids: [],
-          n_prefix_cache_tokens: 0
-      }
-
-      put_in(state.slots[seq_id], slot)
+      put_in(state.slots[seq_id], Map.merge(slot, idle_slot_fields([], 0)))
     end)
   end
 
