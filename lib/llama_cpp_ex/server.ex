@@ -674,12 +674,13 @@ defmodule LlamaCppEx.Server do
     tick_start = System.monotonic_time()
 
     case LlamaCppEx.NIF.batch_eval_sample(state.ctx.ref, entries, samplers, purgeable) do
-      {:ok, results, purged, n_splits} ->
+      {:ok, results, purged, n_splits, failed} ->
         tick_end = System.monotonic_time()
 
         # Phase 4: Apply sampled results, stream pieces, clear tick markers
         state = handle_kv_pressure(state, purged, n_splits)
         state = apply_sample_results(state, results)
+        state = fail_overflowed_slots(state, failed)
         state = clear_batch_indices(state)
 
         emit_tick_telemetry(state, entries, n_decode, tick_end - tick_start)
@@ -691,6 +692,38 @@ defmodule LlamaCppEx.Server do
         Logger.error("batch forward pass failed: #{reason}")
         fail_all_active_slots(state, reason)
     end
+  end
+
+  # Sequences that could not fit a single further token even after purging and
+  # batch splitting — their KV budget is exhausted. Fail just those requests
+  # with a clean error; other slots keep generating.
+  defp fail_overflowed_slots(state, []), do: state
+
+  defp fail_overflowed_slots(state, failed) do
+    Enum.reduce(failed, state, fn seq_id, state ->
+      Logger.warning("LlamaCppEx.Server: slot #{seq_id} out of context — failing request")
+      fail_slot(state, seq_id, :context_full)
+    end)
+  end
+
+  defp fail_slot(state, seq_id, reason) do
+    slot = state.slots[seq_id]
+
+    if slot.from do
+      GenServer.reply(slot.from, {:error, reason})
+    end
+
+    if slot.stream_pid && slot.stream_ref do
+      send(slot.stream_pid, {slot.stream_ref, {:error, reason}})
+    end
+
+    emit_request_exception(slot, seq_id, reason)
+
+    # Clear KV cache and reset — don't preserve cache on error
+    LlamaCppEx.NIF.memory_seq_rm(state.ctx.ref, seq_id, 0, -1)
+    Sampler.reset(slot.sampler)
+
+    put_in(state.slots[seq_id], Map.merge(slot, idle_slot_fields([], 0)))
   end
 
   # Samplers for all active slots, keyed by seq_id — the NIF samples every

@@ -884,9 +884,12 @@ FINE_NIF(batch_eval, ERL_NIF_DIRTY_JOB_CPU_BOUND);
 // retrying after each purge; once the purge list is exhausted, recursively
 // halve the batch — each half's logits entries are sampled right after its
 // sub-decode, before the next decode invalidates the logits buffer. A
-// single-token batch that still fails is a hard error. Purged seq ids and the
-// split count are returned so the caller can fix up its cache bookkeeping and
-// emit telemetry. Purgeable seqs must not have entries in the batch.
+// single-token batch that still fails means THAT sequence is out of KV
+// budget: it is added to `failed` and skipped for the rest of the call so the
+// other sequences keep going (the caller fails just that request). Purged and
+// failed seq ids plus the split count are returned so the caller can fix up
+// its bookkeeping and emit telemetry. Purgeable seqs must not have entries in
+// the batch.
 
 static int bes_decode_range(
     llama_context* ctx,
@@ -898,15 +901,30 @@ static int bes_decode_range(
     size_t& purge_idx,
     std::vector<int64_t>& purged,
     int64_t& n_splits,
+    std::vector<int64_t>& failed,
     std::vector<std::tuple<int64_t, int64_t, std::string, bool>>& results,
     llama_batch& batch) // reserved by the caller for >= entries.size() tokens
 {
-    size_t n = end - begin;
+    // Skip entries whose sequence already failed this call — decoding past a
+    // failed (missing) position would leave a hole in that sequence's KV.
+    std::vector<size_t> idxs;
+    idxs.reserve(end - begin);
+    for (size_t i = begin; i < end; i++) {
+        int64_t seq_id = std::get<2>(entries[i]);
+        if (std::find(failed.begin(), failed.end(), seq_id) == failed.end()) {
+            idxs.push_back(i);
+        }
+    }
+
+    size_t n = idxs.size();
+    if (n == 0) {
+        return 0;
+    }
 
     batch.n_tokens = static_cast<int32_t>(n);
 
     for (size_t i = 0; i < n; i++) {
-        const auto& [token_id, pos, seq_id, logits] = entries[begin + i];
+        const auto& [token_id, pos, seq_id, logits] = entries[idxs[i]];
         batch.token[i]      = static_cast<llama_token>(token_id);
         batch.pos[i]        = static_cast<llama_pos>(pos);
         batch.n_seq_id[i]   = 1;
@@ -928,7 +946,7 @@ static int bes_decode_range(
         // Sample now: these logits belong to THIS decode call and the next
         // sub-decode would overwrite them.
         for (size_t i = 0; i < n; i++) {
-            const auto& [token_id, pos, seq_id, logits] = entries[begin + i];
+            const auto& [token_id, pos, seq_id, logits] = entries[idxs[i]];
             if (!logits) continue;
 
             llama_sampler* smpl = nullptr;
@@ -964,16 +982,25 @@ static int bes_decode_range(
         return 0;
     }
 
-    if (ret == 1 && n > 1) {
+    if (ret == 1 && n == 1) {
+        // A single token still can't fit: this sequence is out of KV budget.
+        // Fail it and let the rest of the batch proceed.
+        failed.push_back(std::get<2>(entries[idxs[0]]));
+        return 0;
+    }
+
+    if (ret == 1) {
         // Halve and retry — explicit positions/seq_ids make any split valid,
         // and per-seq entries stay in position order across the halves.
         n_splits++;
-        size_t mid = begin + n / 2;
+        size_t mid = begin + (end - begin) / 2;
         int rc = bes_decode_range(ctx, vocab, entries, begin, mid, samplers,
-                                  purgeable, purge_idx, purged, n_splits, results, batch);
+                                  purgeable, purge_idx, purged, n_splits,
+                                  failed, results, batch);
         if (rc != 0) return rc;
         return bes_decode_range(ctx, vocab, entries, mid, end, samplers,
-                                purgeable, purge_idx, purged, n_splits, results, batch);
+                                purgeable, purge_idx, purged, n_splits,
+                                failed, results, batch);
     }
 
     return ret;
@@ -982,7 +1009,8 @@ static int bes_decode_range(
 std::variant<
     fine::Ok<std::vector<std::tuple<int64_t, int64_t, std::string, bool>>,
              std::vector<int64_t>,
-             int64_t>,
+             int64_t,
+             std::vector<int64_t>>,
     fine::Error<std::string>
 >
 batch_eval_sample(
@@ -1007,6 +1035,7 @@ batch_eval_sample(
 
     std::vector<std::tuple<int64_t, int64_t, std::string, bool>> results;
     std::vector<int64_t> purged;
+    std::vector<int64_t> failed;
     int64_t n_splits = 0;
     size_t purge_idx = 0;
 
@@ -1014,17 +1043,15 @@ batch_eval_sample(
 
     int rc = bes_decode_range(ctx->ctx, vocab, entries, 0, entries.size(),
                               smpls, purgeable_seq_ids, purge_idx, purged,
-                              n_splits, results, batch);
+                              n_splits, failed, results, batch);
 
-    if (rc == 1) {
-        return fine::Error(std::string("kv_pressure"));
-    }
     if (rc != 0) {
         return fine::Error(std::string(
             "batch_eval_sample failed with code: " + std::to_string(rc)));
     }
 
-    return fine::Ok(std::move(results), std::move(purged), n_splits);
+    return fine::Ok(std::move(results), std::move(purged), n_splits,
+                    std::move(failed));
 }
 FINE_NIF(batch_eval_sample, ERL_NIF_DIRTY_JOB_CPU_BOUND);
 
