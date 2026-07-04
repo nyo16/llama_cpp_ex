@@ -7,6 +7,16 @@ defmodule LlamaCppEx.NIF do
     :erlang.load_nif(path, 0)
   end
 
+  # Converts an ErlangError raised by a NIF into an error tuple. The
+  # NIF-not-loaded error is re-raised: it signals a build/packaging problem,
+  # not bad input, and must not be flattened into a caller-visible string.
+  @doc false
+  def error_tuple(%ErlangError{original: :not_loaded} = e, _label, stacktrace),
+    do: reraise(e, stacktrace)
+
+  def error_tuple(%ErlangError{original: original}, label, _stacktrace),
+    do: {:error, "#{label} failed: #{inspect(original)}"}
+
   # Backend
   def backend_init, do: :erlang.nif_error(:not_loaded)
   def backend_free, do: :erlang.nif_error(:not_loaded)

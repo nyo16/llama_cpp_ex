@@ -19,7 +19,7 @@ defmodule LlamaCppEx.Tokenizer do
     parse_special = Keyword.get(opts, :parse_special, true)
     {:ok, LlamaCppEx.NIF.tokenize(ref, text, add_special, parse_special)}
   rescue
-    e in ErlangError -> {:error, "tokenize failed: #{inspect(e.original)}"}
+    e in ErlangError -> LlamaCppEx.NIF.error_tuple(e, "tokenize", __STACKTRACE__)
   end
 
   @doc """
@@ -29,7 +29,7 @@ defmodule LlamaCppEx.Tokenizer do
   def decode(%LlamaCppEx.Model{ref: ref}, tokens) when is_list(tokens) do
     {:ok, LlamaCppEx.NIF.detokenize(ref, tokens)}
   rescue
-    e in ErlangError -> {:error, "detokenize failed: #{inspect(e.original)}"}
+    e in ErlangError -> LlamaCppEx.NIF.error_tuple(e, "detokenize", __STACKTRACE__)
   end
 
   @doc """

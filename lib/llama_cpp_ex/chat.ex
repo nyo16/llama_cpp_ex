@@ -63,7 +63,7 @@ defmodule LlamaCppEx.Chat do
 
       {:ok, result}
     rescue
-      e in ErlangError -> {:error, "chat template failed: #{inspect(e.original)}"}
+      e in ErlangError -> LlamaCppEx.NIF.error_tuple(e, "chat template", __STACKTRACE__)
     end
   end
 end

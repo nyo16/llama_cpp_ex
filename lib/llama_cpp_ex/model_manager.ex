@@ -196,18 +196,11 @@ defmodule LlamaCppEx.ModelManager do
   """
   @spec generate(id(), String.t(), keyword()) :: {:ok, String.t()} | {:error, term()}
   def generate(id, prompt, opts \\ []) do
-    case route(id) do
-      {:ok, {:server, pid, e}} ->
-        touch(e.id)
-        LlamaCppEx.Server.generate(pid, prompt, opts)
-
-      {:ok, {:direct, model, e}} ->
-        touch(e.id)
-        LlamaCppEx.generate(model, prompt, opts)
-
-      {:error, _} = err ->
-        err
-    end
+    with_route(
+      id,
+      &LlamaCppEx.Server.generate(&1, prompt, opts),
+      &LlamaCppEx.generate(&1, prompt, opts)
+    )
   end
 
   @doc """
@@ -218,17 +211,16 @@ defmodule LlamaCppEx.ModelManager do
   """
   @spec stream(id(), String.t(), keyword()) :: Enumerable.t()
   def stream(id, prompt, opts \\ []) do
-    case route(id) do
-      {:ok, {:server, pid, e}} ->
-        touch(e.id)
-        LlamaCppEx.Server.stream(pid, prompt, opts)
-
-      {:ok, {:direct, model, e}} ->
-        touch(e.id)
-        LlamaCppEx.stream(model, prompt, opts)
-
+    case with_route(
+           id,
+           &LlamaCppEx.Server.stream(&1, prompt, opts),
+           &LlamaCppEx.stream(&1, prompt, opts)
+         ) do
       {:error, reason} ->
         raise ArgumentError, "cannot stream from model #{inspect(id)}: #{inspect(reason)}"
+
+      stream ->
+        stream
     end
   end
 
@@ -236,25 +228,23 @@ defmodule LlamaCppEx.ModelManager do
   @spec chat(id(), [LlamaCppEx.Chat.message()], keyword()) ::
           {:ok, String.t()} | {:error, term()}
   def chat(id, messages, opts \\ []) do
-    case route(id) do
-      {:ok, {:server, pid, e}} ->
-        touch(e.id)
+    with_route(
+      id,
+      &server_chat(&1, messages, opts),
+      &LlamaCppEx.chat(&1, messages, opts)
+    )
+  end
 
-        {chat_opts, gen_opts} =
-          Keyword.split(opts, [:add_assistant, :enable_thinking, :chat_template_kwargs])
+  # A server-backed model exposes generate/stream only, so chat templating
+  # happens here before handing the rendered prompt to the server.
+  defp server_chat(pid, messages, opts) do
+    {chat_opts, gen_opts} =
+      Keyword.split(opts, [:add_assistant, :enable_thinking, :chat_template_kwargs])
 
-        model = LlamaCppEx.Server.get_model(pid)
+    model = LlamaCppEx.Server.get_model(pid)
 
-        with {:ok, prompt} <- LlamaCppEx.Chat.apply_template(model, messages, chat_opts) do
-          LlamaCppEx.Server.generate(pid, prompt, gen_opts)
-        end
-
-      {:ok, {:direct, model, e}} ->
-        touch(e.id)
-        LlamaCppEx.chat(model, messages, opts)
-
-      {:error, _} = err ->
-        err
+    with {:ok, prompt} <- LlamaCppEx.Chat.apply_template(model, messages, chat_opts) do
+      LlamaCppEx.Server.generate(pid, prompt, gen_opts)
     end
   end
 
@@ -301,6 +291,23 @@ defmodule LlamaCppEx.ModelManager do
         :server -> {:ok, {:server, e.server_pid, e}}
         :direct -> {:ok, {:direct, e.model, e}}
       end
+    end
+  end
+
+  # Shared dispatch skeleton: resolve the route, mark the model used, and hand
+  # the server pid or direct model to the matching callback. Errors pass through.
+  defp with_route(id, server_fun, direct_fun) do
+    case route(id) do
+      {:ok, {:server, pid, e}} ->
+        touch(e.id)
+        server_fun.(pid)
+
+      {:ok, {:direct, model, e}} ->
+        touch(e.id)
+        direct_fun.(model)
+
+      {:error, _} = err ->
+        err
     end
   end
 
@@ -595,24 +602,10 @@ defmodule LlamaCppEx.ModelManager do
     end
   end
 
-  defp build_ready_entry(
-         state,
-         id,
-         source,
-         {:server, pid},
-         file_bytes,
-         placement,
-         capabilities,
-         opts
-       ) do
-    ref = Process.monitor(pid)
-
-    entry = %Entry{
+  defp build_ready_entry(state, id, source, backing, file_bytes, placement, capabilities, opts) do
+    base = [
       id: id,
       status: :ready,
-      mode: :server,
-      server_pid: pid,
-      monitor_ref: ref,
       source: source,
       capabilities: capabilities,
       byte_size: file_bytes,
@@ -620,36 +613,17 @@ defmodule LlamaCppEx.ModelManager do
       placement: placement,
       n_gpu_layers: Keyword.get(opts, :n_gpu_layers, 99),
       loaded_at: System.system_time(:second)
-    }
+    ]
 
-    {entry, %{state | monitors: Map.put(state.monitors, ref, id)}}
-  end
+    case backing do
+      {:server, pid} ->
+        ref = Process.monitor(pid)
+        entry = struct!(Entry, [mode: :server, server_pid: pid, monitor_ref: ref] ++ base)
+        {entry, %{state | monitors: Map.put(state.monitors, ref, id)}}
 
-  defp build_ready_entry(
-         state,
-         id,
-         source,
-         {:direct, model},
-         file_bytes,
-         placement,
-         capabilities,
-         opts
-       ) do
-    entry = %Entry{
-      id: id,
-      status: :ready,
-      mode: :direct,
-      model: model,
-      source: source,
-      capabilities: capabilities,
-      byte_size: file_bytes,
-      est_bytes: placement_total(placement),
-      placement: placement,
-      n_gpu_layers: Keyword.get(opts, :n_gpu_layers, 99),
-      loaded_at: System.system_time(:second)
-    }
-
-    {entry, state}
+      {:direct, model} ->
+        {struct!(Entry, [mode: :direct, model: model] ++ base), state}
+    end
   end
 
   defp placement_total(%{ram: ram, vram: vram}), do: ram + Enum.sum(Map.values(vram))
@@ -770,11 +744,15 @@ defmodule LlamaCppEx.ModelManager do
     ArgumentError -> []
   end
 
+  # Best-effort: the NIF may be missing entirely (test env / unsupported
+  # platform) — degrade to :ok like gpu_devices/0, but log what was skipped.
+  # init/0 is a thin NIF call, so only these two exceptions can occur;
+  # anything else propagates.
   defp safe_backend_init do
     LlamaCppEx.init()
   rescue
-    _ -> :ok
-  catch
-    _, _ -> :ok
+    e in [ErlangError, UndefinedFunctionError] ->
+      Logger.debug("backend init skipped: #{Exception.message(e)}")
+      :ok
   end
 end

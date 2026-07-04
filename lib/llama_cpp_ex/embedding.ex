@@ -73,7 +73,7 @@ defmodule LlamaCppEx.Embedding do
 
     # texts is non-empty here (embed_batch handles the [] case), so tokenized
     # and groups are non-empty and Enum.max/1 is safe.
-    with {:ok, tokenized} <- tokenize_all(model, texts) do
+    with {:ok, tokenized} <- map_while_ok(texts, &Tokenizer.encode(model, &1)) do
       longest = tokenized |> Enum.map(&length/1) |> Enum.max()
       budget = max(n_ctx, longest + 8)
       groups = group_by_budget(tokenized, budget, max_seqs)
@@ -88,20 +88,6 @@ defmodule LlamaCppEx.Embedding do
              ) do
         decode_groups(ctx, groups, normalize)
       end
-    end
-  end
-
-  # Tokenizes every text up front, short-circuiting on the first error.
-  defp tokenize_all(model, texts) do
-    Enum.reduce_while(texts, {:ok, []}, fn text, {:ok, acc} ->
-      case Tokenizer.encode(model, text) do
-        {:ok, tokens} -> {:cont, {:ok, [tokens | acc]}}
-        {:error, _} = err -> {:halt, err}
-      end
-    end)
-    |> case do
-      {:ok, acc} -> {:ok, Enum.reverse(acc)}
-      {:error, _} = err -> err
     end
   end
 
@@ -133,66 +119,49 @@ defmodule LlamaCppEx.Embedding do
   # Decodes each group in one batch and extracts per-sequence embeddings,
   # preserving the original text order.
   defp decode_groups(ctx, groups, normalize) do
-    Enum.reduce_while(groups, {:ok, []}, fn group, {:ok, acc} ->
-      sequences = group |> Enum.with_index() |> Enum.map(fn {tokens, i} -> {i, tokens} end)
-
-      with :ok <- embed_batch_decode(ctx, sequences),
-           {:ok, embs} <- collect_group_embeddings(ctx, length(group), normalize) do
-        {:cont, {:ok, acc ++ embs}}
-      else
-        {:error, _} = err -> {:halt, err}
-      end
-    end)
+    with {:ok, nested} <- map_while_ok(groups, &decode_group(ctx, &1, normalize)) do
+      {:ok, Enum.concat(nested)}
+    end
   end
 
-  defp collect_group_embeddings(ctx, count, normalize) do
-    Enum.reduce_while(0..(count - 1)//1, {:ok, []}, fn seq_id, {:ok, acc} ->
-      case get_embeddings(ctx, seq_id, normalize) do
-        {:ok, emb} -> {:cont, {:ok, [emb | acc]}}
-        {:error, _} = err -> {:halt, err}
-      end
-    end)
-    |> case do
-      {:ok, acc} -> {:ok, Enum.reverse(acc)}
-      {:error, _} = err -> err
+  defp decode_group(ctx, group, normalize) do
+    sequences = Enum.with_index(group, fn tokens, i -> {i, tokens} end)
+
+    with :ok <- embed_batch_decode(ctx, sequences) do
+      map_while_ok(0..(length(group) - 1)//1, &get_embeddings(ctx, &1, normalize))
     end
   end
 
   # --- Sequential fallback (one context per text) ---
 
   defp embed_batch_sequential(model, texts, opts) do
-    Enum.reduce_while(texts, {:ok, []}, fn text, {:ok, acc} ->
-      case embed(model, text, opts) do
-        {:ok, emb} -> {:cont, {:ok, [emb | acc]}}
+    map_while_ok(texts, &embed(model, &1, opts))
+  end
+
+  # Maps `fun` (returning {:ok, value} | {:error, _}) over `enum`, preserving
+  # order and short-circuiting on the first error.
+  defp map_while_ok(enum, fun) do
+    enum
+    |> Enum.reduce_while({:ok, []}, fn item, {:ok, acc} ->
+      case fun.(item) do
+        {:ok, value} -> {:cont, {:ok, [value | acc]}}
         {:error, _} = err -> {:halt, err}
       end
     end)
-    |> case do
-      {:ok, embeddings} -> {:ok, Enum.reverse(embeddings)}
+    |> then(fn
+      {:ok, acc} -> {:ok, Enum.reverse(acc)}
       {:error, _} = err -> err
-    end
+    end)
   end
 
   # --- NIF wrappers ---
 
-  defp embed_decode(%Context{ref: ref}, tokens, seq_id) do
-    case LlamaCppEx.NIF.embed_decode(ref, tokens, seq_id) do
-      :ok -> :ok
-      {:error, _} = err -> err
-    end
-  end
+  defp embed_decode(%Context{ref: ref}, tokens, seq_id),
+    do: LlamaCppEx.NIF.embed_decode(ref, tokens, seq_id)
 
-  defp embed_batch_decode(%Context{ref: ref}, sequences) do
-    case LlamaCppEx.NIF.embed_batch_decode(ref, sequences) do
-      :ok -> :ok
-      {:error, _} = err -> err
-    end
-  end
+  defp embed_batch_decode(%Context{ref: ref}, sequences),
+    do: LlamaCppEx.NIF.embed_batch_decode(ref, sequences)
 
-  defp get_embeddings(%Context{ref: ref}, seq_id, normalize) do
-    case LlamaCppEx.NIF.get_embeddings(ref, seq_id, normalize) do
-      {:ok, _} = result -> result
-      {:error, _} = err -> err
-    end
-  end
+  defp get_embeddings(%Context{ref: ref}, seq_id, normalize),
+    do: LlamaCppEx.NIF.get_embeddings(ref, seq_id, normalize)
 end

@@ -981,10 +981,11 @@ defmodule LlamaCppExTest do
         %{model: model, mtp: mtp}
       end
 
-      test "draft context exposes rollback capacity", %{mtp: mtp} do
-        # n_rs_seq on the MTP draft ctx should be at least the configured n_draft;
-        # the default target ctx should report 0 (no rollback).
-        assert LlamaCppEx.Context.n_rs_seq(mtp.mtp_ctx) >= mtp.n_draft
+      test "contexts use no recurrent-state rollback slots", %{mtp: mtp} do
+        # Matching upstream server, the draft ctx is created with n_rs_seq=0 —
+        # MTP rolls back via cached hidden states (pending_h / verify_h), not
+        # recurrent-state snapshots. Both contexts report 0.
+        assert LlamaCppEx.Context.n_rs_seq(mtp.mtp_ctx) == 0
         assert LlamaCppEx.Context.n_rs_seq(mtp.main_ctx) == 0
       end
 

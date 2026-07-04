@@ -496,7 +496,9 @@ defmodule LlamaCppEx.Hub do
           {:error, reason}
       end
     rescue
-      e ->
+      # File.Error from rename!/write!/the File.stream! sink, ErlangError from
+      # lower-level IO — programming errors (KeyError, MatchError, …) propagate.
+      e in [File.Error, ErlangError] ->
         File.rm(tmp_dest)
         {:error, "download failed: #{Exception.message(e)}"}
     end
