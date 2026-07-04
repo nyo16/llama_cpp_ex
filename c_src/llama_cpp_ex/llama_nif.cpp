@@ -869,6 +869,166 @@ batch_eval(
 }
 FINE_NIF(batch_eval, ERL_NIF_DIRTY_JOB_CPU_BOUND);
 
+// --- Fused batch eval + sample (Server hot loop) ---
+//
+// One NIF call per Server tick: builds a batch from `entries`
+// ({token, pos, seq_id, wants_logits}), runs llama_decode, then samples every
+// wants_logits entry whose seq_id has a sampler registered in `samplers`,
+// returning {seq_id, new_token, piece, is_eog}. The piece is empty for EOG
+// tokens. Unlike decode_batch above, samplers are per-sequence resources owned
+// by the caller — their grammar/penalty state advances across ticks and is
+// never reset or shared here.
+//
+// KV-pressure policy (llama_decode == 1, "no KV slot found"), mirroring
+// llama-server's update_slots(): first drop whole sequences listed in
+// `purgeable_seq_ids` (idle slots whose cache the caller is willing to lose),
+// retrying after each purge; once the purge list is exhausted, recursively
+// halve the batch — each half's logits entries are sampled right after its
+// sub-decode, before the next decode invalidates the logits buffer. A
+// single-token batch that still fails is a hard error. Purged seq ids and the
+// split count are returned so the caller can fix up its cache bookkeeping and
+// emit telemetry. Purgeable seqs must not have entries in the batch.
+
+static int bes_decode_range(
+    llama_context* ctx,
+    const llama_vocab* vocab,
+    const std::vector<std::tuple<int64_t, int64_t, int64_t, bool>>& entries,
+    size_t begin, size_t end,
+    const std::vector<std::pair<int64_t, llama_sampler*>>& samplers,
+    const std::vector<int64_t>& purgeable,
+    size_t& purge_idx,
+    std::vector<int64_t>& purged,
+    int64_t& n_splits,
+    std::vector<std::tuple<int64_t, int64_t, std::string, bool>>& results)
+{
+    size_t n = end - begin;
+
+    llama_batch batch = llama_batch_init(static_cast<int32_t>(n), 0, 1);
+    batch.n_tokens = static_cast<int32_t>(n);
+
+    for (size_t i = 0; i < n; i++) {
+        const auto& [token_id, pos, seq_id, logits] = entries[begin + i];
+        batch.token[i]      = static_cast<llama_token>(token_id);
+        batch.pos[i]        = static_cast<llama_pos>(pos);
+        batch.n_seq_id[i]   = 1;
+        batch.seq_id[i][0]  = static_cast<llama_seq_id>(seq_id);
+        batch.logits[i]     = logits;
+    }
+
+    int ret = llama_decode(ctx, batch);
+
+    // Purge donatable idle caches one at a time while the KV cache is full.
+    while (ret == 1 && purge_idx < purgeable.size()) {
+        auto victim = static_cast<llama_seq_id>(purgeable[purge_idx++]);
+        llama_memory_seq_rm(llama_get_memory(ctx), victim, -1, -1);
+        purged.push_back(victim);
+        ret = llama_decode(ctx, batch);
+    }
+
+    llama_batch_free(batch);
+
+    if (ret == 0) {
+        // Sample now: these logits belong to THIS decode call and the next
+        // sub-decode would overwrite them.
+        for (size_t i = 0; i < n; i++) {
+            const auto& [token_id, pos, seq_id, logits] = entries[begin + i];
+            if (!logits) continue;
+
+            llama_sampler* smpl = nullptr;
+            for (const auto& [sid, s] : samplers) {
+                if (sid == seq_id) { smpl = s; break; }
+            }
+            if (!smpl) continue; // logits-only entry, nothing to sample
+
+            // llama_sampler_sample() already accepts the selected token —
+            // calling llama_sampler_accept() again would double-advance
+            // grammar state.
+            llama_token new_token =
+                llama_sampler_sample(smpl, ctx, static_cast<int32_t>(i));
+            bool is_eog = llama_vocab_is_eog(vocab, new_token);
+
+            std::string piece;
+            if (!is_eog) {
+                char buf[1024];
+                int pn = llama_token_to_piece(vocab, new_token, buf, sizeof(buf), 0, false);
+                if (pn < 0) {
+                    std::vector<char> large_buf(-pn);
+                    pn = llama_token_to_piece(vocab, new_token,
+                        large_buf.data(), large_buf.size(), 0, false);
+                    if (pn > 0) piece.assign(large_buf.data(), pn);
+                } else if (pn > 0) {
+                    piece.assign(buf, pn);
+                }
+            }
+
+            results.emplace_back(seq_id, static_cast<int64_t>(new_token),
+                                 std::move(piece), is_eog);
+        }
+        return 0;
+    }
+
+    if (ret == 1 && n > 1) {
+        // Halve and retry — explicit positions/seq_ids make any split valid,
+        // and per-seq entries stay in position order across the halves.
+        n_splits++;
+        size_t mid = begin + n / 2;
+        int rc = bes_decode_range(ctx, vocab, entries, begin, mid, samplers,
+                                  purgeable, purge_idx, purged, n_splits, results);
+        if (rc != 0) return rc;
+        return bes_decode_range(ctx, vocab, entries, mid, end, samplers,
+                                purgeable, purge_idx, purged, n_splits, results);
+    }
+
+    return ret;
+}
+
+std::variant<
+    fine::Ok<std::vector<std::tuple<int64_t, int64_t, std::string, bool>>,
+             std::vector<int64_t>,
+             int64_t>,
+    fine::Error<std::string>
+>
+batch_eval_sample(
+    ErlNifEnv* env,
+    fine::ResourcePtr<LlamaContext> ctx,
+    std::vector<std::tuple<int64_t, int64_t, int64_t, bool>> entries,
+    std::vector<std::tuple<int64_t, fine::ResourcePtr<LlamaSampler>>> samplers,
+    std::vector<int64_t> purgeable_seq_ids)
+{
+    if (entries.empty()) {
+        return fine::Error(std::string("empty entries list"));
+    }
+
+    const auto* vocab = ctx->model->vocab();
+
+    // The ResourcePtr arguments keep the samplers alive for the whole call.
+    std::vector<std::pair<int64_t, llama_sampler*>> smpls;
+    smpls.reserve(samplers.size());
+    for (auto& [sid, s] : samplers) {
+        smpls.emplace_back(sid, s->sampler);
+    }
+
+    std::vector<std::tuple<int64_t, int64_t, std::string, bool>> results;
+    std::vector<int64_t> purged;
+    int64_t n_splits = 0;
+    size_t purge_idx = 0;
+
+    int rc = bes_decode_range(ctx->ctx, vocab, entries, 0, entries.size(),
+                              smpls, purgeable_seq_ids, purge_idx, purged,
+                              n_splits, results);
+
+    if (rc == 1) {
+        return fine::Error(std::string("kv_pressure"));
+    }
+    if (rc != 0) {
+        return fine::Error(std::string(
+            "batch_eval_sample failed with code: " + std::to_string(rc)));
+    }
+
+    return fine::Ok(std::move(results), std::move(purged), n_splits);
+}
+FINE_NIF(batch_eval_sample, ERL_NIF_DIRTY_JOB_CPU_BOUND);
+
 // --- Sampler sample at batch index ---
 
 int64_t sampler_sample_at(
