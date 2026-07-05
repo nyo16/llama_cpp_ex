@@ -403,10 +403,18 @@ defmodule LlamaCppEx.Server do
       )
     end
 
+    now = System.monotonic_time()
+
     slots =
       for seq_id <- 0..(n_parallel - 1), into: %{} do
         {:ok, sampler} = Sampler.create(model, sampler_opts)
-        {seq_id, Map.put(idle_slot_fields([], 0), :sampler, sampler)}
+
+        slot =
+          idle_slot_fields([], 0)
+          |> Map.put(:sampler, sampler)
+          |> Map.put(:t_last_used, now)
+
+        {seq_id, slot}
       end
 
     state = %__MODULE__{
@@ -540,21 +548,38 @@ defmodule LlamaCppEx.Server do
 
       slots when tokens != [] ->
         if request_cache_prompt?(state, req_opts) do
-          # Prefer the slot with the longest cached prefix match
-          {best_id, _} =
-            Enum.max_by(slots, fn {_id, slot} ->
-              common_prefix_length(tokens, slot.cached_tokens)
-            end)
-
-          {:ok, best_id, state}
+          {:ok, pick_cached_slot(slots, tokens), state}
         else
-          [{seq_id, _} | _] = slots
-          {:ok, seq_id, state}
+          {:ok, pick_lru_slot(slots), state}
         end
 
-      [{seq_id, _} | _] ->
-        {:ok, seq_id, state}
+      slots ->
+        {:ok, pick_lru_slot(slots), state}
     end
+  end
+
+  # llama-server's slot-pick rule (server-context.cpp): reuse the slot with the
+  # best cached-prefix similarity only when it clears a threshold
+  # (LCP/prompt_len > 0.1); otherwise take the least-recently-used idle slot so
+  # a tiny unrelated request doesn't evict a valuable long cache.
+  defp pick_cached_slot(idle_slots, tokens) do
+    prompt_len = length(tokens)
+
+    {best_id, best_lcp} =
+      idle_slots
+      |> Enum.map(fn {id, slot} -> {id, common_prefix_length(tokens, slot.cached_tokens)} end)
+      |> Enum.max_by(fn {_id, lcp} -> lcp end)
+
+    if best_lcp / prompt_len > 0.1 do
+      best_id
+    else
+      pick_lru_slot(idle_slots)
+    end
+  end
+
+  defp pick_lru_slot(idle_slots) do
+    {seq_id, _} = Enum.min_by(idle_slots, fn {_id, slot} -> slot.t_last_used end)
+    seq_id
   end
 
   defp init_slot(state, seq_id, tokens, max_tokens, from, stream_pid, stream_ref, req_opts) do
@@ -760,7 +785,12 @@ defmodule LlamaCppEx.Server do
     LlamaCppEx.NIF.memory_seq_rm(state.ctx.ref, seq_id, 0, -1)
     Sampler.reset(slot.sampler)
 
-    put_in(state.slots[seq_id], Map.merge(slot, idle_slot_fields([], 0)))
+    slot =
+      slot
+      |> Map.merge(idle_slot_fields([], 0))
+      |> Map.put(:t_last_used, System.monotonic_time())
+
+    put_in(state.slots[seq_id], slot)
   end
 
   # Samplers for all active slots, keyed by seq_id — the NIF samples every
@@ -1019,16 +1049,19 @@ defmodule LlamaCppEx.Server do
         {[], 0}
       end
 
-    slot = Map.merge(slot, idle_slot_fields(cached_tokens, cached_pos))
+    slot =
+      slot
+      |> Map.merge(idle_slot_fields(cached_tokens, cached_pos))
+      |> Map.put(:t_last_used, System.monotonic_time())
 
     put_in(state.slots[seq_id], slot)
   end
 
   # The single source of truth for a slot's per-request fields. init/1,
-  # reset_slot/2, and fail_all_active_slots/2 all build from this map, so a
-  # new slot field cannot silently carry stale data across requests. The
-  # prefix-cache carry-over is the only caller-controlled part; :sampler is
-  # the only field that lives outside it.
+  # reset_slot/2, and the failure paths all build from this map, so a new
+  # slot field cannot silently carry stale data across requests. The
+  # prefix-cache carry-over is the only caller-controlled part; :sampler and
+  # :t_last_used are the only fields that live outside it.
   defp idle_slot_fields(cached_tokens, cached_pos) do
     %{
       state: :idle,
@@ -1065,22 +1098,8 @@ defmodule LlamaCppEx.Server do
     active_slots =
       Enum.filter(state.slots, fn {_id, slot} -> slot.state != :idle end)
 
-    Enum.reduce(active_slots, state, fn {seq_id, slot}, state ->
-      if slot.from do
-        GenServer.reply(slot.from, {:error, "inference failed: #{reason}"})
-      end
-
-      if slot.stream_pid && slot.stream_ref do
-        send(slot.stream_pid, {slot.stream_ref, {:error, reason}})
-      end
-
-      emit_request_exception(slot, seq_id, reason)
-
-      # Clear KV cache and reset — don't preserve cache on error
-      LlamaCppEx.NIF.memory_seq_rm(state.ctx.ref, seq_id, 0, -1)
-      Sampler.reset(slot.sampler)
-
-      put_in(state.slots[seq_id], Map.merge(slot, idle_slot_fields([], 0)))
+    Enum.reduce(active_slots, state, fn {seq_id, _slot}, state ->
+      fail_slot(state, seq_id, "inference failed: #{reason}")
     end)
   end
 
