@@ -284,7 +284,11 @@ defmodule LlamaCppEx.Server do
     timeout = Keyword.get(opts, :timeout, 60_000)
     max_tokens = Keyword.get(opts, :max_tokens, 256)
     req_opts = Keyword.take(opts, @request_opt_keys)
-    GenServer.call(server, {:generate, prompt, max_tokens, req_opts}, timeout)
+
+    # Tokenize in the caller: parallel across clients and off the server's
+    # mailbox. The model handle comes from a :persistent_term cache.
+    {:ok, token_ids} = Tokenizer.encode(get_model(server), prompt)
+    GenServer.call(server, {:generate_tokens, token_ids, max_tokens, req_opts}, timeout)
   end
 
   @doc """
@@ -304,8 +308,12 @@ defmodule LlamaCppEx.Server do
 
     Stream.resource(
       fn ->
+        {:ok, token_ids} = Tokenizer.encode(get_model(server), prompt)
         ref = make_ref()
-        :ok = GenServer.call(server, {:stream, prompt, max_tokens, self(), ref, req_opts})
+
+        :ok =
+          GenServer.call(server, {:stream_tokens, token_ids, max_tokens, self(), ref, req_opts})
+
         {ref, timeout}
       end,
       fn {ref, timeout} = state ->
@@ -394,11 +402,17 @@ defmodule LlamaCppEx.Server do
   Returns the model struct for external tokenization.
 
   The model resource is reference-counted and thread-safe for read-only
-  operations like tokenization.
+  operations like tokenization. Served from a `:persistent_term` cache — no
+  round-trip through the server's mailbox.
   """
   @spec get_model(GenServer.server()) :: Model.t()
   def get_model(server) do
-    GenServer.call(server, :get_model)
+    with pid when is_pid(pid) <- GenServer.whereis(server),
+         %Model{} = model <- :persistent_term.get({__MODULE__, pid}, nil) do
+      model
+    else
+      _ -> GenServer.call(server, :get_model)
+    end
   end
 
   @doc """
@@ -456,8 +470,16 @@ defmodule LlamaCppEx.Server do
         :swa_full
       ])
 
+    # Trap exits so terminate/2 reliably erases the persistent_term model
+    # cache on shutdown.
+    Process.flag(:trap_exit, true)
+
     :ok = LlamaCppEx.init()
     {:ok, model} = Model.load(model_path, [n_gpu_layers: n_gpu_layers] ++ model_opts)
+
+    # Cache the model handle for callers (get_model/1): tokenization and chat
+    # templating happen client-side without a GenServer.call round-trip.
+    :persistent_term.put({__MODULE__, self()}, model)
 
     {:ok, ctx} =
       Context.create(
@@ -518,21 +540,6 @@ defmodule LlamaCppEx.Server do
   end
 
   @impl true
-  def handle_call({:generate, prompt, max_tokens, req_opts}, from, state) do
-    {:ok, tokens} = Tokenizer.encode(state.model, prompt)
-
-    case acquire_slot(state, tokens, req_opts) do
-      {:ok, seq_id, state} ->
-        state = init_slot(state, seq_id, tokens, max_tokens, from, nil, nil, req_opts)
-        state = maybe_schedule_tick(state)
-        {:noreply, state}
-
-      :no_slots ->
-        state = enqueue_request(state, {:generate, tokens, max_tokens, from, nil, nil, req_opts})
-        {:noreply, state}
-    end
-  end
-
   def handle_call({:generate_tokens, token_ids, max_tokens, req_opts}, from, state) do
     if token_ids == [] do
       {:reply, {:error, "token list cannot be empty"}, state}
@@ -549,23 +556,6 @@ defmodule LlamaCppEx.Server do
 
           {:noreply, state}
       end
-    end
-  end
-
-  def handle_call({:stream, prompt, max_tokens, pid, ref, req_opts}, from, state) do
-    {:ok, tokens} = Tokenizer.encode(state.model, prompt)
-
-    case acquire_slot(state, tokens, req_opts) do
-      {:ok, seq_id, state} ->
-        state = init_slot(state, seq_id, tokens, max_tokens, nil, pid, ref, req_opts)
-        GenServer.reply(from, :ok)
-        state = maybe_schedule_tick(state)
-        {:noreply, state}
-
-      :no_slots ->
-        GenServer.reply(from, :ok)
-        state = enqueue_request(state, {:stream, tokens, max_tokens, nil, pid, ref, req_opts})
-        {:noreply, state}
     end
   end
 
@@ -616,6 +606,17 @@ defmodule LlamaCppEx.Server do
     state = %{state | tick_scheduled: false}
     state = run_tick(state)
     {:noreply, state}
+  end
+
+  def handle_info({:EXIT, _pid, reason}, state) do
+    # trap_exit is on (for terminate/2 cleanup) — honor exit signals.
+    {:stop, reason, state}
+  end
+
+  @impl true
+  def terminate(_reason, _state) do
+    :persistent_term.erase({__MODULE__, self()})
+    :ok
   end
 
   # --- Internal: Slot management ---
