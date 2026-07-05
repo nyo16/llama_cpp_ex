@@ -191,6 +191,7 @@ defmodule LlamaCppEx.Server do
     :sampler_opts,
     slots: %{},
     queue: nil,
+    max_queue: 0,
     sessions: %{},
     n_parallel: 4,
     n_batch: 2048,
@@ -232,7 +233,11 @@ defmodule LlamaCppEx.Server do
       throughput (fewer, larger passes); lower it (or lower `:chunk_size`) for
       smoother streaming latency under mixed load.
     * `:chunk_size` - Max prefill tokens per slot per tick. Defaults to `512`.
-    * `:max_queue` - Max queued requests. `0` for unlimited. Defaults to `0`.
+    * `:max_queue` - Max queued requests waiting for a slot. When the bound is
+      hit, calls return `{:error, :queue_full}` immediately and streams emit a
+      single `{:error, :queue_full}` element — no silent queueing until the
+      call timeout. `0` for unlimited. Defaults to `0`; `2 * n_parallel` is a
+      reasonable bound for latency-sensitive deployments.
     * `:cache_prompt` - Retain KV cache between requests on the same slot for
       prefix reuse. Defaults to `true` (matching llama-server). Overridable
       per request via the `:cache_prompt` option on `generate/3` and friends.
@@ -294,11 +299,16 @@ defmodule LlamaCppEx.Server do
   @doc """
   Returns a stream of generated text chunks.
 
+  If the request is rejected (`:queue_full`) or fails mid-generation, the
+  stream emits a single `{:error, reason}` element and halts — consumers that
+  need to distinguish errors from text should match on it.
+
   ## Options
 
     * `:max_tokens` - Maximum tokens to generate. Defaults to `256`.
     * `:timeout` - Per-token timeout. Defaults to `30_000`.
 
+  Also accepts the per-request options documented on `generate/3`.
   """
   @spec stream(GenServer.server(), String.t(), keyword()) :: Enumerable.t()
   def stream(server, prompt, opts \\ []) do
@@ -311,28 +321,45 @@ defmodule LlamaCppEx.Server do
         {:ok, token_ids} = Tokenizer.encode(get_model(server), prompt)
         ref = make_ref()
 
-        :ok =
-          GenServer.call(server, {:stream_tokens, token_ids, max_tokens, self(), ref, req_opts})
-
-        {ref, timeout}
-      end,
-      fn {ref, timeout} = state ->
-        receive do
-          {^ref, {:token, text}} -> {[text], state}
-          {^ref, {:done, _reason}} -> {:halt, state}
-          {^ref, {:error, _reason}} -> {:halt, state}
-        after
-          timeout -> {:halt, state}
+        case GenServer.call(
+               server,
+               {:stream_tokens, token_ids, max_tokens, self(), ref, req_opts}
+             ) do
+          :ok -> {ref, timeout}
+          {:error, reason} -> {:rejected, ref, reason}
         end
       end,
-      fn {ref, _timeout} ->
-        receive do
-          {^ref, _} -> :ok
-        after
-          0 -> :ok
-        end
-      end
+      &stream_next/1,
+      &stream_cleanup/1
     )
+  end
+
+  # Shared next/cleanup functions for the piece-streaming Stream.resources.
+  # A rejected request ({:error, :queue_full}) surfaces as a single error
+  # element instead of silence-then-timeout.
+  defp stream_next({:rejected, ref, reason}), do: {[{:error, reason}], {:done, ref}}
+  defp stream_next({:done, _ref} = state), do: {:halt, state}
+
+  defp stream_next({ref, timeout} = state) do
+    receive do
+      {^ref, {:token, text}} -> {[text], state}
+      {^ref, {:done, _reason}} -> {:halt, state}
+      {^ref, {:error, reason}} -> {[{:error, reason}], {:done, ref}}
+    after
+      timeout -> {:halt, state}
+    end
+  end
+
+  defp stream_cleanup({:rejected, ref, _reason}), do: drain_stream_message(ref)
+  defp stream_cleanup({:done, ref}), do: drain_stream_message(ref)
+  defp stream_cleanup({ref, _timeout}), do: drain_stream_message(ref)
+
+  defp drain_stream_message(ref) do
+    receive do
+      {^ref, _} -> :ok
+    after
+      0 -> :ok
+    end
   end
 
   @doc """
@@ -403,27 +430,16 @@ defmodule LlamaCppEx.Server do
       fn ->
         ref = make_ref()
 
-        :ok =
-          GenServer.call(server, {:stream_tokens, token_ids, max_tokens, self(), ref, req_opts})
-
-        {ref, timeout}
-      end,
-      fn {ref, timeout} = state ->
-        receive do
-          {^ref, {:token, text}} -> {[text], state}
-          {^ref, {:done, _reason}} -> {:halt, state}
-          {^ref, {:error, _reason}} -> {:halt, state}
-        after
-          timeout -> {:halt, state}
+        case GenServer.call(
+               server,
+               {:stream_tokens, token_ids, max_tokens, self(), ref, req_opts}
+             ) do
+          :ok -> {ref, timeout}
+          {:error, reason} -> {:rejected, ref, reason}
         end
       end,
-      fn {ref, _timeout} ->
-        receive do
-          {^ref, _} -> :ok
-        after
-          0 -> :ok
-        end
-      end
+      &stream_next/1,
+      &stream_cleanup/1
     )
   end
 
@@ -465,6 +481,7 @@ defmodule LlamaCppEx.Server do
     cache_prompt = Keyword.get(opts, :cache_prompt, true)
     kv_unified = Keyword.get(opts, :kv_unified, true)
     prompt_cache_ram_mb = Keyword.get(opts, :prompt_cache_ram_mb, 0)
+    max_queue = Keyword.get(opts, :max_queue, 0)
     batch_strategy = Keyword.get(opts, :batch_strategy, LlamaCppEx.Server.Strategy.DecodeMaximal)
 
     sampler_opts = Keyword.take(opts, @sampler_opt_keys)
@@ -555,6 +572,7 @@ defmodule LlamaCppEx.Server do
       sampler_opts: sampler_opts,
       slots: slots,
       queue: :queue.new(),
+      max_queue: max_queue,
       n_parallel: n_parallel,
       n_batch: n_batch,
       chunk_size: chunk_size,
@@ -579,6 +597,16 @@ defmodule LlamaCppEx.Server do
           state = maybe_schedule_tick(state)
           {:noreply, state}
 
+        :no_slots when state.max_queue > 0 ->
+          if :queue.len(state.queue) >= state.max_queue do
+            {:reply, {:error, :queue_full}, state}
+          else
+            state =
+              enqueue_request(state, {:generate, token_ids, max_tokens, from, nil, nil, req_opts})
+
+            {:noreply, state}
+          end
+
         :no_slots ->
           state =
             enqueue_request(state, {:generate, token_ids, max_tokens, from, nil, nil, req_opts})
@@ -595,6 +623,18 @@ defmodule LlamaCppEx.Server do
         GenServer.reply(from, :ok)
         state = maybe_schedule_tick(state)
         {:noreply, state}
+
+      :no_slots when state.max_queue > 0 ->
+        if :queue.len(state.queue) >= state.max_queue do
+          {:reply, {:error, :queue_full}, state}
+        else
+          GenServer.reply(from, :ok)
+
+          state =
+            enqueue_request(state, {:stream, token_ids, max_tokens, nil, pid, ref, req_opts})
+
+          {:noreply, state}
+        end
 
       :no_slots ->
         GenServer.reply(from, :ok)
