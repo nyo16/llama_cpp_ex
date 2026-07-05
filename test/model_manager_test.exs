@@ -6,8 +6,9 @@ defmodule LlamaCppEx.ModelManagerTest do
   alias LlamaCppEx.ModelManager
 
   # A stub standing in for LlamaCppEx.Server. It answers the two messages the
-  # manager's dispatch sends it: {:generate, prompt, max_tokens} and :get_model.
-  # Started unlinked so killing it (DOWN test) doesn't take down the manager.
+  # manager's dispatch sends it: {:generate, prompt, max_tokens, req_opts} and
+  # :get_model. Started unlinked so killing it (DOWN test) doesn't take down
+  # the manager.
   defmodule StubServer do
     use GenServer
 
@@ -17,7 +18,9 @@ defmodule LlamaCppEx.ModelManagerTest do
     def init(reply), do: {:ok, reply}
 
     @impl true
-    def handle_call({:generate, _prompt, _max}, _from, reply), do: {:reply, reply, reply}
+    def handle_call({:generate, _prompt, _max, _req_opts}, _from, reply),
+      do: {:reply, reply, reply}
+
     def handle_call(:get_model, _from, reply), do: {:reply, fake_model(), reply}
 
     defp fake_model, do: %LlamaCppEx.Model{ref: make_ref()}
