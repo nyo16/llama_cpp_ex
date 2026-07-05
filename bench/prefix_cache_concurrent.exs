@@ -31,10 +31,14 @@ defmodule Bench.PrefixCacheConcurrent do
 
     IO.puts("")
 
-    for cache? <- [false, true] do
-      {ttfts, cache_ratios} = run_workload(cache?, system_prompt)
+    modes = [
+      {"cache OFF            ", cache_prompt: false},
+      {"per-slot cache       ", cache_prompt: true, kv_unified: false},
+      {"cross-slot + affinity", cache_prompt: true, kv_unified: true}
+    ]
 
-      label = if cache?, do: "cache ON ", else: "cache OFF"
+    for {label, opts} <- modes do
+      {ttfts, cache_ratios} = run_workload(opts, system_prompt)
       avg_ratio = Enum.sum(cache_ratios) / length(cache_ratios)
 
       IO.puts(
@@ -44,13 +48,9 @@ defmodule Bench.PrefixCacheConcurrent do
     end
   end
 
-  defp run_workload(cache?, system_prompt) do
+  defp run_workload(opts, system_prompt) do
     server =
-      Bench.Helpers.start_server(
-        n_parallel: @n_parallel,
-        n_ctx: 8192,
-        cache_prompt: cache?
-      )
+      Bench.Helpers.start_server([n_parallel: @n_parallel, n_ctx: 8192] ++ opts)
 
     collector = start_collector()
 
