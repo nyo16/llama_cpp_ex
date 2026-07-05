@@ -121,6 +121,10 @@ defmodule LlamaCppEx.Server do
 
   alias LlamaCppEx.{Context, Model, Sampler, Tokenizer}
 
+  # Per-request options accepted by generate/stream and carried through the
+  # queue into the slot. Server-level options provide the defaults.
+  @request_opt_keys [:cache_prompt]
+
   defstruct [
     :model,
     :ctx,
@@ -130,7 +134,7 @@ defmodule LlamaCppEx.Server do
     n_parallel: 4,
     n_batch: 2048,
     chunk_size: 512,
-    cache_prompt: false,
+    cache_prompt: true,
     # `:part`/`:rs` = partial seq_rm works; `:full` = whole-sequence only
     # (hybrid GDN models like Qwen 3.5/3.6); `:no` = no memory module. We
     # only do prefix-cache partial trims when this is `:part` or `:rs`.
@@ -159,7 +163,8 @@ defmodule LlamaCppEx.Server do
     * `:chunk_size` - Max prefill tokens per slot per tick. Defaults to `512`.
     * `:max_queue` - Max queued requests. `0` for unlimited. Defaults to `0`.
     * `:cache_prompt` - Retain KV cache between requests on the same slot for
-      prefix reuse. Defaults to `false`. Set to `true` for multi-turn chat.
+      prefix reuse. Defaults to `true` (matching llama-server). Overridable
+      per request via the `:cache_prompt` option on `generate/3` and friends.
     * `:batch_strategy` - Batch building strategy module. Defaults to
       `LlamaCppEx.Server.Strategy.DecodeMaximal`. See `LlamaCppEx.Server.BatchStrategy`.
     * Sampling options: `:temp`, `:top_k`, `:top_p`, `:min_p`, `:seed`, `:penalty_repeat`,
@@ -180,6 +185,8 @@ defmodule LlamaCppEx.Server do
 
     * `:max_tokens` - Maximum tokens to generate. Defaults to `256`.
     * `:timeout` - Call timeout in ms. Defaults to `60_000`.
+    * `:cache_prompt` - Reuse/retain this request's KV prefix on the slot.
+      Defaults to the server-level `:cache_prompt` setting.
 
   """
   @spec generate(GenServer.server(), String.t(), keyword()) ::
@@ -187,7 +194,8 @@ defmodule LlamaCppEx.Server do
   def generate(server, prompt, opts \\ []) do
     timeout = Keyword.get(opts, :timeout, 60_000)
     max_tokens = Keyword.get(opts, :max_tokens, 256)
-    GenServer.call(server, {:generate, prompt, max_tokens}, timeout)
+    req_opts = Keyword.take(opts, @request_opt_keys)
+    GenServer.call(server, {:generate, prompt, max_tokens, req_opts}, timeout)
   end
 
   @doc """
@@ -203,11 +211,12 @@ defmodule LlamaCppEx.Server do
   def stream(server, prompt, opts \\ []) do
     max_tokens = Keyword.get(opts, :max_tokens, 256)
     timeout = Keyword.get(opts, :timeout, 30_000)
+    req_opts = Keyword.take(opts, @request_opt_keys)
 
     Stream.resource(
       fn ->
         ref = make_ref()
-        :ok = GenServer.call(server, {:stream, prompt, max_tokens, self(), ref})
+        :ok = GenServer.call(server, {:stream, prompt, max_tokens, self(), ref, req_opts})
         {ref, timeout}
       end,
       fn {ref, timeout} = state ->
@@ -245,7 +254,8 @@ defmodule LlamaCppEx.Server do
   def generate_tokens(server, token_ids, opts \\ []) when is_list(token_ids) do
     timeout = Keyword.get(opts, :timeout, 60_000)
     max_tokens = Keyword.get(opts, :max_tokens, 256)
-    GenServer.call(server, {:generate_tokens, token_ids, max_tokens}, timeout)
+    req_opts = Keyword.take(opts, @request_opt_keys)
+    GenServer.call(server, {:generate_tokens, token_ids, max_tokens, req_opts}, timeout)
   end
 
   @doc """
@@ -261,11 +271,15 @@ defmodule LlamaCppEx.Server do
   def stream_tokens(server, token_ids, opts \\ []) when is_list(token_ids) do
     max_tokens = Keyword.get(opts, :max_tokens, 256)
     timeout = Keyword.get(opts, :timeout, 30_000)
+    req_opts = Keyword.take(opts, @request_opt_keys)
 
     Stream.resource(
       fn ->
         ref = make_ref()
-        :ok = GenServer.call(server, {:stream_tokens, token_ids, max_tokens, self(), ref})
+
+        :ok =
+          GenServer.call(server, {:stream_tokens, token_ids, max_tokens, self(), ref, req_opts})
+
         {ref, timeout}
       end,
       fn {ref, timeout} = state ->
@@ -316,7 +330,7 @@ defmodule LlamaCppEx.Server do
     n_ctx = Keyword.get(opts, :n_ctx, 8192)
     n_batch = Keyword.get(opts, :n_batch, min(n_ctx, 2048))
     chunk_size = Keyword.get(opts, :chunk_size, 512)
-    cache_prompt = Keyword.get(opts, :cache_prompt, false)
+    cache_prompt = Keyword.get(opts, :cache_prompt, true)
     batch_strategy = Keyword.get(opts, :batch_strategy, LlamaCppEx.Server.Strategy.DecodeMaximal)
 
     sampler_opts =
@@ -413,66 +427,71 @@ defmodule LlamaCppEx.Server do
   end
 
   @impl true
-  def handle_call({:generate, prompt, max_tokens}, from, state) do
+  def handle_call({:generate, prompt, max_tokens, req_opts}, from, state) do
     {:ok, tokens} = Tokenizer.encode(state.model, prompt)
 
-    case acquire_slot(state, tokens) do
+    case acquire_slot(state, tokens, req_opts) do
       {:ok, seq_id, state} ->
-        state = init_slot(state, seq_id, tokens, max_tokens, from, nil, nil)
+        state = init_slot(state, seq_id, tokens, max_tokens, from, nil, nil, req_opts)
         state = maybe_schedule_tick(state)
         {:noreply, state}
 
       :no_slots ->
-        state = enqueue_request(state, {:generate, tokens, max_tokens, from, nil, nil})
+        state = enqueue_request(state, {:generate, tokens, max_tokens, from, nil, nil, req_opts})
         {:noreply, state}
     end
   end
 
-  def handle_call({:generate_tokens, token_ids, max_tokens}, from, state) do
+  def handle_call({:generate_tokens, token_ids, max_tokens, req_opts}, from, state) do
     if token_ids == [] do
       {:reply, {:error, "token list cannot be empty"}, state}
     else
-      case acquire_slot(state, token_ids) do
+      case acquire_slot(state, token_ids, req_opts) do
         {:ok, seq_id, state} ->
-          state = init_slot(state, seq_id, token_ids, max_tokens, from, nil, nil)
+          state = init_slot(state, seq_id, token_ids, max_tokens, from, nil, nil, req_opts)
           state = maybe_schedule_tick(state)
           {:noreply, state}
 
         :no_slots ->
-          state = enqueue_request(state, {:generate, token_ids, max_tokens, from, nil, nil})
+          state =
+            enqueue_request(state, {:generate, token_ids, max_tokens, from, nil, nil, req_opts})
+
           {:noreply, state}
       end
     end
   end
 
-  def handle_call({:stream, prompt, max_tokens, pid, ref}, from, state) do
+  def handle_call({:stream, prompt, max_tokens, pid, ref, req_opts}, from, state) do
     {:ok, tokens} = Tokenizer.encode(state.model, prompt)
 
-    case acquire_slot(state, tokens) do
+    case acquire_slot(state, tokens, req_opts) do
       {:ok, seq_id, state} ->
-        state = init_slot(state, seq_id, tokens, max_tokens, nil, pid, ref)
+        state = init_slot(state, seq_id, tokens, max_tokens, nil, pid, ref, req_opts)
         GenServer.reply(from, :ok)
         state = maybe_schedule_tick(state)
         {:noreply, state}
 
       :no_slots ->
         GenServer.reply(from, :ok)
-        state = enqueue_request(state, {:stream, tokens, max_tokens, nil, pid, ref})
+        state = enqueue_request(state, {:stream, tokens, max_tokens, nil, pid, ref, req_opts})
         {:noreply, state}
     end
   end
 
-  def handle_call({:stream_tokens, token_ids, max_tokens, pid, ref}, from, state) do
-    case acquire_slot(state, token_ids) do
+  def handle_call({:stream_tokens, token_ids, max_tokens, pid, ref, req_opts}, from, state) do
+    case acquire_slot(state, token_ids, req_opts) do
       {:ok, seq_id, state} ->
-        state = init_slot(state, seq_id, token_ids, max_tokens, nil, pid, ref)
+        state = init_slot(state, seq_id, token_ids, max_tokens, nil, pid, ref, req_opts)
         GenServer.reply(from, :ok)
         state = maybe_schedule_tick(state)
         {:noreply, state}
 
       :no_slots ->
         GenServer.reply(from, :ok)
-        state = enqueue_request(state, {:stream, token_ids, max_tokens, nil, pid, ref})
+
+        state =
+          enqueue_request(state, {:stream, token_ids, max_tokens, nil, pid, ref, req_opts})
+
         {:noreply, state}
     end
   end
@@ -508,29 +527,39 @@ defmodule LlamaCppEx.Server do
 
   # --- Internal: Slot management ---
 
-  defp acquire_slot(state, tokens) do
+  defp request_cache_prompt?(state, req_opts) do
+    Keyword.get(req_opts, :cache_prompt, state.cache_prompt)
+  end
+
+  defp acquire_slot(state, tokens, req_opts) do
     idle_slots = Enum.filter(state.slots, fn {_id, slot} -> slot.state == :idle end)
 
     case idle_slots do
       [] ->
         :no_slots
 
-      slots when state.cache_prompt and tokens != [] ->
-        # Prefer the slot with the longest cached prefix match
-        {best_id, _} =
-          Enum.max_by(slots, fn {_id, slot} ->
-            common_prefix_length(tokens, slot.cached_tokens)
-          end)
+      slots when tokens != [] ->
+        if request_cache_prompt?(state, req_opts) do
+          # Prefer the slot with the longest cached prefix match
+          {best_id, _} =
+            Enum.max_by(slots, fn {_id, slot} ->
+              common_prefix_length(tokens, slot.cached_tokens)
+            end)
 
-        {:ok, best_id, state}
+          {:ok, best_id, state}
+        else
+          [{seq_id, _} | _] = slots
+          {:ok, seq_id, state}
+        end
 
       [{seq_id, _} | _] ->
         {:ok, seq_id, state}
     end
   end
 
-  defp init_slot(state, seq_id, tokens, max_tokens, from, stream_pid, stream_ref) do
+  defp init_slot(state, seq_id, tokens, max_tokens, from, stream_pid, stream_ref, req_opts) do
     slot = state.slots[seq_id]
+    cache_prompt? = request_cache_prompt?(state, req_opts)
 
     # Prefix cache: find common prefix with cached KV. On models that only
     # support whole-sequence seq_rm (`:full`, e.g. hybrid GDN), a partial
@@ -539,7 +568,7 @@ defmodule LlamaCppEx.Server do
     # cache hit in that case unless the new prompt extends the old one
     # exactly (no trim needed).
     raw_match =
-      if state.cache_prompt do
+      if cache_prompt? do
         common_prefix_length(tokens, slot.cached_tokens)
       else
         0
@@ -577,6 +606,7 @@ defmodule LlamaCppEx.Server do
         from: from,
         stream_pid: stream_pid,
         stream_ref: stream_ref,
+        cache_prompt: cache_prompt?,
         prompt_tokens: tokens,
         prompt_tokens_tuple: List.to_tuple(tokens),
         prefill_pos: n_match,
@@ -616,7 +646,7 @@ defmodule LlamaCppEx.Server do
         state = %{state | queue: queue}
         tokens = request_tokens(request)
 
-        case acquire_slot(state, tokens) do
+        case acquire_slot(state, tokens, request_opts(request)) do
           {:ok, seq_id, state} ->
             state = assign_queued_request(state, seq_id, request)
             dequeue_into_slot(state)
@@ -631,14 +661,16 @@ defmodule LlamaCppEx.Server do
     end
   end
 
-  defp request_tokens({_type, tokens, _max, _from, _pid, _ref}), do: tokens
+  defp request_tokens({_type, tokens, _max, _from, _pid, _ref, _req_opts}), do: tokens
 
-  defp assign_queued_request(state, seq_id, {:generate, tokens, max_tokens, from, _, _}) do
-    init_slot(state, seq_id, tokens, max_tokens, from, nil, nil)
+  defp request_opts({_type, _tokens, _max, _from, _pid, _ref, req_opts}), do: req_opts
+
+  defp assign_queued_request(state, seq_id, {:generate, tokens, max_tokens, from, _, _, req_opts}) do
+    init_slot(state, seq_id, tokens, max_tokens, from, nil, nil, req_opts)
   end
 
-  defp assign_queued_request(state, seq_id, {:stream, tokens, max_tokens, _, pid, ref}) do
-    init_slot(state, seq_id, tokens, max_tokens, nil, pid, ref)
+  defp assign_queued_request(state, seq_id, {:stream, tokens, max_tokens, _, pid, ref, req_opts}) do
+    init_slot(state, seq_id, tokens, max_tokens, nil, pid, ref, req_opts)
   end
 
   # --- Internal: Tick loop ---
@@ -976,9 +1008,10 @@ defmodule LlamaCppEx.Server do
     slot = state.slots[seq_id]
     Sampler.reset(slot.sampler)
 
-    # Build full token history for prefix cache
+    # Build full token history for prefix cache. Retention follows the
+    # per-request setting: a cache_prompt: false request leaves nothing behind.
     {cached_tokens, cached_pos} =
-      if state.cache_prompt do
+      if slot.cache_prompt do
         all_tokens = slot.prompt_tokens ++ Enum.reverse(slot.generated_token_ids)
         {all_tokens, slot.pos}
       else
@@ -1002,6 +1035,7 @@ defmodule LlamaCppEx.Server do
       from: nil,
       stream_pid: nil,
       stream_ref: nil,
+      cache_prompt: false,
       prompt_tokens: [],
       prompt_tokens_tuple: {},
       prefill_pos: 0,
