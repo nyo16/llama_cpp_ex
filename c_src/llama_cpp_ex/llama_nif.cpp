@@ -1074,6 +1074,61 @@ int64_t sampler_sample_at(
 }
 FINE_NIF(sampler_sample_at, ERL_NIF_DIRTY_JOB_CPU_BOUND);
 
+// --- Sequence state save/restore (RAM prompt cache) ---
+
+// Size of one sequence's serialized KV state. Cheap metadata walk — used by
+// the caller to enforce a byte budget BEFORE paying for the copy.
+int64_t state_seq_get_size(ErlNifEnv* env, fine::ResourcePtr<LlamaContext> ctx,
+                           int64_t seq_id) {
+    return static_cast<int64_t>(
+        llama_state_seq_get_size(ctx->ctx, static_cast<llama_seq_id>(seq_id)));
+}
+FINE_NIF(state_seq_get_size, 0);
+
+// Serializes a sequence's KV state into a binary. Dirty: the state is
+// KV-sized (potentially hundreds of MB on long contexts).
+std::variant<fine::Ok<fine::Term>, fine::Error<std::string>>
+state_seq_get_data(ErlNifEnv* env, fine::ResourcePtr<LlamaContext> ctx,
+                   int64_t seq_id) {
+    size_t size = llama_state_seq_get_size(ctx->ctx, static_cast<llama_seq_id>(seq_id));
+    if (size == 0) {
+        return fine::Error(std::string("sequence has no state"));
+    }
+
+    ERL_NIF_TERM bin;
+    unsigned char* data = enif_make_new_binary(env, size, &bin);
+    size_t written = llama_state_seq_get_data(
+        ctx->ctx, data, size, static_cast<llama_seq_id>(seq_id));
+
+    if (written != size) {
+        return fine::Error(std::string("state serialization size mismatch"));
+    }
+
+    return fine::Ok(fine::Term(bin));
+}
+FINE_NIF(state_seq_get_data, ERL_NIF_DIRTY_JOB_CPU_BOUND);
+
+// Restores a previously serialized sequence state into dest_seq_id (which
+// must be empty). Returns bytes read. Dirty: KV-sized memcpy.
+std::variant<fine::Ok<int64_t>, fine::Error<std::string>>
+state_seq_set_data(ErlNifEnv* env, fine::ResourcePtr<LlamaContext> ctx,
+                   fine::Term state_bin, int64_t dest_seq_id) {
+    ErlNifBinary bin;
+    if (!enif_inspect_binary(env, state_bin, &bin)) {
+        return fine::Error(std::string("state must be a binary"));
+    }
+
+    size_t read = llama_state_seq_set_data(
+        ctx->ctx, bin.data, bin.size, static_cast<llama_seq_id>(dest_seq_id));
+
+    if (read == 0) {
+        return fine::Error(std::string("state restore failed"));
+    }
+
+    return fine::Ok(static_cast<int64_t>(read));
+}
+FINE_NIF(state_seq_set_data, ERL_NIF_DIRTY_JOB_CPU_BOUND);
+
 // --- Chat template ---
 
 static ERL_NIF_TERM make_binary_term(ErlNifEnv* env, const char* data, size_t len) {

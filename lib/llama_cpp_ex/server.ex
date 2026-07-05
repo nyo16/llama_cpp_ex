@@ -98,6 +98,22 @@ defmodule LlamaCppEx.Server do
     * `:server` - PID of the server process.
     * `:purged_seq_ids` - Sequence IDs whose caches were purged.
 
+  ### `[:llama_cpp_ex, :server, :ram_cache]`
+
+  Emitted on level-2 RAM prompt cache activity (see `:prompt_cache_ram_mb`).
+
+  Measurements:
+
+    * `:bytes` - Size of the entry involved.
+    * `:tokens` - Cached prefix length of the entry involved.
+    * `:total_bytes` - Cache size after the operation.
+    * `:entries` - Entry count after the operation.
+
+  Metadata:
+
+    * `:server` - PID of the server process.
+    * `:op` - `:save`, `:restore`, or `:evict`.
+
   ### `[:llama_cpp_ex, :server, :request, :exception]`
 
   Emitted when an inference error aborts an active request (e.g. the
@@ -125,6 +141,13 @@ defmodule LlamaCppEx.Server do
   # queue into the slot. Server-level options provide the defaults.
   @request_opt_keys [:cache_prompt, :session]
 
+  # Evicted caches below this many tokens are not worth a KV-sized state copy.
+  @ram_cache_min_tokens 32
+
+  # Restore a RAM cache entry only when the usable fraction clears this bar
+  # (llama-server's f_keep heuristic) — restoring is a KV-sized memcpy.
+  @ram_cache_min_keep 0.25
+
   defstruct [
     :model,
     :ctx,
@@ -140,6 +163,11 @@ defmodule LlamaCppEx.Server do
     # cross-stream seq_cp aborts in split mode) AND partial seq_rm support
     # (hybrid GDN recurrent state cannot be partially copied).
     cross_slot_sharing: false,
+    # Level-2 prompt cache: evicted slot KV states saved to RAM, FIFO under a
+    # byte budget. 0 MB = disabled.
+    prompt_cache_ram_mb: 0,
+    ram_cache: [],
+    ram_cache_bytes: 0,
     # `:part`/`:rs` = partial seq_rm works; `:full` = whole-sequence only
     # (hybrid GDN models like Qwen 3.5/3.6); `:no` = no memory module. We
     # only do prefix-cache partial trims when this is `:part` or `:rs`.
@@ -176,6 +204,12 @@ defmodule LlamaCppEx.Server do
       slot via a metadata-only copy. Slots then compete for the shared `n_ctx`
       budget, and idle slots' caches are purged under KV pressure. Defaults to
       `true`. Set `false` for strictly isolated per-slot budgets.
+    * `:prompt_cache_ram_mb` - Byte budget (in MB) for the level-2 RAM prompt
+      cache: when a slot's cached prefix is about to be destroyed it is
+      serialized to RAM and can be restored later instead of re-prefilling.
+      State blobs are KV-sized (up to hundreds of MB for long contexts) —
+      entries larger than the budget are never stored, so a small budget
+      degrades to "disabled" rather than OOM. Defaults to `0` (off).
     * `:batch_strategy` - Batch building strategy module. Defaults to
       `LlamaCppEx.Server.Strategy.DecodeMaximal`. See `LlamaCppEx.Server.BatchStrategy`.
     * Sampling options: `:temp`, `:top_k`, `:top_p`, `:min_p`, `:seed`, `:penalty_repeat`,
@@ -346,6 +380,7 @@ defmodule LlamaCppEx.Server do
     chunk_size = Keyword.get(opts, :chunk_size, 512)
     cache_prompt = Keyword.get(opts, :cache_prompt, true)
     kv_unified = Keyword.get(opts, :kv_unified, true)
+    prompt_cache_ram_mb = Keyword.get(opts, :prompt_cache_ram_mb, 0)
     batch_strategy = Keyword.get(opts, :batch_strategy, LlamaCppEx.Server.Strategy.DecodeMaximal)
 
     sampler_opts =
@@ -445,6 +480,7 @@ defmodule LlamaCppEx.Server do
       chunk_size: chunk_size,
       cache_prompt: cache_prompt,
       cross_slot_sharing: kv_unified and seq_rm_kind == :part,
+      prompt_cache_ram_mb: prompt_cache_ram_mb,
       seq_rm_kind: seq_rm_kind,
       batch_strategy: batch_strategy
     }
@@ -538,7 +574,9 @@ defmodule LlamaCppEx.Server do
       prefilling_slots: counts.prefilling,
       queue_depth: :queue.len(state.queue),
       n_parallel: state.n_parallel,
-      n_batch: state.n_batch
+      n_batch: state.n_batch,
+      ram_cache_entries: length(state.ram_cache),
+      ram_cache_bytes: state.ram_cache_bytes
     }
 
     {:reply, stats, state}
@@ -644,20 +682,8 @@ defmodule LlamaCppEx.Server do
         raw_match
       end
 
-    # Cross-slot sharing: another slot (idle OR active) may hold a longer
-    # matching prefix — e.g. a shared system prompt that only ever needs to be
-    # prefilled once. Adopting it is a metadata-only seq_cp under unified KV.
-    n_match =
-      case best_donor(state, seq_id, tokens, own_match, cache_prompt?) do
-        nil ->
-          apply_own_cache(state, seq_id, slot, own_match)
-          own_match
-
-        {donor_id, donor_lcp} ->
-          _ = LlamaCppEx.NIF.memory_seq_rm(state.ctx.ref, seq_id, 0, -1)
-          :ok = LlamaCppEx.NIF.memory_seq_cp(state.ctx.ref, donor_id, seq_id, 0, donor_lcp)
-          donor_lcp
-      end
+    {state, n_match} = resolve_prefix_cache(state, seq_id, tokens, own_match, cache_prompt?)
+    slot = state.slots[seq_id]
 
     # Reset sampler for fresh generation
     Sampler.reset(slot.sampler)
@@ -695,24 +721,153 @@ defmodule LlamaCppEx.Server do
     put_in(state.slots[seq_id], slot)
   end
 
-  # Applies the slot's OWN cached-prefix decision: trim past the match, keep an
-  # exact-prefix continuation untouched, or clear the sequence entirely.
-  defp apply_own_cache(state, seq_id, slot, own_match) do
+  # Decides where this request's cached prefix comes from and prepares the
+  # slot's KV accordingly. The three sources compete by match length, with
+  # ties broken by cost: the slot's own cache (free) beats a donor slot
+  # (metadata-only seq_cp under unified KV) beats the RAM prompt cache
+  # (KV-sized memcpy). Whenever the slot's own cache is about to be destroyed
+  # or truncated, it is offered to the RAM cache first.
+  defp resolve_prefix_cache(state, seq_id, tokens, own_match, cache_prompt?) do
+    slot = state.slots[seq_id]
+
+    donor = best_donor(state, seq_id, tokens, own_match, cache_prompt?)
+    donor_lcp = if donor, do: elem(donor, 1), else: 0
+
+    ram = if cache_prompt?, do: best_ram_candidate(state, tokens), else: nil
+    ram_lcp = if ram, do: elem(ram, 1), else: 0
+
     cond do
+      donor_lcp > own_match and donor_lcp >= ram_lcp ->
+        {donor_id, _} = donor
+        state = maybe_save_to_ram_cache(state, seq_id, slot)
+        _ = LlamaCppEx.NIF.memory_seq_rm(state.ctx.ref, seq_id, 0, -1)
+        :ok = LlamaCppEx.NIF.memory_seq_cp(state.ctx.ref, donor_id, seq_id, 0, donor_lcp)
+        {state, donor_lcp}
+
+      ram_lcp > own_match ->
+        {entry, _} = ram
+        state = maybe_save_to_ram_cache(state, seq_id, slot)
+        _ = LlamaCppEx.NIF.memory_seq_rm(state.ctx.ref, seq_id, 0, -1)
+        {state, apply_ram_restore(state, seq_id, entry, ram_lcp)}
+
       own_match > 0 and own_match < slot.cached_pos ->
         # Trim KV cache beyond the matched prefix (only safe on `:part`/`:rs`).
+        # The truncated tail may still be valuable to another conversation —
+        # offer the full state to the RAM cache before cutting it.
+        state = maybe_save_to_ram_cache(state, seq_id, slot)
         true = LlamaCppEx.NIF.memory_seq_rm(state.ctx.ref, seq_id, own_match, -1)
+        {state, own_match}
 
       own_match > 0 ->
         # Exact-prefix continuation; nothing to trim.
-        :noop
+        {state, own_match}
 
       true ->
-        # No usable match — clear everything for this slot.
+        # No usable match anywhere — clear the slot.
+        state = maybe_save_to_ram_cache(state, seq_id, slot)
         _ = LlamaCppEx.NIF.memory_seq_rm(state.ctx.ref, seq_id, 0, -1)
+        {state, 0}
     end
+  end
 
-    :ok
+  # Offers a slot's about-to-be-destroyed cache to the RAM prompt cache.
+  # Skipped when the feature is off, the cache is too small to be worth a
+  # KV-sized copy, an existing entry already covers it, or the blob exceeds
+  # the whole budget (degrade to disabled, never OOM).
+  defp maybe_save_to_ram_cache(%{prompt_cache_ram_mb: 0} = state, _seq_id, _slot), do: state
+
+  defp maybe_save_to_ram_cache(state, seq_id, slot) do
+    budget = state.prompt_cache_ram_mb * 1024 * 1024
+
+    with true <- slot.cached_pos >= @ram_cache_min_tokens,
+         false <- ram_cache_covers?(state.ram_cache, slot.cached_tokens, slot.cached_pos),
+         bytes = LlamaCppEx.NIF.state_seq_get_size(state.ctx.ref, seq_id),
+         true <- bytes > 0 and bytes <= budget,
+         {:ok, bin} <- LlamaCppEx.NIF.state_seq_get_data(state.ctx.ref, seq_id) do
+      entry = %{tokens: slot.cached_tokens, len: slot.cached_pos, bin: bin, bytes: bytes}
+
+      state = %{
+        state
+        | ram_cache: state.ram_cache ++ [entry],
+          ram_cache_bytes: state.ram_cache_bytes + bytes
+      }
+
+      state = evict_ram_cache_to_budget(state, budget)
+      emit_ram_cache_telemetry(state, :save, entry)
+      state
+    else
+      _ -> state
+    end
+  end
+
+  defp ram_cache_covers?(entries, cached_tokens, cached_pos) do
+    Enum.any?(entries, fn entry ->
+      entry.len >= cached_pos and
+        common_prefix_length(cached_tokens, entry.tokens) == cached_pos
+    end)
+  end
+
+  # FIFO eviction: drop oldest entries until the cache fits the budget.
+  defp evict_ram_cache_to_budget(state, budget) do
+    if state.ram_cache_bytes <= budget do
+      state
+    else
+      [evicted | rest] = state.ram_cache
+      state = %{state | ram_cache: rest, ram_cache_bytes: state.ram_cache_bytes - evicted.bytes}
+      emit_ram_cache_telemetry(state, :evict, evicted)
+      evict_ram_cache_to_budget(state, budget)
+    end
+  end
+
+  # Best RAM cache entry for this prompt, if one clears the f_keep bar
+  # (restoring is a KV-sized memcpy — not worth it for a sliver) and its
+  # unusable tail can actually be trimmed on this model.
+  defp best_ram_candidate(%{ram_cache: []}, _tokens), do: nil
+
+  defp best_ram_candidate(state, tokens) do
+    {entry, lcp} =
+      state.ram_cache
+      |> Enum.map(fn entry -> {entry, common_prefix_length(tokens, entry.tokens)} end)
+      |> Enum.max_by(fn {_entry, lcp} -> lcp end)
+
+    usable? =
+      lcp > 0 and lcp / entry.len >= @ram_cache_min_keep and
+        (lcp == entry.len or state.seq_rm_kind != :full)
+
+    if usable?, do: {entry, lcp}
+  end
+
+  # Restores a RAM cache entry into an (empty) sequence and trims the unusable
+  # tail. Returns the number of reusable prefix tokens.
+  defp apply_ram_restore(state, seq_id, entry, lcp) do
+    case LlamaCppEx.NIF.state_seq_set_data(state.ctx.ref, entry.bin, seq_id) do
+      {:ok, _bytes} ->
+        if lcp < entry.len do
+          true = LlamaCppEx.NIF.memory_seq_rm(state.ctx.ref, seq_id, lcp, -1)
+        end
+
+        emit_ram_cache_telemetry(state, :restore, entry)
+        lcp
+
+      {:error, reason} ->
+        # A partial restore could leave garbage in the sequence — clear it.
+        Logger.warning("LlamaCppEx.Server: RAM cache restore failed: #{inspect(reason)}")
+        _ = LlamaCppEx.NIF.memory_seq_rm(state.ctx.ref, seq_id, 0, -1)
+        0
+    end
+  end
+
+  defp emit_ram_cache_telemetry(state, op, entry) do
+    :telemetry.execute(
+      [:llama_cpp_ex, :server, :ram_cache],
+      %{
+        bytes: entry.bytes,
+        tokens: entry.len,
+        total_bytes: state.ram_cache_bytes,
+        entries: length(state.ram_cache)
+      },
+      %{server: self(), op: op}
+    )
   end
 
   # Finds the slot whose in-KV tokens share the longest prefix with the new
