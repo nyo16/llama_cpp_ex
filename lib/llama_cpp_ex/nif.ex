@@ -84,6 +84,7 @@ defmodule LlamaCppEx.NIF do
         _attention_type,
         _no_perf,
         _swa_full,
+        _kv_unified,
         _ctx_type,
         _n_rs_seq
       ),

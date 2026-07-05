@@ -136,6 +136,10 @@ defmodule LlamaCppEx.Server do
     n_batch: 2048,
     chunk_size: 512,
     cache_prompt: true,
+    # True when cross-slot prefix sharing is safe: unified KV (partial
+    # cross-stream seq_cp aborts in split mode) AND partial seq_rm support
+    # (hybrid GDN recurrent state cannot be partially copied).
+    cross_slot_sharing: false,
     # `:part`/`:rs` = partial seq_rm works; `:full` = whole-sequence only
     # (hybrid GDN models like Qwen 3.5/3.6); `:no` = no memory module. We
     # only do prefix-cache partial trims when this is `:part` or `:rs`.
@@ -166,6 +170,12 @@ defmodule LlamaCppEx.Server do
     * `:cache_prompt` - Retain KV cache between requests on the same slot for
       prefix reuse. Defaults to `true` (matching llama-server). Overridable
       per request via the `:cache_prompt` option on `generate/3` and friends.
+    * `:kv_unified` - Share one KV buffer across all slots instead of splitting
+      `n_ctx` evenly (`n_ctx/n_parallel` each). Enables cross-slot prefix
+      sharing: a system prompt cached by any slot is adopted by every other
+      slot via a metadata-only copy. Slots then compete for the shared `n_ctx`
+      budget, and idle slots' caches are purged under KV pressure. Defaults to
+      `true`. Set `false` for strictly isolated per-slot budgets.
     * `:batch_strategy` - Batch building strategy module. Defaults to
       `LlamaCppEx.Server.Strategy.DecodeMaximal`. See `LlamaCppEx.Server.BatchStrategy`.
     * Sampling options: `:temp`, `:top_k`, `:top_p`, `:min_p`, `:seed`, `:penalty_repeat`,
@@ -335,6 +345,7 @@ defmodule LlamaCppEx.Server do
     n_batch = Keyword.get(opts, :n_batch, min(n_ctx, 2048))
     chunk_size = Keyword.get(opts, :chunk_size, 512)
     cache_prompt = Keyword.get(opts, :cache_prompt, true)
+    kv_unified = Keyword.get(opts, :kv_unified, true)
     batch_strategy = Keyword.get(opts, :batch_strategy, LlamaCppEx.Server.Strategy.DecodeMaximal)
 
     sampler_opts =
@@ -387,7 +398,8 @@ defmodule LlamaCppEx.Server do
     {:ok, ctx} =
       Context.create(
         model,
-        [n_ctx: n_ctx, n_batch: n_batch, n_seq_max: n_parallel] ++ context_opts
+        [n_ctx: n_ctx, n_batch: n_batch, n_seq_max: n_parallel, kv_unified: kv_unified] ++
+          context_opts
       )
 
     # Probe seq_rm support BEFORE any decode work — the call has the side
@@ -432,6 +444,7 @@ defmodule LlamaCppEx.Server do
       n_batch: n_batch,
       chunk_size: chunk_size,
       cache_prompt: cache_prompt,
+      cross_slot_sharing: kv_unified and seq_rm_kind == :part,
       seq_rm_kind: seq_rm_kind,
       batch_strategy: batch_strategy
     }
@@ -624,26 +637,27 @@ defmodule LlamaCppEx.Server do
 
     needs_trim = raw_match > 0 and raw_match < slot.cached_pos
 
-    n_match =
+    own_match =
       if needs_trim and state.seq_rm_kind == :full do
         0
       else
         raw_match
       end
 
-    cond do
-      n_match > 0 and n_match < slot.cached_pos ->
-        # Trim KV cache beyond the matched prefix (only safe on `:part`/`:rs`).
-        true = LlamaCppEx.NIF.memory_seq_rm(state.ctx.ref, seq_id, n_match, -1)
+    # Cross-slot sharing: another slot (idle OR active) may hold a longer
+    # matching prefix — e.g. a shared system prompt that only ever needs to be
+    # prefilled once. Adopting it is a metadata-only seq_cp under unified KV.
+    n_match =
+      case best_donor(state, seq_id, tokens, own_match, cache_prompt?) do
+        nil ->
+          apply_own_cache(state, seq_id, slot, own_match)
+          own_match
 
-      n_match > 0 ->
-        # Exact-prefix continuation; nothing to trim.
-        :noop
-
-      true ->
-        # No usable match — clear everything for this slot.
-        _ = LlamaCppEx.NIF.memory_seq_rm(state.ctx.ref, seq_id, 0, -1)
-    end
+        {donor_id, donor_lcp} ->
+          _ = LlamaCppEx.NIF.memory_seq_rm(state.ctx.ref, seq_id, 0, -1)
+          :ok = LlamaCppEx.NIF.memory_seq_cp(state.ctx.ref, donor_id, seq_id, 0, donor_lcp)
+          donor_lcp
+      end
 
     # Reset sampler for fresh generation
     Sampler.reset(slot.sampler)
@@ -679,6 +693,65 @@ defmodule LlamaCppEx.Server do
     )
 
     put_in(state.slots[seq_id], slot)
+  end
+
+  # Applies the slot's OWN cached-prefix decision: trim past the match, keep an
+  # exact-prefix continuation untouched, or clear the sequence entirely.
+  defp apply_own_cache(state, seq_id, slot, own_match) do
+    cond do
+      own_match > 0 and own_match < slot.cached_pos ->
+        # Trim KV cache beyond the matched prefix (only safe on `:part`/`:rs`).
+        true = LlamaCppEx.NIF.memory_seq_rm(state.ctx.ref, seq_id, own_match, -1)
+
+      own_match > 0 ->
+        # Exact-prefix continuation; nothing to trim.
+        :noop
+
+      true ->
+        # No usable match — clear everything for this slot.
+        _ = LlamaCppEx.NIF.memory_seq_rm(state.ctx.ref, seq_id, 0, -1)
+    end
+
+    :ok
+  end
+
+  # Finds the slot whose in-KV tokens share the longest prefix with the new
+  # prompt, when that beats the assigned slot's own match. Active donors count
+  # too — only their FED tokens are in the KV, so the match is capped at the
+  # fed length. The pos_max probe guards against any bookkeeping drift between
+  # slot state and the actual KV contents.
+  defp best_donor(state, dst_seq_id, tokens, own_match, cache_prompt?) do
+    if cache_prompt? and state.cross_slot_sharing do
+      state.slots
+      |> Enum.reject(fn {id, _slot} -> id == dst_seq_id end)
+      |> Enum.map(fn {id, slot} -> {id, donor_prefix_match(slot, tokens)} end)
+      |> Enum.max_by(fn {_id, lcp} -> lcp end, fn -> {nil, 0} end)
+      |> validate_donor(state, own_match)
+    else
+      nil
+    end
+  end
+
+  defp validate_donor({donor_id, lcp}, state, own_match) when lcp > own_match and lcp > 0 do
+    if LlamaCppEx.NIF.memory_seq_pos_max(state.ctx.ref, donor_id) + 1 >= lcp do
+      {donor_id, lcp}
+    end
+  end
+
+  defp validate_donor(_candidate, _state, _own_match), do: nil
+
+  defp donor_prefix_match(%{state: :idle} = slot, tokens) do
+    common_prefix_length(tokens, slot.cached_tokens)
+  end
+
+  defp donor_prefix_match(%{state: :prefilling} = slot, tokens) do
+    # Only positions 0..prefill_pos-1 are in the KV so far.
+    min(common_prefix_length(tokens, slot.prompt_tokens), slot.prefill_pos)
+  end
+
+  defp donor_prefix_match(%{state: :generating} = slot, tokens) do
+    fed = slot.prompt_tokens ++ Enum.reverse(slot.generated_token_ids)
+    min(common_prefix_length(tokens, fed), slot.pos)
   end
 
   defp slot_mode(%{stream_pid: pid}) when is_pid(pid), do: :stream

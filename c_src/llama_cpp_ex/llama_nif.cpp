@@ -299,6 +299,7 @@ context_create(
     int64_t attention_type,
     bool no_perf,
     bool swa_full,
+    bool kv_unified,
     // Speculative decoding / MTP
     int64_t ctx_type,
     int64_t n_rs_seq)
@@ -339,6 +340,10 @@ context_create(
     params.attention_type = static_cast<enum llama_attention_type>(attention_type);
     params.no_perf        = no_perf;
     params.swa_full       = swa_full;
+    // Unified KV: all sequences share one buffer/stream, making cross-seq
+    // llama_memory_seq_cp a metadata-only tag copy for ANY position range.
+    // In split mode (false), partial cross-stream seq_cp aborts the process.
+    params.kv_unified     = kv_unified;
 
     // Speculative decoding / MTP
     params.ctx_type = static_cast<enum llama_context_type>(ctx_type);
