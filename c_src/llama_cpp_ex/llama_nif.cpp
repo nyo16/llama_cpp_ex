@@ -489,13 +489,36 @@ FINE_NIF(sampler_sample, ERL_NIF_DIRTY_JOB_CPU_BOUND);
 
 std::variant<fine::Ok<>, fine::Error<std::string>>
 decode(ErlNifEnv* env, fine::ResourcePtr<LlamaContext> ctx, std::vector<int64_t> token_ids) {
-    std::vector<llama_token> tokens(token_ids.begin(), token_ids.end());
+    int n_tokens = static_cast<int>(token_ids.size());
+    if (n_tokens == 0) {
+        return fine::Ok();
+    }
 
-    // Process in chunks of n_batch
+    // Explicit batch instead of llama_batch_get_one: get_one requests logits
+    // for the LAST TOKEN OF EVERY CHUNK, computing (and copying) a full-vocab
+    // logit row per n_batch tokens of prompt for nothing. Only the very last
+    // token needs logits. Positions continue seq 0 from wherever the context
+    // is, preserving get_one's append semantics for repeated decode calls.
+    llama_pos start =
+        llama_memory_seq_pos_max(llama_get_memory(ctx->ctx), 0) + 1;
+
     int n_batch = llama_n_batch(ctx->ctx);
-    for (size_t i = 0; i < tokens.size(); i += n_batch) {
-        int n = std::min(static_cast<int>(tokens.size() - i), n_batch);
-        llama_batch batch = llama_batch_get_one(tokens.data() + i, n);
+    llama_batch& batch = ctx->reserve_batch(std::min(n_tokens, n_batch));
+
+    for (int i = 0; i < n_tokens; i += n_batch) {
+        int n = std::min(n_tokens - i, n_batch);
+        bool is_last_chunk = (i + n >= n_tokens);
+
+        batch.n_tokens = n;
+
+        for (int j = 0; j < n; j++) {
+            batch.token[j]      = static_cast<llama_token>(token_ids[i + j]);
+            batch.pos[j]        = start + static_cast<llama_pos>(i + j);
+            batch.n_seq_id[j]   = 1;
+            batch.seq_id[j][0]  = 0;
+            batch.logits[j]     = (is_last_chunk && j == n - 1);
+        }
+
         int ret = llama_decode(ctx->ctx, batch);
         if (ret != 0) {
             return fine::Error(std::string("llama_decode failed with code: " + std::to_string(ret)));
