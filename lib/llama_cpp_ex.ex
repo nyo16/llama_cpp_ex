@@ -36,6 +36,7 @@ defmodule LlamaCppEx do
     Grammar,
     Model,
     Sampler,
+    Server,
     Thinking,
     Tokenizer
   }
@@ -290,9 +291,11 @@ defmodule LlamaCppEx do
     end
   end
 
-  # OpenAI-style finish_reason for a generator outcome message.
+  # OpenAI-style finish_reason. :eog/:done come from the stateless generator
+  # protocol; :max_tokens from the Server's completion metadata.
   defp finish_reason(:eog), do: "stop"
   defp finish_reason(:done), do: "length"
+  defp finish_reason(:max_tokens), do: "length"
 
   @doc """
   Applies the chat template and generates a response.
@@ -351,10 +354,19 @@ defmodule LlamaCppEx do
 
       completion.choices |> hd() |> Map.get(:message) |> Map.get(:content)
 
+  ## Server routing
+
+  When given a running `LlamaCppEx.Server` (pid or name) instead of a
+  `%Model{}`, the request is served by the batching server: chat templating
+  and tokenization happen in the caller, and the multi-turn prompt benefits
+  from the server's prefix cache. Server-only request options like
+  `:session` and `:cache_prompt` are forwarded.
   """
-  @spec chat_completion(Model.t(), [Chat.message()], keyword()) ::
+  @spec chat_completion(Model.t() | GenServer.server(), [Chat.message()], keyword()) ::
           {:ok, ChatCompletion.t()} | {:error, term()}
-  def chat_completion(%Model{} = model, messages, opts \\ []) when is_list(messages) do
+  def chat_completion(model_or_server, messages, opts \\ [])
+
+  def chat_completion(%Model{} = model, messages, opts) when is_list(messages) do
     {chat_opts, gen_opts} = opts |> resolve_grammar_opts() |> split_chat_opts()
     cfg = gen_config(gen_opts)
 
@@ -369,42 +381,81 @@ defmodule LlamaCppEx do
       # stragglers so they don't pollute the caller's mailbox.
       stop_generator(ref, gen_pid)
 
-      raw_text = Enum.join(texts)
-      enable_thinking = Keyword.get(chat_opts, :enable_thinking, false)
-
-      {reasoning_content, content} =
-        if enable_thinking do
-          {rc, c} = Thinking.parse(raw_text)
-          {if(rc == "", do: nil, else: rc), c}
-        else
-          {nil, raw_text}
-        end
-
-      completion = %ChatCompletion{
-        id: "chatcmpl-" <> random_hex(12),
-        object: "chat.completion",
-        created: System.os_time(:second),
-        model: Model.desc(model),
-        choices: [
-          %{
-            index: 0,
-            message: %{
-              role: "assistant",
-              content: content,
-              reasoning_content: reasoning_content
-            },
-            finish_reason: finish_reason
-          }
-        ],
-        usage: %{
-          prompt_tokens: length(prompt_tokens),
-          completion_tokens: completion_tokens,
-          total_tokens: length(prompt_tokens) + completion_tokens
-        }
-      }
+      completion =
+        build_chat_completion(
+          Model.desc(model),
+          length(prompt_tokens),
+          Enum.join(texts),
+          finish_reason,
+          completion_tokens,
+          chat_opts
+        )
 
       {:ok, completion}
     end
+  end
+
+  def chat_completion(server, messages, opts) when is_list(messages) do
+    {chat_opts, gen_opts} = opts |> resolve_grammar_opts() |> split_chat_opts()
+    model = Server.get_model(server)
+
+    with {:ok, prompt} <- Chat.apply_template(model, messages, chat_opts),
+         {:ok, prompt_tokens} <- Tokenizer.encode(model, prompt),
+         {:ok, result} <- Server.complete_tokens(server, prompt_tokens, gen_opts) do
+      completion =
+        build_chat_completion(
+          Model.desc(model),
+          length(prompt_tokens),
+          result.text,
+          finish_reason(result.finish_reason),
+          result.completion_tokens,
+          chat_opts
+        )
+
+      {:ok, completion}
+    end
+  end
+
+  defp build_chat_completion(
+         model_desc,
+         prompt_tokens,
+         raw_text,
+         finish_reason,
+         completion_tokens,
+         chat_opts
+       ) do
+    enable_thinking = Keyword.get(chat_opts, :enable_thinking, false)
+
+    {reasoning_content, content} =
+      if enable_thinking do
+        {rc, c} = Thinking.parse(raw_text)
+        {if(rc == "", do: nil, else: rc), c}
+      else
+        {nil, raw_text}
+      end
+
+    %ChatCompletion{
+      id: "chatcmpl-" <> random_hex(12),
+      object: "chat.completion",
+      created: System.os_time(:second),
+      model: model_desc,
+      choices: [
+        %{
+          index: 0,
+          message: %{
+            role: "assistant",
+            content: content,
+            reasoning_content: reasoning_content
+          },
+          finish_reason: finish_reason
+        }
+      ],
+      usage: %{
+        prompt_tokens: prompt_tokens,
+        completion_tokens: completion_tokens,
+        total_tokens: prompt_tokens + completion_tokens
+      }
+    }
   end
 
   @doc """
@@ -429,8 +480,11 @@ defmodule LlamaCppEx do
       end)
 
   """
-  @spec stream_chat_completion(Model.t(), [Chat.message()], keyword()) :: Enumerable.t()
-  def stream_chat_completion(%Model{} = model, messages, opts \\ []) when is_list(messages) do
+  @spec stream_chat_completion(Model.t() | GenServer.server(), [Chat.message()], keyword()) ::
+          Enumerable.t()
+  def stream_chat_completion(model_or_server, messages, opts \\ [])
+
+  def stream_chat_completion(%Model{} = model, messages, opts) when is_list(messages) do
     {chat_opts, gen_opts} = opts |> resolve_grammar_opts() |> split_chat_opts()
     cfg = gen_config(gen_opts)
 
@@ -441,20 +495,8 @@ defmodule LlamaCppEx do
         {:ok, ctx, sampler} = create_gen_resources(model, tokens, cfg)
         {ref, gen_pid} = spawn_generator(ctx, sampler, tokens, cfg.max_tokens)
 
-        enable_thinking = Keyword.get(chat_opts, :enable_thinking, false)
-
-        %{
-          ref: ref,
-          gen_pid: gen_pid,
-          timeout: cfg.timeout,
-          id: "chatcmpl-" <> random_hex(12),
-          created: System.os_time(:second),
-          model: Model.desc(model),
-          phase: :first,
-          enable_thinking: enable_thinking,
-          thinking_parser:
-            if(enable_thinking, do: Thinking.stream_parser(thinking: true), else: nil)
-        }
+        chat_chunk_state(ref, cfg.timeout, Model.desc(model), chat_opts)
+        |> Map.put(:gen_pid, gen_pid)
       end,
       fn
         %{phase: :first} = state ->
@@ -479,6 +521,63 @@ defmodule LlamaCppEx do
       end,
       fn %{ref: ref, gen_pid: gen_pid} -> stop_generator(ref, gen_pid) end
     )
+  end
+
+  # Server-routed streaming: templating/tokenization in the caller, tokens
+  # served by the batching server with prefix caching.
+  def stream_chat_completion(server, messages, opts) when is_list(messages) do
+    {chat_opts, gen_opts} = opts |> resolve_grammar_opts() |> split_chat_opts()
+    timeout = Keyword.get(gen_opts, :timeout, 30_000)
+
+    Stream.resource(
+      fn ->
+        model = Server.get_model(server)
+        {:ok, prompt} = Chat.apply_template(model, messages, chat_opts)
+        {:ok, tokens} = Tokenizer.encode(model, prompt)
+        ref = make_ref()
+        :ok = Server.subscribe_stream_tokens(server, tokens, ref, gen_opts)
+
+        chat_chunk_state(ref, timeout, Model.desc(model), chat_opts)
+      end,
+      fn
+        %{phase: :first} = state ->
+          {[chunk(state, %{role: "assistant", content: ""}, nil)], %{state | phase: :streaming}}
+
+        %{phase: :streaming, ref: ref, timeout: timeout} = state ->
+          receive do
+            {^ref, {:token, text}} ->
+              token_chunks(state, text)
+
+            {^ref, {:done, reason}} ->
+              {[chunk(state, %{}, finish_reason(reason))], %{state | phase: :done}}
+
+            {^ref, {:error, _reason}} ->
+              {:halt, state}
+          after
+            timeout -> {:halt, state}
+          end
+
+        %{phase: :done} = state ->
+          {:halt, state}
+      end,
+      fn %{ref: ref} -> flush_stream_messages(ref) end
+    )
+  end
+
+  # Shared per-stream state for the chat-completion chunk builders.
+  defp chat_chunk_state(ref, timeout, model_desc, chat_opts) do
+    enable_thinking = Keyword.get(chat_opts, :enable_thinking, false)
+
+    %{
+      ref: ref,
+      timeout: timeout,
+      id: "chatcmpl-" <> random_hex(12),
+      created: System.os_time(:second),
+      model: model_desc,
+      phase: :first,
+      enable_thinking: enable_thinking,
+      thinking_parser: if(enable_thinking, do: Thinking.stream_parser(thinking: true), else: nil)
+    }
   end
 
   # Emits the chunk(s) for one generated token, routing through the thinking

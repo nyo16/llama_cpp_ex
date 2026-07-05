@@ -319,7 +319,7 @@ defmodule LlamaCppEx.Server do
       fn {ref, timeout} = state ->
         receive do
           {^ref, {:token, text}} -> {[text], state}
-          {^ref, :done} -> {:halt, state}
+          {^ref, {:done, _reason}} -> {:halt, state}
           {^ref, {:error, _reason}} -> {:halt, state}
         after
           timeout -> {:halt, state}
@@ -356,6 +356,35 @@ defmodule LlamaCppEx.Server do
   end
 
   @doc """
+  Like `generate_tokens/3`, but returns completion metadata alongside the text.
+
+  Returns `{:ok, %{text: text, completion_tokens: n, finish_reason: reason}}`
+  where `reason` is `:eog` or `:max_tokens`. Used by the OpenAI-shaped
+  `LlamaCppEx.chat_completion/3` when routed through a server.
+  """
+  @spec complete_tokens(GenServer.server(), [integer()], keyword()) ::
+          {:ok, %{text: String.t(), completion_tokens: non_neg_integer(), finish_reason: atom()}}
+          | {:error, term()}
+  def complete_tokens(server, token_ids, opts \\ []) when is_list(token_ids) do
+    timeout = Keyword.get(opts, :timeout, 60_000)
+    max_tokens = Keyword.get(opts, :max_tokens, 256)
+    req_opts = Keyword.take(opts, @request_opt_keys) ++ [reply: :full]
+    GenServer.call(server, {:generate_tokens, token_ids, max_tokens, req_opts}, timeout)
+  end
+
+  @doc false
+  # Subscribes `self()` to a token stream using the raw message protocol:
+  # {ref, {:token, piece}} per piece, then {ref, {:done, :eog | :max_tokens}}
+  # or {ref, {:error, reason}}. Internal — used by the chat-completion
+  # streaming path; library users should call stream/3 or stream_tokens/3.
+  @spec subscribe_stream_tokens(GenServer.server(), [integer()], reference(), keyword()) :: :ok
+  def subscribe_stream_tokens(server, token_ids, ref, opts \\ []) when is_list(token_ids) do
+    max_tokens = Keyword.get(opts, :max_tokens, 256)
+    req_opts = Keyword.take(opts, @request_opt_keys)
+    GenServer.call(server, {:stream_tokens, token_ids, max_tokens, self(), ref, req_opts})
+  end
+
+  @doc """
   Returns a stream of generated text chunks from pre-tokenized input.
 
   ## Options
@@ -382,7 +411,7 @@ defmodule LlamaCppEx.Server do
       fn {ref, timeout} = state ->
         receive do
           {^ref, {:token, text}} -> {[text], state}
-          {^ref, :done} -> {:halt, state}
+          {^ref, {:done, _reason}} -> {:halt, state}
           {^ref, {:error, _reason}} -> {:halt, state}
         after
           timeout -> {:halt, state}
@@ -738,6 +767,7 @@ defmodule LlamaCppEx.Server do
         stream_pid: stream_pid,
         stream_ref: stream_ref,
         sampler: sampler,
+        reply_mode: Keyword.get(req_opts, :reply, :text),
         cache_prompt: cache_prompt?,
         prompt_tokens: tokens,
         prompt_tokens_tuple: List.to_tuple(tokens),
@@ -1357,11 +1387,11 @@ defmodule LlamaCppEx.Server do
     t_end = System.monotonic_time()
 
     if slot.from do
-      GenServer.reply(slot.from, {:ok, accumulated_text(slot)})
+      GenServer.reply(slot.from, {:ok, completion_reply(slot, stop_reason)})
     end
 
     if slot.stream_pid && slot.stream_ref do
-      send(slot.stream_pid, {slot.stream_ref, :done})
+      send(slot.stream_pid, {slot.stream_ref, {:done, stop_reason}})
     end
 
     # Emit telemetry
@@ -1472,6 +1502,7 @@ defmodule LlamaCppEx.Server do
       from: nil,
       stream_pid: nil,
       stream_ref: nil,
+      reply_mode: :text,
       cache_prompt: false,
       prompt_tokens: [],
       prompt_tokens_tuple: {},
@@ -1497,6 +1528,18 @@ defmodule LlamaCppEx.Server do
   defp accumulated_text(slot) do
     slot.accumulated_pieces |> Enum.reverse() |> IO.iodata_to_binary()
   end
+
+  # generate/generate_tokens reply with plain text; complete_tokens gets
+  # completion metadata for the OpenAI-shaped API.
+  defp completion_reply(%{reply_mode: :full} = slot, stop_reason) do
+    %{
+      text: accumulated_text(slot),
+      completion_tokens: slot.tokens_generated,
+      finish_reason: stop_reason
+    }
+  end
+
+  defp completion_reply(slot, _stop_reason), do: accumulated_text(slot)
 
   defp fail_all_active_slots(state, reason) do
     active_slots =
