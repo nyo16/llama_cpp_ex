@@ -38,7 +38,8 @@ defmodule LlamaCppEx do
     Sampler,
     Server,
     Thinking,
-    Tokenizer
+    Tokenizer,
+    UTF8Stream
   }
 
   @context_opt_keys [
@@ -222,20 +223,40 @@ defmodule LlamaCppEx do
         {:ok, tokens} = Tokenizer.encode(model, prompt)
         {:ok, ctx, sampler} = create_gen_resources(model, tokens, cfg)
         {ref, gen_pid, cancel} = spawn_generator(ctx, sampler, tokens, cfg.max_tokens)
-        {ref, gen_pid, cancel, cfg.timeout}
+        {ref, gen_pid, cancel, cfg.timeout, _utf8_pending = ""}
       end,
-      fn {ref, _gen_pid, _cancel, timeout} = state ->
-        receive do
-          {^ref, {:token, _id, text}} -> {[text], state}
-          {^ref, outcome} when outcome in [:eog, :done] -> {:halt, state}
-          {^ref, {:error, _reason}} -> {:halt, state}
-        after
-          timeout -> {:halt, state}
-        end
+      fn
+        {:flushed, _ref, _gen_pid, _cancel} = state ->
+          {:halt, state}
+
+        {ref, gen_pid, cancel, timeout, pending} = state ->
+          receive do
+            {^ref, {:token, _id, text}} ->
+              # Emit only whole codepoints; hold back a split multibyte tail.
+              {out, pending} = UTF8Stream.push(pending, text)
+              emitted = if out == "", do: [], else: [out]
+              {emitted, {ref, gen_pid, cancel, timeout, pending}}
+
+            {^ref, outcome} when outcome in [:eog, :done] ->
+              flush_then_halt(pending, {:flushed, ref, gen_pid, cancel})
+
+            {^ref, {:error, _reason}} ->
+              {:halt, state}
+          after
+            timeout -> {:halt, state}
+          end
       end,
-      fn {ref, gen_pid, cancel, _timeout} -> stop_generator(ref, gen_pid, cancel) end
+      fn
+        {:flushed, ref, gen_pid, cancel} -> stop_generator(ref, gen_pid, cancel)
+        {ref, gen_pid, cancel, _timeout, _pending} -> stop_generator(ref, gen_pid, cancel)
+      end
     )
   end
+
+  # Emits held-back trailing bytes (if any) as a final element, then halts on
+  # the next pull.
+  defp flush_then_halt("", state), do: {:halt, state}
+  defp flush_then_halt(pending, state), do: {[pending], state}
 
   # --- Shared generation plumbing ---
 
@@ -521,10 +542,15 @@ defmodule LlamaCppEx do
         %{phase: :streaming, ref: ref, timeout: timeout} = state ->
           receive do
             {^ref, {:token, _id, text}} ->
-              token_chunks(state, text)
+              # Whole codepoints only — the thinking parser and consumers
+              # must never see a split multibyte sequence.
+              {out, pending} = UTF8Stream.push(state.utf8_pending, text)
+              state = %{state | utf8_pending: pending}
+              if out == "", do: {[], state}, else: token_chunks(state, out)
 
             {^ref, outcome} when outcome in [:eog, :done] ->
-              {[chunk(state, %{}, finish_reason(outcome))], %{state | phase: :done}}
+              {tail, state} = flush_pending_chunks(state)
+              {tail ++ [chunk(state, %{}, finish_reason(outcome))], %{state | phase: :done}}
 
             {^ref, {:error, _reason}} ->
               {:halt, state}
@@ -584,6 +610,12 @@ defmodule LlamaCppEx do
     )
   end
 
+  defp flush_pending_chunks(%{utf8_pending: ""} = state), do: {[], state}
+
+  defp flush_pending_chunks(%{utf8_pending: pending} = state) do
+    token_chunks(%{state | utf8_pending: ""}, pending)
+  end
+
   # Shared per-stream state for the chat-completion chunk builders.
   defp chat_chunk_state(ref, timeout, model_desc, chat_opts) do
     enable_thinking = Keyword.get(chat_opts, :enable_thinking, false)
@@ -595,6 +627,7 @@ defmodule LlamaCppEx do
       created: System.os_time(:second),
       model: model_desc,
       phase: :first,
+      utf8_pending: "",
       enable_thinking: enable_thinking,
       thinking_parser: if(enable_thinking, do: Thinking.stream_parser(thinking: true), else: nil)
     }

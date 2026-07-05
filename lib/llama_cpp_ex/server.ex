@@ -152,7 +152,7 @@ defmodule LlamaCppEx.Server do
 
   require Logger
 
-  alias LlamaCppEx.{Context, Model, Sampler, Tokenizer}
+  alias LlamaCppEx.{Context, Model, Sampler, Tokenizer, UTF8Stream}
 
   # Sampling options accepted both at server start (defaults) and per request
   # (overrides). Keep in sync with LlamaCppEx.Sampler.create/2.
@@ -1368,15 +1368,27 @@ defmodule LlamaCppEx.Server do
   end
 
   # Streams a sampled piece to the slot's subscriber (if any) and folds it
-  # into the slot's accumulated output/counters.
+  # into the slot's accumulated output/counters. Streamed bytes pass through
+  # a per-slot UTF-8 buffer so a codepoint split across tokens is never sent
+  # partially; the accumulated text keeps raw pieces (whole result is valid).
   defp emit_piece(slot, piece, now) do
-    if slot.stream_pid && slot.stream_ref do
-      send(slot.stream_pid, {slot.stream_ref, {:token, piece}})
-    end
+    utf8_pending =
+      if slot.stream_pid && slot.stream_ref do
+        {out, pending} = UTF8Stream.push(slot.utf8_pending, piece)
+
+        if out != "" do
+          send(slot.stream_pid, {slot.stream_ref, {:token, out}})
+        end
+
+        pending
+      else
+        slot.utf8_pending
+      end
 
     %{
       slot
       | accumulated_pieces: [piece | slot.accumulated_pieces],
+        utf8_pending: utf8_pending,
         tokens_generated: slot.tokens_generated + 1,
         t_first_token: slot.t_first_token || now
     }
@@ -1470,6 +1482,12 @@ defmodule LlamaCppEx.Server do
     end
 
     if slot.stream_pid && slot.stream_ref do
+      # Flush any held-back trailing bytes (best effort — an incomplete
+      # codepoint at end-of-generation is the model's own output).
+      if slot.utf8_pending != "" do
+        send(slot.stream_pid, {slot.stream_ref, {:token, slot.utf8_pending}})
+      end
+
       send(slot.stream_pid, {slot.stream_ref, {:done, stop_reason}})
     end
 
@@ -1646,6 +1664,7 @@ defmodule LlamaCppEx.Server do
       tokens_generated: 0,
       max_tokens: 0,
       accumulated_pieces: [],
+      utf8_pending: "",
       t_start: nil,
       t_first_token: nil,
       n_prompt_tokens: 0,
