@@ -595,8 +595,10 @@ embed_decode(
         return fine::Error(std::string("empty token list"));
     }
 
-    // Clear memory for a fresh decode
-    llama_memory_clear(llama_get_memory(ctx->ctx), true);
+    // Fresh decode for THIS sequence only — clearing the whole memory would
+    // clobber every other sequence if the context is ever shared.
+    llama_memory_seq_rm(llama_get_memory(ctx->ctx),
+                        static_cast<llama_seq_id>(seq_id), -1, -1);
 
     // Build batch with explicit seq_id and position tracking
     llama_batch batch = llama_batch_init(n_tokens, 0, 1);
@@ -621,7 +623,11 @@ embed_decode(
 }
 FINE_NIF(embed_decode, ERL_NIF_DIRTY_JOB_CPU_BOUND);
 
-std::variant<fine::Ok<std::vector<double>>, fine::Error<std::string>>
+// Returns the embedding as a raw little-endian f32 binary (native order on
+// all supported targets): one 16 KB refc binary for a 4096-dim vector instead
+// of ~100 KB of boxed floats + list cells per call. The Elixir wrapper
+// decodes to a list by default and passes the binary through for Nx users.
+std::variant<fine::Ok<fine::Term>, fine::Error<std::string>>
 get_embeddings(
     ErlNifEnv* env,
     fine::ResourcePtr<LlamaContext> ctx,
@@ -645,14 +651,16 @@ get_embeddings(
         return fine::Error(std::string("failed to get embeddings (null pointer)"));
     }
 
-    std::vector<double> out(n_embd);
+    ERL_NIF_TERM bin;
+    float* out = reinterpret_cast<float*>(
+        enif_make_new_binary(env, static_cast<size_t>(n_embd) * sizeof(float), &bin));
 
     if (normalize == 2) {
         // L2 normalization
         double sum = 0.0;
         for (int i = 0; i < n_embd; i++) sum += (double)embd[i] * (double)embd[i];
-        double norm = sum > 0.0 ? 1.0 / std::sqrt(sum) : 0.0;
-        for (int i = 0; i < n_embd; i++) out[i] = (double)embd[i] * norm;
+        float norm = sum > 0.0 ? static_cast<float>(1.0 / std::sqrt(sum)) : 0.0f;
+        for (int i = 0; i < n_embd; i++) out[i] = embd[i] * norm;
     } else if (normalize == 0) {
         // Max-abs normalization
         double max_abs = 0.0;
@@ -660,14 +668,14 @@ get_embeddings(
             double a = std::abs((double)embd[i]);
             if (a > max_abs) max_abs = a;
         }
-        double norm = max_abs > 0.0 ? 1.0 / max_abs : 0.0;
-        for (int i = 0; i < n_embd; i++) out[i] = (double)embd[i] * norm;
+        float norm = max_abs > 0.0 ? static_cast<float>(1.0 / max_abs) : 0.0f;
+        for (int i = 0; i < n_embd; i++) out[i] = embd[i] * norm;
     } else {
         // No normalization
-        for (int i = 0; i < n_embd; i++) out[i] = (double)embd[i];
+        std::memcpy(out, embd, static_cast<size_t>(n_embd) * sizeof(float));
     }
 
-    return fine::Ok(out);
+    return fine::Ok(fine::Term(bin));
 }
 FINE_NIF(get_embeddings, 0);
 
@@ -696,8 +704,12 @@ embed_batch_decode(
         return fine::Error(std::string("no tokens to decode"));
     }
 
-    // Fresh decode for this batch
-    llama_memory_clear(llama_get_memory(ctx->ctx), true);
+    // Fresh decode for the sequences in THIS batch only (successive groups
+    // reuse the same seq ids) — never clear the whole memory.
+    for (auto& [seq_id, tokens] : sequences) {
+        llama_memory_seq_rm(llama_get_memory(ctx->ctx),
+                            static_cast<llama_seq_id>(seq_id), -1, -1);
+    }
 
     llama_batch batch = llama_batch_init(total, 0, 1);
     batch.n_tokens = total;

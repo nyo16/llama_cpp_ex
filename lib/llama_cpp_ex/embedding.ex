@@ -18,13 +18,18 @@ defmodule LlamaCppEx.Embedding do
     * `:pooling_type` - Pooling type. Defaults to `:unspecified` (model's default).
       Values: `:unspecified`, `:none`, `:mean`, `:cls`, `:last`.
     * `:normalize` - Normalization mode. `2` = L2 (default), `0` = max-abs, `-1` = none.
+    * `:format` - `:list` (default) returns a list of floats; `:binary`
+      returns the raw native-endian f32 binary as produced by the NIF —
+      zero-copy and directly loadable via `Nx.from_binary(bin, :f32)`.
 
   """
-  @spec embed(Model.t(), String.t(), keyword()) :: {:ok, t()} | {:error, String.t()}
+  @spec embed(Model.t(), String.t(), keyword()) ::
+          {:ok, t() | binary()} | {:error, String.t()}
   def embed(%Model{} = model, text, opts \\ []) when is_binary(text) do
     n_ctx = Keyword.get(opts, :n_ctx, 2048)
     pooling_type = Keyword.get(opts, :pooling_type, :unspecified)
     normalize = Keyword.get(opts, :normalize, 2)
+    format = Keyword.get(opts, :format, :list)
 
     {:ok, tokens} = Tokenizer.encode(model, text)
     ctx_size = max(n_ctx, length(tokens) + 8)
@@ -36,7 +41,7 @@ defmodule LlamaCppEx.Embedding do
              pooling_type: pooling_type
            ),
          :ok <- embed_decode(ctx, tokens, 0) do
-      get_embeddings(ctx, 0, normalize)
+      get_embeddings(ctx, 0, normalize, format)
     end
   end
 
@@ -69,6 +74,7 @@ defmodule LlamaCppEx.Embedding do
     n_ctx = Keyword.get(opts, :n_ctx, 2048)
     pooling_type = Keyword.get(opts, :pooling_type, :unspecified)
     normalize = Keyword.get(opts, :normalize, 2)
+    format = Keyword.get(opts, :format, :list)
     max_seqs = Keyword.get(opts, :max_batch_sequences, @default_max_batch_sequences)
 
     # texts is non-empty here (embed_batch handles the [] case), so tokenized
@@ -86,7 +92,7 @@ defmodule LlamaCppEx.Embedding do
                pooling_type: pooling_type,
                n_seq_max: max(max_group, 1)
              ) do
-        decode_groups(ctx, groups, normalize)
+        decode_groups(ctx, groups, normalize, format)
       end
     end
   end
@@ -118,17 +124,17 @@ defmodule LlamaCppEx.Embedding do
 
   # Decodes each group in one batch and extracts per-sequence embeddings,
   # preserving the original text order.
-  defp decode_groups(ctx, groups, normalize) do
-    with {:ok, nested} <- map_while_ok(groups, &decode_group(ctx, &1, normalize)) do
+  defp decode_groups(ctx, groups, normalize, format) do
+    with {:ok, nested} <- map_while_ok(groups, &decode_group(ctx, &1, normalize, format)) do
       {:ok, Enum.concat(nested)}
     end
   end
 
-  defp decode_group(ctx, group, normalize) do
+  defp decode_group(ctx, group, normalize, format) do
     sequences = Enum.with_index(group, fn tokens, i -> {i, tokens} end)
 
     with :ok <- embed_batch_decode(ctx, sequences) do
-      map_while_ok(0..(length(group) - 1)//1, &get_embeddings(ctx, &1, normalize))
+      map_while_ok(0..(length(group) - 1)//1, &get_embeddings(ctx, &1, normalize, format))
     end
   end
 
@@ -162,6 +168,14 @@ defmodule LlamaCppEx.Embedding do
   defp embed_batch_decode(%Context{ref: ref}, sequences),
     do: LlamaCppEx.NIF.embed_batch_decode(ref, sequences)
 
-  defp get_embeddings(%Context{ref: ref}, seq_id, normalize),
-    do: LlamaCppEx.NIF.get_embeddings(ref, seq_id, normalize)
+  # The NIF returns a raw native-endian f32 binary; decode to a float list
+  # unless the caller asked for the binary itself (Nx interop).
+  defp get_embeddings(%Context{ref: ref}, seq_id, normalize, format) do
+    with {:ok, bin} <- LlamaCppEx.NIF.get_embeddings(ref, seq_id, normalize) do
+      case format do
+        :binary -> {:ok, bin}
+        :list -> {:ok, for(<<f::float-32-native <- bin>>, do: f)}
+      end
+    end
+  end
 end
