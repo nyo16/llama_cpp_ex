@@ -153,9 +153,24 @@ defmodule LlamaCppEx.Server do
 
   alias LlamaCppEx.{Context, Model, Sampler, Tokenizer}
 
+  # Sampling options accepted both at server start (defaults) and per request
+  # (overrides). Keep in sync with LlamaCppEx.Sampler.create/2.
+  @sampler_opt_keys [
+    :seed,
+    :temp,
+    :top_k,
+    :top_p,
+    :min_p,
+    :penalty_repeat,
+    :penalty_freq,
+    :penalty_present,
+    :grammar,
+    :grammar_root
+  ]
+
   # Per-request options accepted by generate/stream and carried through the
   # queue into the slot. Server-level options provide the defaults.
-  @request_opt_keys [:cache_prompt, :session]
+  @request_opt_keys [:cache_prompt, :session] ++ @sampler_opt_keys
 
   # Evicted caches below this many tokens are not worth a KV-sized state copy.
   @ram_cache_min_tokens 32
@@ -258,6 +273,9 @@ defmodule LlamaCppEx.Server do
     * `:session` - Any term identifying a conversation. Requests with the same
       session are routed to the same slot whenever it is free, keeping their
       cached prefix intact under concurrency.
+    * Sampling options (`:temp`, `:top_k`, `:top_p`, `:min_p`, `:seed`,
+      `:penalty_repeat`, `:penalty_freq`, `:penalty_present`, `:grammar`,
+      `:grammar_root`) - override the server-level defaults for this request.
 
   """
   @spec generate(GenServer.server(), String.t(), keyword()) ::
@@ -406,19 +424,7 @@ defmodule LlamaCppEx.Server do
     prompt_cache_ram_mb = Keyword.get(opts, :prompt_cache_ram_mb, 0)
     batch_strategy = Keyword.get(opts, :batch_strategy, LlamaCppEx.Server.Strategy.DecodeMaximal)
 
-    sampler_opts =
-      Keyword.take(opts, [
-        :seed,
-        :temp,
-        :top_k,
-        :top_p,
-        :min_p,
-        :penalty_repeat,
-        :penalty_freq,
-        :penalty_present,
-        :grammar,
-        :grammar_root
-      ])
+    sampler_opts = Keyword.take(opts, @sampler_opt_keys)
 
     model_opts =
       Keyword.take(opts, [
@@ -689,9 +695,17 @@ defmodule LlamaCppEx.Server do
     # an M-RoPE position-mismatch abort on the next decode. Disable the
     # cache hit in that case unless the new prompt extends the old one
     # exactly (no trim needed).
+    #
+    # A cached match may never cover the WHOLE prompt: at least the last
+    # prompt token must be decoded to produce logits for sampling the first
+    # generated token (llama-server does the same n_past-- adjustment). An
+    # uncapped full match would enter the tick with nothing to prefill and no
+    # logits to sample — a stuck slot.
+    max_reuse = length(tokens) - 1
+
     raw_match =
       if cache_prompt? do
-        common_prefix_length(tokens, slot.cached_tokens)
+        min(common_prefix_length(tokens, slot.cached_tokens), max_reuse)
       else
         0
       end
@@ -710,8 +724,11 @@ defmodule LlamaCppEx.Server do
     {state, n_match} = resolve_prefix_cache(state, seq_id, tokens, own_match, cache_prompt?)
     slot = state.slots[seq_id]
 
-    # Reset sampler for fresh generation
-    Sampler.reset(slot.sampler)
+    # Fresh sampler per request: request opts override server defaults, and a
+    # new chain means clean grammar/penalty state and a fresh seed. The old
+    # sampler resource is dropped and freed by GC.
+    sampler_opts = Keyword.merge(state.sampler_opts, Keyword.take(req_opts, @sampler_opt_keys))
+    {:ok, sampler} = Sampler.create(state.model, sampler_opts)
 
     slot = %{
       slot
@@ -719,6 +736,7 @@ defmodule LlamaCppEx.Server do
         from: from,
         stream_pid: stream_pid,
         stream_ref: stream_ref,
+        sampler: sampler,
         cache_prompt: cache_prompt?,
         prompt_tokens: tokens,
         prompt_tokens_tuple: List.to_tuple(tokens),
@@ -898,9 +916,14 @@ defmodule LlamaCppEx.Server do
   defp best_ram_candidate(%{ram_cache: []}, _tokens), do: nil
 
   defp best_ram_candidate(state, tokens) do
+    # Cap at len-1: the last prompt token must be decoded for logits.
+    max_reuse = length(tokens) - 1
+
     {entry, lcp} =
       state.ram_cache
-      |> Enum.map(fn entry -> {entry, common_prefix_length(tokens, entry.tokens)} end)
+      |> Enum.map(fn entry ->
+        {entry, min(common_prefix_length(tokens, entry.tokens), max_reuse)}
+      end)
       |> Enum.max_by(fn {_entry, lcp} -> lcp end)
 
     usable? =
@@ -950,9 +973,12 @@ defmodule LlamaCppEx.Server do
   # slot state and the actual KV contents.
   defp best_donor(state, dst_seq_id, tokens, own_match, cache_prompt?) do
     if cache_prompt? and state.cross_slot_sharing do
+      # Cap at len-1: the last prompt token must be decoded for logits.
+      max_reuse = length(tokens) - 1
+
       state.slots
       |> Enum.reject(fn {id, _slot} -> id == dst_seq_id end)
-      |> Enum.map(fn {id, slot} -> {id, donor_prefix_match(slot, tokens)} end)
+      |> Enum.map(fn {id, slot} -> {id, min(donor_prefix_match(slot, tokens), max_reuse)} end)
       |> Enum.max_by(fn {_id, lcp} -> lcp end, fn -> {nil, 0} end)
       |> validate_donor(state, own_match)
     else
@@ -1158,9 +1184,8 @@ defmodule LlamaCppEx.Server do
 
     emit_request_exception(slot, seq_id, reason)
 
-    # Clear KV cache and reset — don't preserve cache on error
+    # Clear KV cache — don't preserve cache on error
     LlamaCppEx.NIF.memory_seq_rm(state.ctx.ref, seq_id, 0, -1)
-    Sampler.reset(slot.sampler)
 
     slot =
       slot
@@ -1413,10 +1438,10 @@ defmodule LlamaCppEx.Server do
 
   defp reset_slot(state, seq_id) do
     slot = state.slots[seq_id]
-    Sampler.reset(slot.sampler)
 
     # Build full token history for prefix cache. Retention follows the
     # per-request setting: a cache_prompt: false request leaves nothing behind.
+    # (No sampler reset — every request gets a fresh sampler at init_slot.)
     {cached_tokens, cached_pos} =
       if slot.cache_prompt do
         all_tokens = slot.prompt_tokens ++ Enum.reverse(slot.generated_token_ids)
