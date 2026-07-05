@@ -123,7 +123,7 @@ defmodule LlamaCppEx.Server do
 
   # Per-request options accepted by generate/stream and carried through the
   # queue into the slot. Server-level options provide the defaults.
-  @request_opt_keys [:cache_prompt]
+  @request_opt_keys [:cache_prompt, :session]
 
   defstruct [
     :model,
@@ -131,6 +131,7 @@ defmodule LlamaCppEx.Server do
     :sampler_opts,
     slots: %{},
     queue: nil,
+    sessions: %{},
     n_parallel: 4,
     n_batch: 2048,
     chunk_size: 512,
@@ -187,6 +188,9 @@ defmodule LlamaCppEx.Server do
     * `:timeout` - Call timeout in ms. Defaults to `60_000`.
     * `:cache_prompt` - Reuse/retain this request's KV prefix on the slot.
       Defaults to the server-level `:cache_prompt` setting.
+    * `:session` - Any term identifying a conversation. Requests with the same
+      session are routed to the same slot whenever it is free, keeping their
+      cached prefix intact under concurrency.
 
   """
   @spec generate(GenServer.server(), String.t(), keyword()) ::
@@ -413,6 +417,7 @@ defmodule LlamaCppEx.Server do
           idle_slot_fields([], 0)
           |> Map.put(:sampler, sampler)
           |> Map.put(:t_last_used, now)
+          |> Map.put(:session, nil)
 
         {seq_id, slot}
       end
@@ -546,15 +551,32 @@ defmodule LlamaCppEx.Server do
       [] ->
         :no_slots
 
-      slots when tokens != [] ->
-        if request_cache_prompt?(state, req_opts) do
-          {:ok, pick_cached_slot(slots, tokens), state}
-        else
-          {:ok, pick_lru_slot(slots), state}
-        end
-
       slots ->
-        {:ok, pick_lru_slot(slots), state}
+        session_pick = session_slot_if_idle(state, Keyword.get(req_opts, :session), slots)
+
+        cond do
+          session_pick != nil ->
+            {:ok, session_pick, state}
+
+          tokens != [] and request_cache_prompt?(state, req_opts) ->
+            {:ok, pick_cached_slot(slots, tokens), state}
+
+          true ->
+            {:ok, pick_lru_slot(slots), state}
+        end
+    end
+  end
+
+  # Session affinity: the slot that served this session last, if it is idle.
+  # Overrides the similarity rule — the session's cache lives there.
+  defp session_slot_if_idle(_state, nil, _idle_slots), do: nil
+
+  defp session_slot_if_idle(state, session, idle_slots) do
+    with seq_id when seq_id != nil <- Map.get(state.sessions, session),
+         true <- Enum.any?(idle_slots, fn {id, _} -> id == seq_id end) do
+      seq_id
+    else
+      _ -> nil
     end
   end
 
@@ -583,6 +605,7 @@ defmodule LlamaCppEx.Server do
   end
 
   defp init_slot(state, seq_id, tokens, max_tokens, from, stream_pid, stream_ref, req_opts) do
+    state = update_session_mapping(state, seq_id, Keyword.get(req_opts, :session))
     slot = state.slots[seq_id]
     cache_prompt? = request_cache_prompt?(state, req_opts)
 
@@ -661,11 +684,64 @@ defmodule LlamaCppEx.Server do
   defp slot_mode(%{stream_pid: pid}) when is_pid(pid), do: :stream
   defp slot_mode(_slot), do: :generate
 
+  # Keeps sessions ↔ slots consistent: the slot remembers its session (so an
+  # idle slot can be re-picked by affinity) and the reverse map points each
+  # session at the slot serving it. A slot taken over by a different session
+  # drops its old mapping — but only if that mapping still points here (the
+  # old session may already have moved to another slot).
+  defp update_session_mapping(state, seq_id, session) do
+    old_session = state.slots[seq_id].session
+
+    sessions =
+      if old_session != nil and old_session != session and
+           Map.get(state.sessions, old_session) == seq_id do
+        Map.delete(state.sessions, old_session)
+      else
+        state.sessions
+      end
+
+    sessions = if session != nil, do: Map.put(sessions, session, seq_id), else: sessions
+
+    state = put_in(state.slots[seq_id].session, session)
+    %{state | sessions: sessions}
+  end
+
   defp enqueue_request(state, request) do
     %{state | queue: :queue.in(request, state.queue)}
   end
 
+  # Freed slots serve queued requests session-first, then FIFO — otherwise a
+  # busy queue scatters a conversation across slots and shreds its cache.
   defp dequeue_into_slot(state) do
+    state
+    |> dequeue_session_matches()
+    |> dequeue_fifo()
+  end
+
+  defp dequeue_session_matches(state) do
+    requests = :queue.to_list(state.queue)
+
+    {state, remaining} =
+      Enum.reduce(requests, {state, []}, fn request, {state, rest} ->
+        opts = request_opts(request)
+
+        case session_slot_if_idle(state, Keyword.get(opts, :session), idle_slots(state)) do
+          nil ->
+            {state, [request | rest]}
+
+          seq_id ->
+            {assign_queued_request(state, seq_id, request), rest}
+        end
+      end)
+
+    %{state | queue: :queue.from_list(Enum.reverse(remaining))}
+  end
+
+  defp idle_slots(state) do
+    Enum.filter(state.slots, fn {_id, slot} -> slot.state == :idle end)
+  end
+
+  defp dequeue_fifo(state) do
     case :queue.out(state.queue) do
       {{:value, request}, queue} ->
         state = %{state | queue: queue}
@@ -674,7 +750,7 @@ defmodule LlamaCppEx.Server do
         case acquire_slot(state, tokens, request_opts(request)) do
           {:ok, seq_id, state} ->
             state = assign_queued_request(state, seq_id, request)
-            dequeue_into_slot(state)
+            dequeue_fifo(state)
 
           :no_slots ->
             # Put it back
@@ -1060,8 +1136,9 @@ defmodule LlamaCppEx.Server do
   # The single source of truth for a slot's per-request fields. init/1,
   # reset_slot/2, and the failure paths all build from this map, so a new
   # slot field cannot silently carry stale data across requests. The
-  # prefix-cache carry-over is the only caller-controlled part; :sampler and
-  # :t_last_used are the only fields that live outside it.
+  # prefix-cache carry-over is the only caller-controlled part; :sampler,
+  # :t_last_used, and :session are the only fields that live outside it
+  # (slot metadata that must survive request resets).
   defp idle_slot_fields(cached_tokens, cached_pos) do
     %{
       state: :idle,
