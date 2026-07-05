@@ -98,6 +98,22 @@ defmodule LlamaCppEx.Server do
     * `:server` - PID of the server process.
     * `:purged_seq_ids` - Sequence IDs whose caches were purged.
 
+  ### `[:llama_cpp_ex, :server, :prefix_instability]`
+
+  Emitted when a cache-eligible request matches only 10–50% of a slot's
+  cached history — the signature of a chat template that rewrites earlier
+  turns (e.g. stripping thinking blocks), silently defeating prefix caching.
+
+  Measurements:
+
+    * `:matched_tokens` - Length of the common prefix actually reusable.
+    * `:cached_tokens` - Length of the cached history that was expected to match.
+
+  Metadata:
+
+    * `:server` - PID of the server process.
+    * `:seq_id` - Slot sequence ID.
+
   ### `[:llama_cpp_ex, :server, :ram_cache]`
 
   Emitted on level-2 RAM prompt cache activity (see `:prompt_cache_ram_mb`).
@@ -148,6 +164,12 @@ defmodule LlamaCppEx.Server do
   # (llama-server's f_keep heuristic) — restoring is a KV-sized memcpy.
   @ram_cache_min_keep 0.25
 
+  # Prefix-instability heuristic: a cached history this long that matches
+  # 10–50% of its tokens looks like a chat template rewriting history
+  # (thinking-strip etc.) rather than a brand-new conversation (~0%) or a
+  # clean continuation (~100%).
+  @prefix_instability_min_cached 64
+
   defstruct [
     :model,
     :ctx,
@@ -168,6 +190,7 @@ defmodule LlamaCppEx.Server do
     prompt_cache_ram_mb: 0,
     ram_cache: [],
     ram_cache_bytes: 0,
+    prefix_instability_warned: false,
     # `:part`/`:rs` = partial seq_rm works; `:full` = whole-sequence only
     # (hybrid GDN models like Qwen 3.5/3.6); `:no` = no memory module. We
     # only do prefix-cache partial trims when this is `:part` or `:rs`.
@@ -682,6 +705,8 @@ defmodule LlamaCppEx.Server do
         raw_match
       end
 
+    state = maybe_warn_prefix_instability(state, seq_id, slot, raw_match, cache_prompt?)
+
     {state, n_match} = resolve_prefix_cache(state, seq_id, tokens, own_match, cache_prompt?)
     slot = state.slots[seq_id]
 
@@ -768,6 +793,43 @@ defmodule LlamaCppEx.Server do
         _ = LlamaCppEx.NIF.memory_seq_rm(state.ctx.ref, seq_id, 0, -1)
         {state, 0}
     end
+  end
+
+  # A cache-eligible request whose prompt shares only a partial prefix with
+  # the slot's cached history usually means the chat template rewrote earlier
+  # turns (e.g. Qwen thinking-strip re-rendering) — every such request pays a
+  # near-full re-prefill that the caller probably believes is cached. Emit
+  # telemetry per occurrence and warn in the log once per server.
+  defp maybe_warn_prefix_instability(state, seq_id, slot, raw_match, cache_prompt?) do
+    suspicious? =
+      cache_prompt? and slot.cached_pos >= @prefix_instability_min_cached and
+        raw_match > slot.cached_pos * 0.1 and raw_match < slot.cached_pos * 0.5
+
+    if suspicious? do
+      :telemetry.execute(
+        [:llama_cpp_ex, :server, :prefix_instability],
+        %{matched_tokens: raw_match, cached_tokens: slot.cached_pos},
+        %{server: self(), seq_id: seq_id}
+      )
+
+      warn_prefix_instability_once(state, raw_match, slot.cached_pos)
+    else
+      state
+    end
+  end
+
+  defp warn_prefix_instability_once(%{prefix_instability_warned: true} = state, _match, _cached),
+    do: state
+
+  defp warn_prefix_instability_once(state, raw_match, cached_pos) do
+    Logger.warning(
+      "LlamaCppEx.Server: request matched only #{raw_match}/#{cached_pos} cached prompt " <>
+        "tokens — the chat template may be rewriting history (e.g. stripping thinking " <>
+        "blocks), which defeats prefix caching. Emitted per-request as " <>
+        "[:llama_cpp_ex, :server, :prefix_instability]; this warning logs once."
+    )
+
+    %{state | prefix_instability_warned: true}
   end
 
   # Offers a slot's about-to-be-destroyed cache to the RAM prompt cache.
