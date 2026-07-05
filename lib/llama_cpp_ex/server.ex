@@ -763,35 +763,46 @@ defmodule LlamaCppEx.Server do
 
     cond do
       donor_lcp > own_match and donor_lcp >= ram_lcp ->
-        {donor_id, _} = donor
-        state = maybe_save_to_ram_cache(state, seq_id, slot)
-        _ = LlamaCppEx.NIF.memory_seq_rm(state.ctx.ref, seq_id, 0, -1)
-        :ok = LlamaCppEx.NIF.memory_seq_cp(state.ctx.ref, donor_id, seq_id, 0, donor_lcp)
-        {state, donor_lcp}
+        adopt_donor_cache(state, seq_id, slot, donor)
 
       ram_lcp > own_match ->
-        {entry, _} = ram
-        state = maybe_save_to_ram_cache(state, seq_id, slot)
-        _ = LlamaCppEx.NIF.memory_seq_rm(state.ctx.ref, seq_id, 0, -1)
-        {state, apply_ram_restore(state, seq_id, entry, ram_lcp)}
-
-      own_match > 0 and own_match < slot.cached_pos ->
-        # Trim KV cache beyond the matched prefix (only safe on `:part`/`:rs`).
-        # The truncated tail may still be valuable to another conversation —
-        # offer the full state to the RAM cache before cutting it.
-        state = maybe_save_to_ram_cache(state, seq_id, slot)
-        true = LlamaCppEx.NIF.memory_seq_rm(state.ctx.ref, seq_id, own_match, -1)
-        {state, own_match}
+        adopt_ram_cache(state, seq_id, slot, ram)
 
       own_match > 0 ->
-        # Exact-prefix continuation; nothing to trim.
-        {state, own_match}
+        keep_own_cache(state, seq_id, slot, own_match)
 
       true ->
         # No usable match anywhere — clear the slot.
         state = maybe_save_to_ram_cache(state, seq_id, slot)
         _ = LlamaCppEx.NIF.memory_seq_rm(state.ctx.ref, seq_id, 0, -1)
         {state, 0}
+    end
+  end
+
+  defp adopt_donor_cache(state, seq_id, slot, {donor_id, donor_lcp}) do
+    state = maybe_save_to_ram_cache(state, seq_id, slot)
+    _ = LlamaCppEx.NIF.memory_seq_rm(state.ctx.ref, seq_id, 0, -1)
+    :ok = LlamaCppEx.NIF.memory_seq_cp(state.ctx.ref, donor_id, seq_id, 0, donor_lcp)
+    {state, donor_lcp}
+  end
+
+  defp adopt_ram_cache(state, seq_id, slot, {entry, ram_lcp}) do
+    state = maybe_save_to_ram_cache(state, seq_id, slot)
+    _ = LlamaCppEx.NIF.memory_seq_rm(state.ctx.ref, seq_id, 0, -1)
+    {state, apply_ram_restore(state, seq_id, entry, ram_lcp)}
+  end
+
+  defp keep_own_cache(state, seq_id, slot, own_match) do
+    if own_match < slot.cached_pos do
+      # Trim KV cache beyond the matched prefix (only safe on `:part`/`:rs`).
+      # The truncated tail may still be valuable to another conversation —
+      # offer the full state to the RAM cache before cutting it.
+      state = maybe_save_to_ram_cache(state, seq_id, slot)
+      true = LlamaCppEx.NIF.memory_seq_rm(state.ctx.ref, seq_id, own_match, -1)
+      {state, own_match}
+    else
+      # Exact-prefix continuation; nothing to trim.
+      {state, own_match}
     end
   end
 
