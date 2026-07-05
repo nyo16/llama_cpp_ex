@@ -199,7 +199,8 @@ defmodule LlamaCppEx.Context do
         opts \\ []
       ) do
     max_tokens = Keyword.get(opts, :max_tokens, 256)
-    LlamaCppEx.NIF.generate(ctx_ref, sampler_ref, tokens, max_tokens)
+    cancel = Keyword.get_lazy(opts, :cancel, fn -> LlamaCppEx.NIF.cancel_flag_new() end)
+    LlamaCppEx.NIF.generate(ctx_ref, sampler_ref, tokens, max_tokens, cancel)
   end
 
   # --- Enum mappings ---

@@ -74,6 +74,15 @@ public:
     LlamaContext& operator=(const LlamaContext&) = delete;
 };
 
+// Cooperative cancellation flag for the stateless generation loops. The
+// owning Elixir process holds the resource and sets it via request_cancel/1;
+// the generating NIF polls it per iteration and also installs it as the
+// context's abort callback so a long prefill aborts mid-decode.
+class CancelFlag {
+public:
+    std::atomic<bool> cancelled{false};
+};
+
 // RAII wrapper for llama_sampler*
 class LlamaSampler {
 public:

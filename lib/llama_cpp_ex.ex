@@ -221,10 +221,10 @@ defmodule LlamaCppEx do
         # Start: tokenize, create context+sampler, spawn generator
         {:ok, tokens} = Tokenizer.encode(model, prompt)
         {:ok, ctx, sampler} = create_gen_resources(model, tokens, cfg)
-        {ref, gen_pid} = spawn_generator(ctx, sampler, tokens, cfg.max_tokens)
-        {ref, gen_pid, cfg.timeout}
+        {ref, gen_pid, cancel} = spawn_generator(ctx, sampler, tokens, cfg.max_tokens)
+        {ref, gen_pid, cancel, cfg.timeout}
       end,
-      fn {ref, _gen_pid, timeout} = state ->
+      fn {ref, _gen_pid, _cancel, timeout} = state ->
         receive do
           {^ref, {:token, _id, text}} -> {[text], state}
           {^ref, outcome} when outcome in [:eog, :done] -> {:halt, state}
@@ -233,7 +233,7 @@ defmodule LlamaCppEx do
           timeout -> {:halt, state}
         end
       end,
-      fn {ref, gen_pid, _timeout} -> stop_generator(ref, gen_pid) end
+      fn {ref, gen_pid, cancel, _timeout} -> stop_generator(ref, gen_pid, cancel) end
     )
   end
 
@@ -264,20 +264,35 @@ defmodule LlamaCppEx do
 
   # Runs the NIF token generator in a linked process that sends
   # {ref, {:token, id, text} | :eog | :done | {:error, reason}} to the caller.
+  # The cancel flag lets stop_generator/3 halt the NIF loop cooperatively —
+  # killing the process alone cannot interrupt a running NIF.
   defp spawn_generator(ctx, sampler, tokens, max_tokens) do
     ref = make_ref()
     parent = self()
+    cancel = LlamaCppEx.NIF.cancel_flag_new()
 
     gen_pid =
       spawn_link(fn ->
-        LlamaCppEx.NIF.generate_tokens(ctx.ref, sampler.ref, tokens, max_tokens, parent, ref)
+        LlamaCppEx.NIF.generate_tokens(
+          ctx.ref,
+          sampler.ref,
+          tokens,
+          max_tokens,
+          parent,
+          ref,
+          cancel
+        )
       end)
 
-    {ref, gen_pid}
+    {ref, gen_pid, cancel}
   end
 
-  # Kills a generator (if still running) and drains its remaining messages.
-  defp stop_generator(ref, gen_pid) do
+  # Cancels a generator (if still running) and drains its remaining messages.
+  # The flag stops the NIF loop — even mid-prefill via the abort callback —
+  # so the dirty scheduler is freed promptly instead of decoding to
+  # max_tokens for a departed consumer.
+  defp stop_generator(ref, gen_pid, cancel) do
+    LlamaCppEx.NIF.request_cancel(cancel)
     Process.unlink(gen_pid)
     Process.exit(gen_pid, :kill)
     flush_stream_messages(ref)
@@ -373,13 +388,13 @@ defmodule LlamaCppEx do
     with {:ok, prompt} <- Chat.apply_template(model, messages, chat_opts),
          {:ok, prompt_tokens} <- Tokenizer.encode(model, prompt) do
       {:ok, ctx, sampler} = create_gen_resources(model, prompt_tokens, cfg)
-      {ref, gen_pid} = spawn_generator(ctx, sampler, prompt_tokens, cfg.max_tokens)
+      {ref, gen_pid, cancel} = spawn_generator(ctx, sampler, prompt_tokens, cfg.max_tokens)
 
       {texts, finish_reason, completion_tokens} = collect_completion_tokens(ref, cfg.timeout)
 
-      # On timeout the generator may still be running — kill it and drain any
-      # stragglers so they don't pollute the caller's mailbox.
-      stop_generator(ref, gen_pid)
+      # On timeout the generator may still be running — cancel it and drain
+      # any stragglers so they don't pollute the caller's mailbox.
+      stop_generator(ref, gen_pid, cancel)
 
       completion =
         build_chat_completion(
@@ -493,10 +508,11 @@ defmodule LlamaCppEx do
         {:ok, prompt} = Chat.apply_template(model, messages, chat_opts)
         {:ok, tokens} = Tokenizer.encode(model, prompt)
         {:ok, ctx, sampler} = create_gen_resources(model, tokens, cfg)
-        {ref, gen_pid} = spawn_generator(ctx, sampler, tokens, cfg.max_tokens)
+        {ref, gen_pid, cancel} = spawn_generator(ctx, sampler, tokens, cfg.max_tokens)
 
         chat_chunk_state(ref, cfg.timeout, Model.desc(model), chat_opts)
         |> Map.put(:gen_pid, gen_pid)
+        |> Map.put(:cancel, cancel)
       end,
       fn
         %{phase: :first} = state ->
@@ -519,7 +535,7 @@ defmodule LlamaCppEx do
         %{phase: :done} = state ->
           {:halt, state}
       end,
-      fn %{ref: ref, gen_pid: gen_pid} -> stop_generator(ref, gen_pid) end
+      fn %{ref: ref, gen_pid: gen_pid, cancel: cancel} -> stop_generator(ref, gen_pid, cancel) end
     )
   end
 
@@ -560,7 +576,11 @@ defmodule LlamaCppEx do
         %{phase: :done} = state ->
           {:halt, state}
       end,
-      fn %{ref: ref} -> flush_stream_messages(ref) end
+      fn %{ref: ref, phase: phase} ->
+        # Halted before the final chunk — cancel server-side generation.
+        if phase != :done, do: Server.cancel(server, ref)
+        flush_stream_messages(ref)
+      end
     )
   end
 

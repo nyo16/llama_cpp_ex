@@ -144,8 +144,12 @@ defmodule LlamaCppEx.NIF do
       ),
       do: :erlang.nif_error(:not_loaded)
 
+  # Cancellation (cooperative flag polled by the stateless generation loops)
+  def cancel_flag_new, do: :erlang.nif_error(:not_loaded)
+  def request_cancel(_flag), do: :erlang.nif_error(:not_loaded)
+
   # Streaming generation (sends messages to caller_pid tagged with ref)
-  def generate_tokens(_ctx, _sampler, _prompt_tokens, _max_tokens, _caller_pid, _ref),
+  def generate_tokens(_ctx, _sampler, _prompt_tokens, _max_tokens, _caller_pid, _ref, _cancel),
     do: :erlang.nif_error(:not_loaded)
 
   # Speculative decoding (MTP)
@@ -160,12 +164,14 @@ defmodule LlamaCppEx.NIF do
         _max_tokens,
         _emit_stats_every,
         _caller_pid,
-        _ref
+        _ref,
+        _cancel
       ),
       do: :erlang.nif_error(:not_loaded)
 
   # High-level generation
-  def generate(_ctx, _sampler, _prompt_tokens, _max_tokens), do: :erlang.nif_error(:not_loaded)
+  def generate(_ctx, _sampler, _prompt_tokens, _max_tokens, _cancel),
+    do: :erlang.nif_error(:not_loaded)
 
   # Embeddings
   def embed_decode(_ctx, _tokens, _seq_id), do: :erlang.nif_error(:not_loaded)

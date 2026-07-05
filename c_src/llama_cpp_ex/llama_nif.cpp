@@ -20,6 +20,38 @@ FINE_RESOURCE(LlamaModel);
 FINE_RESOURCE(LlamaContext);
 FINE_RESOURCE(LlamaSampler);
 FINE_RESOURCE(LlamaSpeculative);
+FINE_RESOURCE(CancelFlag);
+
+// --- Cancellation ---
+
+fine::ResourcePtr<CancelFlag> cancel_flag_new(ErlNifEnv* env) {
+    return fine::make_resource<CancelFlag>();
+}
+FINE_NIF(cancel_flag_new, 0);
+
+fine::Ok<> request_cancel(ErlNifEnv* env, fine::ResourcePtr<CancelFlag> flag) {
+    flag->cancelled.store(true, std::memory_order_relaxed);
+    return fine::Ok();
+}
+FINE_NIF(request_cancel, 0);
+
+static bool cancel_abort_cb(void* data) {
+    return static_cast<CancelFlag*>(data)->cancelled.load(std::memory_order_relaxed);
+}
+
+// Installs the flag as the context's abort callback for the duration of a
+// generation loop, so a cancel interrupts even a long prefill decode
+// (llama_decode returns 2). Cleared on scope exit.
+struct AbortCallbackScope {
+    llama_context* ctx;
+
+    AbortCallbackScope(llama_context* c, CancelFlag* flag) : ctx(c) {
+        llama_set_abort_callback(ctx, cancel_abort_cb, flag);
+    }
+    ~AbortCallbackScope() {
+        llama_set_abort_callback(ctx, nullptr, nullptr);
+    }
+};
 
 // --- Backend ---
 
@@ -1349,7 +1381,8 @@ fine::Ok<> generate_mtp_tokens(
     int64_t max_tokens,
     int64_t emit_stats_every,
     ErlNifPid caller_pid,
-    fine::Term ref)
+    fine::Term ref,
+    fine::ResourcePtr<CancelFlag> cancel)
 {
     auto& sp = *spec_res;
     auto* ctx_tgt = sp.ctx_tgt->ctx;
@@ -1358,6 +1391,11 @@ fine::Ok<> generate_mtp_tokens(
     const auto* vocab = sp.ctx_tgt->model->vocab();
     const llama_seq_id seq_id = 0;
     const int32_t n_draft = static_cast<int32_t>(sp.n_draft);
+
+    // Cancellation: polled per speculative iteration and installed as the
+    // target context's abort callback so the prompt prefill can stop
+    // mid-decode (ret == 2 handled by the prefill error path below).
+    AbortCallbackScope abort_scope(ctx_tgt, cancel.get());
 
     ErlNifEnv* msg_env = enif_alloc_env();
 
@@ -1544,6 +1582,12 @@ fine::Ok<> generate_mtp_tokens(
 
     // Main speculative loop.
     while (n_emitted < max_tokens) {
+        if (cancel->cancelled.load(std::memory_order_relaxed)) {
+            // Caller abandoned the stream — stop quietly.
+            enif_free_env(msg_env);
+            return fine::Ok();
+        }
+
         sp.n_iters.fetch_add(1, std::memory_order_relaxed);
 
         // Anchor for the "other" bucket: time between known timer ends
@@ -1798,11 +1842,16 @@ fine::Ok<> generate_tokens(
     std::vector<int64_t> prompt_token_ids,
     int64_t max_tokens,
     ErlNifPid caller_pid,
-    fine::Term ref)
+    fine::Term ref,
+    fine::ResourcePtr<CancelFlag> cancel)
 {
     auto* ctx = ctx_res->ctx;
     auto* sampler = sampler_res->sampler;
     const auto* vocab = ctx_res->model->vocab();
+
+    // Cancellation: polled per generated token AND installed as the abort
+    // callback so a long prefill decode stops mid-flight (ret == 2).
+    AbortCallbackScope abort_scope(ctx, cancel.get());
 
     std::vector<llama_token> prompt_tokens(prompt_token_ids.begin(), prompt_token_ids.end());
 
@@ -1824,7 +1873,12 @@ fine::Ok<> generate_tokens(
     for (size_t i = 0; i < prompt_tokens.size(); i += n_batch) {
         int n = std::min(static_cast<int>(prompt_tokens.size() - i), n_batch);
         llama_batch batch = llama_batch_get_one(prompt_tokens.data() + i, n);
-        if (llama_decode(ctx, batch) != 0) {
+        int ret = llama_decode(ctx, batch);
+        if (ret == 2) {
+            // Aborted by the cancel flag mid-prefill — stop quietly.
+            return fine::Ok();
+        }
+        if (ret != 0) {
             ErlNifEnv* msg_env = enif_alloc_env();
             ERL_NIF_TERM ref_copy = enif_make_copy(msg_env, ref);
             ERL_NIF_TERM msg = enif_make_tuple2(msg_env, ref_copy,
@@ -1850,6 +1904,13 @@ fine::Ok<> generate_tokens(
 
     // Generation loop
     for (int64_t i = 0; i < max_tokens; i++) {
+        if (cancel->cancelled.load(std::memory_order_relaxed)) {
+            // Caller abandoned the stream — stop quietly; the consumer is
+            // not reading messages anymore.
+            enif_free_env(msg_env);
+            return fine::Ok();
+        }
+
         // llama_sampler_sample() already accepts the selected token; calling
         // llama_sampler_accept() again would double-advance grammar state.
         llama_token new_token = llama_sampler_sample(sampler, ctx, -1);
@@ -1894,7 +1955,13 @@ fine::Ok<> generate_tokens(
 
         // Decode next token
         llama_batch batch = llama_batch_get_one(&new_token, 1);
-        if (llama_decode(ctx, batch) != 0) {
+        int ret = llama_decode(ctx, batch);
+        if (ret == 2) {
+            // Aborted by the cancel flag — stop quietly.
+            enif_free_env(msg_env);
+            return fine::Ok();
+        }
+        if (ret != 0) {
             enif_clear_env(msg_env);
             ref_copy = enif_make_copy(msg_env, ref);
             ERL_NIF_TERM err_msg = enif_make_tuple2(msg_env, ref_copy,
@@ -1926,11 +1993,16 @@ generate(
     fine::ResourcePtr<LlamaContext> ctx_res,
     fine::ResourcePtr<LlamaSampler> sampler_res,
     std::vector<int64_t> prompt_token_ids,
-    int64_t max_tokens)
+    int64_t max_tokens,
+    fine::ResourcePtr<CancelFlag> cancel)
 {
     auto* ctx = ctx_res->ctx;
     auto* sampler = sampler_res->sampler;
     const auto* vocab = ctx_res->model->vocab();
+
+    // Cancellation: polled per token; the abort callback interrupts long
+    // prefill decodes (ret == 2). A cancelled call returns the partial text.
+    AbortCallbackScope abort_scope(ctx, cancel.get());
 
     // Convert prompt tokens
     std::vector<llama_token> prompt_tokens(prompt_token_ids.begin(), prompt_token_ids.end());
@@ -1945,6 +2017,9 @@ generate(
         int n = std::min(static_cast<int>(prompt_tokens.size() - i), n_batch);
         llama_batch batch = llama_batch_get_one(prompt_tokens.data() + i, n);
         int ret = llama_decode(ctx, batch);
+        if (ret == 2) {
+            return fine::Ok(std::string());
+        }
         if (ret != 0) {
             return fine::Error(std::string("prompt decode failed with code: " + std::to_string(ret)));
         }
@@ -1953,6 +2028,10 @@ generate(
     // Generation loop
     std::string result;
     for (int64_t i = 0; i < max_tokens; i++) {
+        if (cancel->cancelled.load(std::memory_order_relaxed)) {
+            break;
+        }
+
         // llama_sampler_sample() applies the sampler chain, selects a token, and
         // already accepts it (advancing grammar state / penalties). Do NOT call
         // llama_sampler_accept() again — a double-accept corrupts grammar state.
@@ -1977,6 +2056,9 @@ generate(
         // Decode the new token for next iteration
         llama_batch batch = llama_batch_get_one(&new_token, 1);
         int ret = llama_decode(ctx, batch);
+        if (ret == 2) {
+            break;
+        }
         if (ret != 0) {
             return fine::Error(std::string("generation decode failed with code: " + std::to_string(ret)));
         }

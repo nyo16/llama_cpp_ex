@@ -79,8 +79,9 @@ defmodule LlamaCppEx.Server do
     * `:server` - PID of the server process.
     * `:seq_id` - Slot sequence ID (integer).
     * `:mode` - `:generate` or `:stream`.
-    * `:stop_reason` - `:eog` (end-of-generation token sampled) or
-      `:max_tokens` (request `max_tokens` reached).
+    * `:stop_reason` - `:eog` (end-of-generation token sampled),
+      `:max_tokens` (request `max_tokens` reached), or `:cancelled` (consumer
+      died or cancelled the request).
 
   ### `[:llama_cpp_ex, :server, :kv_pressure]`
 
@@ -325,7 +326,7 @@ defmodule LlamaCppEx.Server do
                server,
                {:stream_tokens, token_ids, max_tokens, self(), ref, req_opts}
              ) do
-          :ok -> {ref, timeout}
+          :ok -> {server, ref, timeout}
           {:error, reason} -> {:rejected, ref, reason}
         end
       end,
@@ -336,27 +337,33 @@ defmodule LlamaCppEx.Server do
 
   # Shared next/cleanup functions for the piece-streaming Stream.resources.
   # A rejected request ({:error, :queue_full}) surfaces as a single error
-  # element instead of silence-then-timeout.
+  # element instead of silence-then-timeout. Halting an ACTIVE stream early
+  # (cleanup before :done) cancels the request server-side — otherwise an
+  # abandoned stream would keep consuming batch budget to max_tokens.
   defp stream_next({:rejected, ref, reason}), do: {[{:error, reason}], {:done, ref}}
   defp stream_next({:done, _ref} = state), do: {:halt, state}
 
-  defp stream_next({ref, timeout} = state) do
+  defp stream_next({server, ref, timeout} = state) do
     receive do
       {^ref, {:token, text}} -> {[text], state}
-      {^ref, {:done, _reason}} -> {:halt, state}
+      {^ref, {:done, _reason}} -> {:halt, {:done, ref}}
       {^ref, {:error, reason}} -> {[{:error, reason}], {:done, ref}}
     after
-      timeout -> {:halt, state}
+      timeout -> {:halt, {server, ref, timeout}}
     end
   end
 
-  defp stream_cleanup({:rejected, ref, _reason}), do: drain_stream_message(ref)
-  defp stream_cleanup({:done, ref}), do: drain_stream_message(ref)
-  defp stream_cleanup({ref, _timeout}), do: drain_stream_message(ref)
+  defp stream_cleanup({:rejected, ref, _reason}), do: drain_stream_messages(ref)
+  defp stream_cleanup({:done, ref}), do: drain_stream_messages(ref)
 
-  defp drain_stream_message(ref) do
+  defp stream_cleanup({server, ref, _timeout}) do
+    cancel(server, ref)
+    drain_stream_messages(ref)
+  end
+
+  defp drain_stream_messages(ref) do
     receive do
-      {^ref, _} -> :ok
+      {^ref, _} -> drain_stream_messages(ref)
     after
       0 -> :ok
     end
@@ -434,13 +441,29 @@ defmodule LlamaCppEx.Server do
                server,
                {:stream_tokens, token_ids, max_tokens, self(), ref, req_opts}
              ) do
-          :ok -> {ref, timeout}
+          :ok -> {server, ref, timeout}
           {:error, reason} -> {:rejected, ref, reason}
         end
       end,
       &stream_next/1,
       &stream_cleanup/1
     )
+  end
+
+  @doc """
+  Cancels an in-flight or queued stream request by its subscription reference.
+
+  The slot stops being scheduled immediately and is freed for other requests
+  (its prefix cache is retained per the request's `:cache_prompt`). Consumer
+  death is detected automatically via monitors — explicit cancel is for
+  consumers that stop reading without exiting. `Server.stream/3` and
+  `stream_tokens/3` call this from their cleanup, so halting those streams
+  early (e.g. `Enum.take/2`) cancels generation instead of burning batch
+  budget to `max_tokens`.
+  """
+  @spec cancel(GenServer.server(), reference()) :: :ok
+  def cancel(server, ref) when is_reference(ref) do
+    GenServer.cast(server, {:cancel, ref})
   end
 
   @doc """
@@ -671,10 +694,34 @@ defmodule LlamaCppEx.Server do
   end
 
   @impl true
+  def handle_cast({:cancel, ref}, state) do
+    state =
+      case Enum.find(state.slots, fn {_id, slot} -> slot.stream_ref == ref end) do
+        {seq_id, _slot} -> cancel_slot(state, seq_id)
+        nil -> drop_queued_request(state, ref)
+      end
+
+    {:noreply, state}
+  end
+
+  @impl true
   def handle_info(:tick, state) do
     state = %{state | tick_scheduled: false}
     state = run_tick(state)
     {:noreply, state}
+  end
+
+  def handle_info({:DOWN, mref, :process, pid, _reason}, state) do
+    # A request's consumer died — free its slot instead of generating into
+    # the void until max_tokens. Queued requests from the dead pid are
+    # dropped as well.
+    state =
+      case Enum.find(state.slots, fn {_id, slot} -> slot.monitor_ref == mref end) do
+        {seq_id, _slot} -> cancel_slot(state, seq_id)
+        nil -> state
+      end
+
+    {:noreply, drop_queued_requests_from(state, pid)}
   end
 
   def handle_info({:EXIT, _pid, reason}, state) do
@@ -800,12 +847,18 @@ defmodule LlamaCppEx.Server do
     sampler_opts = Keyword.merge(state.sampler_opts, Keyword.take(req_opts, @sampler_opt_keys))
     {:ok, sampler} = Sampler.create(state.model, sampler_opts)
 
+    # Watch the consumer (stream subscriber or sync caller) so its death
+    # cancels the request instead of burning batch budget to max_tokens.
+    watch_pid = stream_pid || caller_pid(from)
+    monitor_ref = if watch_pid, do: Process.monitor(watch_pid)
+
     slot = %{
       slot
       | state: :prefilling,
         from: from,
         stream_pid: stream_pid,
         stream_ref: stream_ref,
+        monitor_ref: monitor_ref,
         sampler: sampler,
         reply_mode: Keyword.get(req_opts, :reply, :text),
         cache_prompt: cache_prompt?,
@@ -1244,6 +1297,7 @@ defmodule LlamaCppEx.Server do
 
   defp fail_slot(state, seq_id, reason) do
     slot = state.slots[seq_id]
+    demonitor_slot(slot)
 
     if slot.from do
       GenServer.reply(slot.from, {:error, reason})
@@ -1425,6 +1479,7 @@ defmodule LlamaCppEx.Server do
   defp finish_slot(state, seq_id, stop_reason) do
     slot = state.slots[seq_id]
     t_end = System.monotonic_time()
+    demonitor_slot(slot)
 
     if slot.from do
       GenServer.reply(slot.from, {:ok, completion_reply(slot, stop_reason)})
@@ -1438,6 +1493,51 @@ defmodule LlamaCppEx.Server do
     emit_request_done(slot, seq_id, t_end, stop_reason)
 
     reset_slot(state, seq_id)
+  end
+
+  # Releases a slot whose consumer went away (died or explicitly cancelled).
+  # Nothing to reply to — the prefix cache is retained per the request's
+  # cache_prompt so a resumed conversation can still hit it, and the freed
+  # slot immediately serves the queue.
+  defp cancel_slot(state, seq_id) do
+    slot = state.slots[seq_id]
+    demonitor_slot(slot)
+    emit_request_done(slot, seq_id, System.monotonic_time(), :cancelled)
+
+    state
+    |> reset_slot(seq_id)
+    |> dequeue_into_slot()
+    |> continue_if_active()
+  end
+
+  defp demonitor_slot(%{monitor_ref: nil}), do: :ok
+  defp demonitor_slot(%{monitor_ref: mref}), do: Process.demonitor(mref, [:flush])
+
+  defp caller_pid({pid, _tag}) when is_pid(pid), do: pid
+  defp caller_pid(_from), do: nil
+
+  # Drops a queued (not yet slotted) stream request by its subscription ref.
+  defp drop_queued_request(state, ref) do
+    queue =
+      :queue.filter(
+        fn {_type, _tokens, _max, _from, _pid, req_ref, _opts} -> req_ref != ref end,
+        state.queue
+      )
+
+    %{state | queue: queue}
+  end
+
+  # Drops queued requests whose consumer (stream pid or sync caller) died.
+  defp drop_queued_requests_from(state, pid) do
+    queue =
+      :queue.filter(
+        fn {_type, _tokens, _max, from, stream_pid, _ref, _opts} ->
+          stream_pid != pid and caller_pid(from) != pid
+        end,
+        state.queue
+      )
+
+    %{state | queue: queue}
   end
 
   defp emit_request_done(slot, seq_id, t_end, stop_reason) do
@@ -1510,16 +1610,23 @@ defmodule LlamaCppEx.Server do
   defp reset_slot(state, seq_id) do
     slot = state.slots[seq_id]
 
-    # Build full token history for prefix cache. Retention follows the
-    # per-request setting: a cache_prompt: false request leaves nothing behind.
-    # (No sampler reset — every request gets a fresh sampler at init_slot.)
+    # Build the token history matching what is actually in the KV. Retention
+    # follows the per-request setting: a cache_prompt: false request leaves
+    # nothing behind. A slot cancelled mid-prefill only has prefill_pos
+    # positions in KV — caching the full prompt would advertise positions
+    # that don't exist. (No sampler reset — every request gets a fresh
+    # sampler at init_slot.)
     {cached_tokens, cached_pos} =
-      if slot.cache_prompt do
-        all_tokens = slot.prompt_tokens ++ Enum.reverse(slot.generated_token_ids)
-        {all_tokens, slot.pos}
-      else
-        LlamaCppEx.NIF.memory_seq_rm(state.ctx.ref, seq_id, 0, -1)
-        {[], 0}
+      cond do
+        not slot.cache_prompt ->
+          LlamaCppEx.NIF.memory_seq_rm(state.ctx.ref, seq_id, 0, -1)
+          {[], 0}
+
+        slot.state == :prefilling ->
+          {Enum.take(slot.prompt_tokens, slot.prefill_pos), slot.prefill_pos}
+
+        true ->
+          {slot.prompt_tokens ++ Enum.reverse(slot.generated_token_ids), slot.pos}
       end
 
     slot =
@@ -1542,6 +1649,7 @@ defmodule LlamaCppEx.Server do
       from: nil,
       stream_pid: nil,
       stream_ref: nil,
+      monitor_ref: nil,
       reply_mode: :text,
       cache_prompt: false,
       prompt_tokens: [],
