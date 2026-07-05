@@ -620,21 +620,9 @@ defmodule LlamaCppEx.Server do
           state = maybe_schedule_tick(state)
           {:noreply, state}
 
-        :no_slots when state.max_queue > 0 ->
-          if :queue.len(state.queue) >= state.max_queue do
-            {:reply, {:error, :queue_full}, state}
-          else
-            state =
-              enqueue_request(state, {:generate, token_ids, max_tokens, from, nil, nil, req_opts})
-
-            {:noreply, state}
-          end
-
         :no_slots ->
-          state =
-            enqueue_request(state, {:generate, token_ids, max_tokens, from, nil, nil, req_opts})
-
-          {:noreply, state}
+          request = {:generate, token_ids, max_tokens, from, nil, nil, req_opts}
+          enqueue_or_reject(state, request, from, _reply_ok? = false)
       end
     end
   end
@@ -647,25 +635,9 @@ defmodule LlamaCppEx.Server do
         state = maybe_schedule_tick(state)
         {:noreply, state}
 
-      :no_slots when state.max_queue > 0 ->
-        if :queue.len(state.queue) >= state.max_queue do
-          {:reply, {:error, :queue_full}, state}
-        else
-          GenServer.reply(from, :ok)
-
-          state =
-            enqueue_request(state, {:stream, token_ids, max_tokens, nil, pid, ref, req_opts})
-
-          {:noreply, state}
-        end
-
       :no_slots ->
-        GenServer.reply(from, :ok)
-
-        state =
-          enqueue_request(state, {:stream, token_ids, max_tokens, nil, pid, ref, req_opts})
-
-        {:noreply, state}
+        request = {:stream, token_ids, max_tokens, nil, pid, ref, req_opts}
+        enqueue_or_reject(state, request, from, _reply_ok? = true)
     end
   end
 
@@ -739,6 +711,18 @@ defmodule LlamaCppEx.Server do
 
   defp request_cache_prompt?(state, req_opts) do
     Keyword.get(req_opts, :cache_prompt, state.cache_prompt)
+  end
+
+  # Queues a request for the next free slot, or rejects it when :max_queue is
+  # bound and full. Stream subscriptions reply :ok up-front (tokens arrive as
+  # messages); sync requests stay unanswered until finish_slot replies.
+  defp enqueue_or_reject(state, request, from, reply_ok?) do
+    if state.max_queue > 0 and :queue.len(state.queue) >= state.max_queue do
+      {:reply, {:error, :queue_full}, state}
+    else
+      if reply_ok?, do: GenServer.reply(from, :ok)
+      {:noreply, enqueue_request(state, request)}
+    end
   end
 
   defp acquire_slot(state, tokens, req_opts) do
