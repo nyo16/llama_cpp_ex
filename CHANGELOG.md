@@ -1,6 +1,6 @@
 # Changelog
 
-## v0.9.0
+## v0.8.33
 
 Performance and robustness release for the batching `Server` and generation paths
 (the `perf-batching-prefix-cache` plan: 22 tasks across hot-loop, prefix-caching,
