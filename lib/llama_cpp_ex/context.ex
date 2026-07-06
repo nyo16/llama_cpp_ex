@@ -55,6 +55,10 @@ defmodule LlamaCppEx.Context do
       Use `:non_causal` for embedding models.
     * `:no_perf` - Disable performance timing. Defaults to `true`.
     * `:swa_full` - Use full-size sliding window attention cache. Defaults to `true`.
+    * `:kv_unified` - Share one KV buffer across all sequences instead of
+      splitting `n_ctx` evenly between them. Required for cheap cross-sequence
+      `memory_seq_cp` (prefix sharing); sequences then compete for the shared
+      `n_ctx` budget. Defaults to `false` (llama.cpp default).
 
   ### Speculative decoding / MTP
 
@@ -104,6 +108,7 @@ defmodule LlamaCppEx.Context do
     attention_type = Keyword.get(opts, :attention_type, :unspecified) |> attention_type_to_int()
     no_perf = Keyword.get(opts, :no_perf, true)
     swa_full = Keyword.get(opts, :swa_full, true)
+    kv_unified = Keyword.get(opts, :kv_unified, false)
 
     # Speculative decoding / MTP
     ctx_type = Keyword.get(opts, :ctx_type, :default) |> ctx_type_to_int()
@@ -135,6 +140,7 @@ defmodule LlamaCppEx.Context do
            attention_type,
            no_perf,
            swa_full,
+           kv_unified,
            ctx_type,
            n_rs_seq
          ) do
@@ -193,7 +199,8 @@ defmodule LlamaCppEx.Context do
         opts \\ []
       ) do
     max_tokens = Keyword.get(opts, :max_tokens, 256)
-    LlamaCppEx.NIF.generate(ctx_ref, sampler_ref, tokens, max_tokens)
+    cancel = Keyword.get_lazy(opts, :cancel, fn -> LlamaCppEx.NIF.cancel_flag_new() end)
+    LlamaCppEx.NIF.generate(ctx_ref, sampler_ref, tokens, max_tokens, cancel)
   end
 
   # --- Enum mappings ---

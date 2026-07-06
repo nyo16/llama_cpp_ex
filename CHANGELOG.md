@@ -1,5 +1,100 @@
 # Changelog
 
+## v0.8.33
+
+Performance and robustness release for the batching `Server` and generation paths
+(the `perf-batching-prefix-cache` plan: 22 tasks across hot-loop, prefix-caching,
+API-routing, and correctness phases). Benchmarked before/after on an M1 Max
+(`bench/results/v0.8.32-e6e1ef1-baseline-perf-m1max.md` vs
+`bench/results/v0.8.32-perf-branch-final-m1max.md`). Headline: with 8 interleaved
+conversations sharing a system prompt on 4 slots, TTFT median drops 115 → 35.5 ms
+(3.2x) at a ~75% prefix-cache hit ratio; server-routed multi-turn `chat_completion`
+is 1.6x faster than the stateless path. Full suite: 252 tests, 0 failures.
+
+### Added
+
+- **Cross-slot prefix sharing** — with unified KV (`kv_unified: true`, new `Server`
+  and `Context.create/2` option), a prefix cached by any slot (idle or still
+  generating) is adopted by other slots via a metadata-only `llama_memory_seq_cp`;
+  a shared system prompt prefills once, ever. Gated off automatically on
+  configurations where it is unsafe (split KV, hybrid-GDN models).
+- **Session affinity** — `session:` request option pins a conversation to the slot
+  holding its cache; freed slots serve queued requests session-first.
+- **Level-2 RAM prompt cache** — `prompt_cache_ram_mb:` server option (default 0 =
+  off): slot KV states about to be destroyed are serialized to RAM (new
+  `llama_state_seq_get_size/get_data/set_data` NIFs) and restored later instead of
+  re-prefilling; FIFO eviction under a byte budget checked before copying.
+- **Per-request options** — `:cache_prompt`, `:session`, and all sampling params
+  (`:temp`, `:seed`, `:top_k`, `:top_p`, `:min_p`, penalties, `:grammar`) now work
+  per request on `Server.generate/stream/generate_tokens/stream_tokens`, overriding
+  server defaults; each request gets a fresh sampler chain.
+- **Server-routed chat completions** — `LlamaCppEx.chat_completion/3` and
+  `stream_chat_completion/3` accept a running `Server` (pid or name); templating and
+  tokenization happen in the caller and generation uses continuous batching with
+  prefix caching. New `Server.complete_tokens/3` returns
+  `%{text, completion_tokens, finish_reason}`. `ModelManager` gains matching
+  `chat_completion/3` and `stream_chat_completion/3` routing.
+- **Cancellation** — the server monitors each request's consumer and frees the slot
+  when it dies; halting a `Server.stream/stream_tokens` early cancels generation
+  (`Server.cancel/2` also public). Stateless `generate`/`stream`/MTP loops carry a
+  cancel-flag NIF resource installed as `llama_set_abort_callback`, so even a long
+  prefill aborts mid-decode instead of running to completion for a departed caller.
+- **`:max_queue` backpressure** — the previously documented but unenforced option now
+  rejects overflow with `{:error, :queue_full}` immediately; streams surface it (and
+  mid-generation errors) as a single `{:error, reason}` element.
+- **KV-pressure recovery** — on `llama_decode == 1` the fused tick NIF purges idle
+  slots' cached KV, then recursively halves the batch; a sequence that still cannot
+  fit one token fails alone with `{:error, :context_full}` while other slots keep
+  generating. New `[:llama_cpp_ex, :server, :kv_pressure]`, `[:..., :ram_cache]`, and
+  `[:..., :prefix_instability]` telemetry events.
+- **Embeddings for Nx** — `format: :binary` on `Embedding.embed/embed_batch` returns
+  the raw native-endian f32 binary (`Nx.from_binary(bin, :f32)`), skipping the boxed
+  float list entirely.
+- Tests: `test/server_test.exs` (pure slot-pick/session/donor/RAM-cache logic),
+  `test/server_smoke_test.exs` (cache semantics, affinity, backpressure,
+  cancellation, overflow isolation), `test/utf8_stream_test.exs`; two new bench
+  scripts (`bench/prefix_cache_concurrent.exs`, `bench/chat_completion_server.exs`).
+
+### Changed
+
+- **Server hot loop** — one fused dirty-CPU NIF per tick (`batch_eval_sample`:
+  decode + per-slot sampling + detokenization + EOG check) replaces the previous
+  1 dirty + (2 normal-scheduler NIFs + send) × generating-slots pattern; streamed
+  pieces are delivered one tick earlier; a persistent `llama_batch` is reused across
+  decode NIFs; `sampler_sample`, `sampler_sample_at`, `chat_apply_template_jinja`,
+  `json_schema_to_grammar`, and `speculative_init` are dirty-flagged.
+- **Defaults** — `cache_prompt` on the `Server` now defaults to `true` (llama-server
+  parity; per-request overridable); `kv_unified` defaults to `true` (slots share the
+  full `n_ctx` budget instead of a fixed `n_ctx/n_parallel` split; no measurable
+  throughput cost in A/B); `n_batch` defaults to `min(n_ctx, 2048)` (bounds
+  worst-case tick latency).
+- **Error shapes** — failure replies are atoms/tagged tuples: `:context_full`,
+  `:queue_full`, `:empty_prompt`, `{:inference_failed, reason}` (previously
+  formatted strings). A batch failure now fails only the affected request instead of
+  every active slot.
+- **Tokenization moved to the caller** — `Server.generate/stream` encode client-side
+  using a `:persistent_term`-cached model handle; `Server.get_model/1` no longer
+  round-trips the server mailbox.
+- `Context.decode/2` uses an explicit batch requesting logits only for the final
+  token (previously the last token of every `n_batch` chunk).
+
+### Fixed
+
+- **UTF-8-safe streaming** — pieces that split a multibyte codepoint across tokens
+  are buffered and emitted whole at every emission point (server streams, stateless
+  streams, chat-completion chunks); previously consumers could receive invalid UTF-8.
+- A prompt exactly matching its cached prefix hung the slot until the call timeout
+  (nothing left to prefill, no logits to sample); cached reuse is now capped at
+  `prompt_len - 1` like llama-server, so the last prompt token is always re-decoded.
+- A tiny incidental prefix match (e.g. 2 tokens) could destroy a long cached prefix
+  via trim; own-slot, donor-slot, and RAM-cache candidates now compete by match
+  length with cost-ordered tie-breaking.
+- Abandoned streams no longer burn batch budget to `max_tokens` (see cancellation).
+- `stream_tokens` with an empty token list now returns `{:error, :empty_prompt}`
+  instead of hanging until the stream timeout.
+- Embedding decodes clear only their own sequences instead of the whole context —
+  safe if pointed at a shared context.
+
 ## v0.8.32
 
 ### Changed

@@ -34,19 +34,53 @@ public:
 
 // RAII wrapper for llama_context*
 // Holds a ResourcePtr to the model to prevent premature GC.
+//
+// INVARIANT: a context is driven by a single process (the Server GenServer or
+// one owning caller). The reusable `batch` below relies on that — decode-side
+// NIFs must never run concurrently on the same context from multiple
+// processes. (A single process can't overlap NIF calls, so no locking.)
 class LlamaContext {
 public:
     llama_context* ctx;
     fine::ResourcePtr<LlamaModel> model;
 
+    // Reusable explicit batch for the decode-side NIFs (batch_eval,
+    // batch_eval_sample, decode_token, prefill), allocated once on first use
+    // and grown on demand instead of llama_batch_init/free per call.
+    llama_batch batch{};
+    int32_t batch_capacity = 0;
+
     LlamaContext(llama_context* c, fine::ResourcePtr<LlamaModel> m)
         : ctx(c), model(std::move(m)) {}
+
+    // Returns the reusable batch with capacity for at least n tokens
+    // (per-token seq-id capacity 1 — all decode builders use single-seq
+    // entries). Contents are stale; the caller fills 0..n-1 and n_tokens.
+    llama_batch& reserve_batch(int32_t n) {
+        if (batch_capacity < n) {
+            if (batch_capacity > 0) llama_batch_free(batch);
+            batch = llama_batch_init(n, 0, 1);
+            batch_capacity = n;
+        }
+        return batch;
+    }
+
     ~LlamaContext() {
+        if (batch_capacity > 0) llama_batch_free(batch);
         if (ctx) llama_free(ctx);
     }
 
     LlamaContext(const LlamaContext&) = delete;
     LlamaContext& operator=(const LlamaContext&) = delete;
+};
+
+// Cooperative cancellation flag for the stateless generation loops. The
+// owning Elixir process holds the resource and sets it via request_cancel/1;
+// the generating NIF polls it per iteration and also installs it as the
+// context's abort callback so a long prefill aborts mid-decode.
+class CancelFlag {
+public:
+    std::atomic<bool> cancelled{false};
 };
 
 // RAII wrapper for llama_sampler*

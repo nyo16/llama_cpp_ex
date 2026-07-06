@@ -13,15 +13,13 @@ defmodule LlamaCppEx.Server.Strategy.PrefillPriority do
   alias LlamaCppEx.Server.Strategy.Batch
 
   @impl true
-  def build_batch(slots, budget, chunk_size, opts) do
-    model_ref = Keyword.fetch!(opts, :model_ref)
-
+  def build_batch(slots, budget, chunk_size, _opts) do
     # Prefill chunks first (priority), then decode tokens fill remaining budget.
     {entries, n_entries, slots, budget} =
       Batch.add_prefill_chunks(slots, [], 0, budget, chunk_size)
 
     {entries, _n_entries, slots, _budget} =
-      Batch.add_decode_tokens(slots, entries, n_entries, budget, model_ref)
+      Batch.add_decode_tokens(slots, entries, n_entries, budget)
 
     {Enum.reverse(entries), slots}
   end

@@ -27,6 +27,8 @@ defmodule Bench.Helpers do
       server_opts
       |> maybe_add(opts, :cache_prompt)
       |> maybe_add(opts, :batch_strategy)
+      |> maybe_add(opts, :kv_unified)
+      |> maybe_add(opts, :prompt_cache_ram_mb)
 
     {:ok, server} = LlamaCppEx.Server.start_link(server_opts)
     server

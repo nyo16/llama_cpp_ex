@@ -5,9 +5,14 @@ defmodule LlamaCppEx.ModelManagerTest do
 
   alias LlamaCppEx.ModelManager
 
-  # A stub standing in for LlamaCppEx.Server. It answers the two messages the
-  # manager's dispatch sends it: {:generate, prompt, max_tokens} and :get_model.
-  # Started unlinked so killing it (DOWN test) doesn't take down the manager.
+  # A stub standing in for LlamaCppEx.Server. It answers the raw protocol
+  # messages a routed request produces: {:generate_tokens, ...} and
+  # :get_model. NOTE: full-path ModelManager.generate/3 can't be unit-tested
+  # against a stub anymore — Server.generate tokenizes in the CALLER via
+  # get_model/1, which needs a real model NIF resource; routing tests assert
+  # via route/1 + the raw tokens call instead (real-path coverage lives in
+  # the smoke tests). Started unlinked so killing it (DOWN test) doesn't take
+  # down the manager.
   defmodule StubServer do
     use GenServer
 
@@ -17,10 +22,20 @@ defmodule LlamaCppEx.ModelManagerTest do
     def init(reply), do: {:ok, reply}
 
     @impl true
-    def handle_call({:generate, _prompt, _max}, _from, reply), do: {:reply, reply, reply}
+    def handle_call({:generate_tokens, _tokens, _max, _req_opts}, _from, reply),
+      do: {:reply, reply, reply}
+
     def handle_call(:get_model, _from, reply), do: {:reply, fake_model(), reply}
 
     defp fake_model, do: %LlamaCppEx.Model{ref: make_ref()}
+  end
+
+  # Routes id through the manager and performs the stubbed raw call — the
+  # unit-testable equivalent of ModelManager.generate/3 for :server entries.
+  defp generate_via_route(id) do
+    with {:ok, {:server, pid, _entry}} <- ModelManager.route(id) do
+      GenServer.call(pid, {:generate_tokens, [1, 2, 3], 256, []})
+    end
   end
 
   # Fake Backend: no real GGUF files, no native loads. Behaviour is driven by
@@ -160,7 +175,7 @@ defmodule LlamaCppEx.ModelManagerTest do
 
     test "generate routes to the server-backed model" do
       {:ok, _} = ModelManager.load("chat", {:path, "chat.gguf"}, fake_reply: {:ok, "hello"})
-      assert {:ok, "hello"} = ModelManager.generate("chat", "hi")
+      assert {:ok, "hello"} = generate_via_route("chat")
     end
 
     test "generate on a missing model returns :not_loaded" do
@@ -212,7 +227,7 @@ defmodule LlamaCppEx.ModelManagerTest do
         ModelManager.load("chat", {:path, "chat.gguf"}, default: true, fake_reply: {:ok, "d"})
 
       assert ModelManager.default() == "chat"
-      assert {:ok, "d"} = ModelManager.generate(:default, "hi")
+      assert {:ok, "d"} = generate_via_route(:default)
     end
 
     test "set_default/1 updates the default" do
@@ -221,7 +236,7 @@ defmodule LlamaCppEx.ModelManagerTest do
 
       assert :ok = ModelManager.set_default("b")
       assert ModelManager.default() == "b"
-      assert {:ok, "from-b"} = ModelManager.generate(:default, "hi")
+      assert {:ok, "from-b"} = generate_via_route(:default)
     end
 
     test "set_default on a missing model errors" do

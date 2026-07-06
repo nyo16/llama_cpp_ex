@@ -235,6 +235,44 @@ defmodule LlamaCppEx.ModelManager do
     )
   end
 
+  @doc """
+  Routes an OpenAI-shaped chat completion to model `id` (or `:default`).
+
+  Server-backed models serve it through the batching server (prefix caching,
+  `:session` affinity); direct models use the stateless path.
+  """
+  @spec chat_completion(id(), [LlamaCppEx.Chat.message()], keyword()) ::
+          {:ok, LlamaCppEx.ChatCompletion.t()} | {:error, term()}
+  def chat_completion(id, messages, opts \\ []) do
+    with_route(
+      id,
+      &LlamaCppEx.chat_completion(&1, messages, opts),
+      &LlamaCppEx.chat_completion(&1, messages, opts)
+    )
+  end
+
+  @doc """
+  Routes a streaming OpenAI-shaped chat completion to model `id` (or `:default`).
+
+  Raises `ArgumentError` if the model is not loaded and ready (a lazy stream
+  cannot carry an error tuple).
+  """
+  @spec stream_chat_completion(id(), [LlamaCppEx.Chat.message()], keyword()) :: Enumerable.t()
+  def stream_chat_completion(id, messages, opts \\ []) do
+    case with_route(
+           id,
+           &LlamaCppEx.stream_chat_completion(&1, messages, opts),
+           &LlamaCppEx.stream_chat_completion(&1, messages, opts)
+         ) do
+      {:error, reason} ->
+        raise ArgumentError,
+              "cannot stream chat completion from model #{inspect(id)}: #{inspect(reason)}"
+
+      stream ->
+        stream
+    end
+  end
+
   # A server-backed model exposes generate/stream only, so chat templating
   # happens here before handing the rendered prompt to the server.
   defp server_chat(pid, messages, opts) do

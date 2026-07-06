@@ -179,6 +179,7 @@ defmodule LlamaCppEx.MTP do
 
         ref = make_ref()
         parent = self()
+        cancel = LlamaCppEx.NIF.cancel_flag_new()
 
         gen_pid =
           spawn_link(fn ->
@@ -189,14 +190,22 @@ defmodule LlamaCppEx.MTP do
               max_tokens,
               emit_stats_every,
               parent,
-              ref
+              ref,
+              cancel
             )
           end)
 
         # Keep `sampler` alive for the duration of the stream so it doesn't
         # get GC'd while the NIF is still using it. `done?` records that a
         # terminal event was already emitted, so we halt on the next pull.
-        %{ref: ref, gen_pid: gen_pid, sampler: sampler, timeout: timeout, done?: false}
+        %{
+          ref: ref,
+          gen_pid: gen_pid,
+          sampler: sampler,
+          cancel: cancel,
+          timeout: timeout,
+          done?: false
+        }
       end,
       fn
         %{done?: true} = state ->
@@ -213,7 +222,10 @@ defmodule LlamaCppEx.MTP do
             timeout -> {:halt, state}
           end
       end,
-      fn %{ref: ref, gen_pid: gen_pid} ->
+      fn %{ref: ref, gen_pid: gen_pid, cancel: cancel} ->
+        # The flag stops the NIF loop cooperatively — killing the process
+        # alone cannot interrupt a running NIF.
+        LlamaCppEx.NIF.request_cancel(cancel)
         Process.unlink(gen_pid)
         Process.exit(gen_pid, :kill)
         flush(ref)

@@ -84,6 +84,7 @@ defmodule LlamaCppEx.NIF do
         _attention_type,
         _no_perf,
         _swa_full,
+        _kv_unified,
         _ctx_type,
         _n_rs_seq
       ),
@@ -124,6 +125,11 @@ defmodule LlamaCppEx.NIF do
   def memory_seq_pos_max(_ctx, _seq_id), do: :erlang.nif_error(:not_loaded)
   def context_can_seq_rm(_ctx), do: :erlang.nif_error(:not_loaded)
 
+  # Sequence state save/restore (RAM prompt cache)
+  def state_seq_get_size(_ctx, _seq_id), do: :erlang.nif_error(:not_loaded)
+  def state_seq_get_data(_ctx, _seq_id), do: :erlang.nif_error(:not_loaded)
+  def state_seq_set_data(_ctx, _state_bin, _dest_seq_id), do: :erlang.nif_error(:not_loaded)
+
   # Chat template
   def chat_apply_template(_template, _messages, _add_assistant),
     do: :erlang.nif_error(:not_loaded)
@@ -138,8 +144,12 @@ defmodule LlamaCppEx.NIF do
       ),
       do: :erlang.nif_error(:not_loaded)
 
+  # Cancellation (cooperative flag polled by the stateless generation loops)
+  def cancel_flag_new, do: :erlang.nif_error(:not_loaded)
+  def request_cancel(_flag), do: :erlang.nif_error(:not_loaded)
+
   # Streaming generation (sends messages to caller_pid tagged with ref)
-  def generate_tokens(_ctx, _sampler, _prompt_tokens, _max_tokens, _caller_pid, _ref),
+  def generate_tokens(_ctx, _sampler, _prompt_tokens, _max_tokens, _caller_pid, _ref, _cancel),
     do: :erlang.nif_error(:not_loaded)
 
   # Speculative decoding (MTP)
@@ -154,12 +164,14 @@ defmodule LlamaCppEx.NIF do
         _max_tokens,
         _emit_stats_every,
         _caller_pid,
-        _ref
+        _ref,
+        _cancel
       ),
       do: :erlang.nif_error(:not_loaded)
 
   # High-level generation
-  def generate(_ctx, _sampler, _prompt_tokens, _max_tokens), do: :erlang.nif_error(:not_loaded)
+  def generate(_ctx, _sampler, _prompt_tokens, _max_tokens, _cancel),
+    do: :erlang.nif_error(:not_loaded)
 
   # Embeddings
   def embed_decode(_ctx, _tokens, _seq_id), do: :erlang.nif_error(:not_loaded)
@@ -173,6 +185,10 @@ defmodule LlamaCppEx.NIF do
 
   # Continuous batching
   def batch_eval(_ctx, _entries), do: :erlang.nif_error(:not_loaded)
+
+  def batch_eval_sample(_ctx, _entries, _samplers, _purgeable_seq_ids),
+    do: :erlang.nif_error(:not_loaded)
+
   def sampler_sample_at(_sampler, _ctx, _idx), do: :erlang.nif_error(:not_loaded)
 
   # JSON Schema to Grammar
