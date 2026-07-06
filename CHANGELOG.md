@@ -57,6 +57,14 @@ is 1.6x faster than the stateless path. Full suite: 252 tests, 0 failures.
 
 ### Changed
 
+- **llama.cpp submodule** — Updated from 2d973636e to cb295bf59 (18 commits, tag b9888). No NIF changes were required: every header the binding compiles against — `include/llama.h`, `ggml/include/ggml.h`, `ggml/include/ggml-backend.h`, `common/common.h`, `common/chat.h`, `common/json-schema-to-grammar.h`, `common/sampling.h`, and `common/speculative.h` — has zero diff in this range (nothing under `include/` or `common/` changed at all). The range only touches `llama` core `src/` and the statically-linked `ggml` backend implementations (CUDA, HIP, Vulkan, CPU) plus webui/scripts/server-test code the NIF does not link against, so the bump is picked up purely by resyncing the static libraries on rebuild.
+  - **llama core**: guard the K/V rotation input when the buffer is unallocated (#25215); fix stale tensor-split params for draft models (#24814).
+  - **ggml**: fix a tensor-parallel + `-ncmoe` crash on MoE models (#25028); abort on a multi-buffer in `ggml-backend-meta` (#25276); fix the broken CPU concat implementation for quantized types (#25247).
+  - **CUDA**: extend K-type validation to V-types for flash attention (#24403); add a concat implementation for quantized types (#25303); optimize `conv_transpose_1d` indexing (#25310); VMM-pool allocation Turing P2P access fix (#24491).
+  - **ggml-cpu**: use a UE4M3 LUT in the ARM NVFP4 dot product (#25331); enable tiled matmul on AIX (#25199).
+  - **ggml-hip**: enable `-ffast-math` for HIP builds (#23862).
+  - **vulkan**: fix a 32-bit integer overflow in `CEIL_DIV` (#25245).
+  - **ui/scripts/tests** (not linked into the binding): restore the Ctrl+B sidebar toggle (#25307), fake a 200 for proxy `DELETE` requests (#25298), and add sync blocks so display/behavior settings honor `--ui-config-file` (#25132); use `HF_TOKEN` when downloading UI assets (#25280); temporarily skip the model-downloading API test (#25355).
 - **Server hot loop** — one fused dirty-CPU NIF per tick (`batch_eval_sample`:
   decode + per-slot sampling + detokenization + EOG check) replaces the previous
   1 dirty + (2 normal-scheduler NIFs + send) × generating-slots pattern; streamed
