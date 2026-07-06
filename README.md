@@ -24,9 +24,10 @@ Built with C++ NIFs using [fine](https://github.com/elixir-nx/fine) for ergonomi
 - **Multi-model manager** — keep several models resident, route requests by id, with a placement-aware (per-GPU VRAM) memory budget
 - **Device introspection** — `LlamaCppEx.devices/0` lists GPUs/accelerators with per-device VRAM
 - **Multi-Token Prediction (MTP) speculative decoding** — ~2x token-generation speedup on Qwen 3.6 with live acceptance-rate stats
-- **Prefix caching** — same-slot KV cache reuse for multi-turn chat (1.23x faster)
+- **Prefix caching** — cross-slot KV reuse with session affinity and an optional RAM prompt cache (TTFT 115 → 35 ms at ~75% hit ratio under concurrency)
 - **Pluggable batching strategies** — DecodeMaximal, PrefillPriority, Balanced
 - **Pre-tokenized API** — tokenize outside the GenServer for lower contention
+- **Request lifecycle controls** — per-request sampling params, `:max_queue` backpressure, and cancellation (dead or halted stream consumers free their slot immediately)
 - Telemetry integration for observability
 
 ## Installation
@@ -262,17 +263,40 @@ Multiple callers are batched into a single forward pass per tick, improving thro
 
 ### Prefix Caching
 
-The server caches KV state between requests on the same slot. Multi-turn chat benefits automatically — the system prompt and prior turns aren't recomputed:
+The server caches KV state between requests (on by default) and shares it **across slots**: with unified KV (`kv_unified: true`, the default) a system prompt prefilled by any slot is adopted by every other slot via a metadata-only copy, so it is computed once, ever. Requests carrying a `:session` term stick to their slot under concurrency, keeping conversations on their cached prefix:
 
 ```elixir
 {:ok, server} = LlamaCppEx.Server.start_link(
   model_path: "model.gguf",
   n_parallel: 4,
-  cache_prompt: true  # opt-in (default: false)
+  cache_prompt: true,        # default: true; also overridable per request
+  prompt_cache_ram_mb: 1024  # optional level-2 RAM cache for evicted prefixes (default: 0 = off)
 )
+
+{:ok, text} = LlamaCppEx.Server.generate(server, prompt, session: "conversation-42")
 ```
 
-Benchmark: **1.23x faster** for multi-turn conversations (487ms vs 597ms per 4-turn exchange).
+Benchmark (8 interleaved conversations × 4 turns on 4 slots, shared system prompt): **TTFT median 115 → 35.5 ms (3.2x)** at a ~75% prefix-cache hit ratio.
+
+Notes:
+
+- Hybrid GDN models (e.g. Qwen 3.5/3.6) only hit on exact-prefix continuations; dense-attention models additionally get partial-prefix and cross-slot hits.
+- If a chat template rewrites history (e.g. stripping thinking blocks), cache hits silently degrade — the server emits `[:llama_cpp_ex, :server, :prefix_instability]` telemetry when it detects this.
+
+### Chat Completions via the Server
+
+`chat_completion/3` and `stream_chat_completion/3` accept a running server in place of a `%Model{}` — templating and tokenization happen in the caller, and the multi-turn prompt benefits from the prefix cache (**1.6x faster** than the stateless path over a 4-turn conversation):
+
+```elixir
+{:ok, completion} =
+  LlamaCppEx.chat_completion(server, messages, max_tokens: 200, session: "conversation-42")
+```
+
+### Backpressure & Cancellation
+
+- `max_queue: n` bounds the request queue; overflow returns `{:error, :queue_full}` immediately and streams emit a single `{:error, :queue_full}` element (default: `0`, unlimited).
+- Halting a stream early (`Enum.take/2`, consumer exit) cancels generation and frees the slot right away instead of decoding to `max_tokens`; `LlamaCppEx.Server.cancel/2` is also available explicitly.
+- Sampling options (`:temp`, `:seed`, `:grammar`, ...) can be set per request, overriding the server defaults.
 
 ### Batching Strategies
 
