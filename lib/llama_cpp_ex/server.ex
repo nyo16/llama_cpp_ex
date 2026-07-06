@@ -612,7 +612,7 @@ defmodule LlamaCppEx.Server do
   @impl true
   def handle_call({:generate_tokens, token_ids, max_tokens, req_opts}, from, state) do
     if token_ids == [] do
-      {:reply, {:error, "token list cannot be empty"}, state}
+      {:reply, {:error, :empty_prompt}, state}
     else
       case acquire_slot(state, token_ids, req_opts) do
         {:ok, seq_id, state} ->
@@ -628,16 +628,23 @@ defmodule LlamaCppEx.Server do
   end
 
   def handle_call({:stream_tokens, token_ids, max_tokens, pid, ref, req_opts}, from, state) do
-    case acquire_slot(state, token_ids, req_opts) do
-      {:ok, seq_id, state} ->
-        state = init_slot(state, seq_id, token_ids, max_tokens, nil, pid, ref, req_opts)
-        GenServer.reply(from, :ok)
-        state = maybe_schedule_tick(state)
-        {:noreply, state}
+    if token_ids == [] do
+      # Same guard as :generate_tokens — an empty prompt would enter the tick
+      # with nothing to prefill and no logits to sample, hanging the consumer
+      # until its stream timeout.
+      {:reply, {:error, :empty_prompt}, state}
+    else
+      case acquire_slot(state, token_ids, req_opts) do
+        {:ok, seq_id, state} ->
+          state = init_slot(state, seq_id, token_ids, max_tokens, nil, pid, ref, req_opts)
+          GenServer.reply(from, :ok)
+          state = maybe_schedule_tick(state)
+          {:noreply, state}
 
-      :no_slots ->
-        request = {:stream, token_ids, max_tokens, nil, pid, ref, req_opts}
-        enqueue_or_reject(state, request, from, _reply_ok? = true)
+        :no_slots ->
+          request = {:stream, token_ids, max_tokens, nil, pid, ref, req_opts}
+          enqueue_or_reject(state, request, from, _reply_ok? = true)
+      end
     end
   end
 
@@ -748,11 +755,12 @@ defmodule LlamaCppEx.Server do
     end
   end
 
+  @doc false
   # Session affinity: the slot that served this session last, if it is idle.
   # Overrides the similarity rule — the session's cache lives there.
-  defp session_slot_if_idle(_state, nil, _idle_slots), do: nil
+  def session_slot_if_idle(_state, nil, _idle_slots), do: nil
 
-  defp session_slot_if_idle(state, session, idle_slots) do
+  def session_slot_if_idle(state, session, idle_slots) do
     with seq_id when seq_id != nil <- Map.get(state.sessions, session),
          true <- Enum.any?(idle_slots, fn {id, _} -> id == seq_id end) do
       seq_id
@@ -761,11 +769,13 @@ defmodule LlamaCppEx.Server do
     end
   end
 
+  @doc false
   # llama-server's slot-pick rule (server-context.cpp): reuse the slot with the
   # best cached-prefix similarity only when it clears a threshold
   # (LCP/prompt_len > 0.1); otherwise take the least-recently-used idle slot so
   # a tiny unrelated request doesn't evict a valuable long cache.
-  defp pick_cached_slot(idle_slots, tokens) do
+  # Public (like common_prefix_length/2) for direct unit testing.
+  def pick_cached_slot(idle_slots, tokens) do
     prompt_len = length(tokens)
 
     {best_id, best_lcp} =
@@ -780,7 +790,8 @@ defmodule LlamaCppEx.Server do
     end
   end
 
-  defp pick_lru_slot(idle_slots) do
+  @doc false
+  def pick_lru_slot(idle_slots) do
     {seq_id, _} = Enum.min_by(idle_slots, fn {_id, slot} -> slot.t_last_used end)
     seq_id
   end
@@ -999,22 +1010,30 @@ defmodule LlamaCppEx.Server do
     end
   end
 
-  defp ram_cache_covers?(entries, cached_tokens, cached_pos) do
+  @doc false
+  def ram_cache_covers?(entries, cached_tokens, cached_pos) do
     Enum.any?(entries, fn entry ->
       entry.len >= cached_pos and
         common_prefix_length(cached_tokens, entry.tokens) == cached_pos
     end)
   end
 
-  # FIFO eviction: drop oldest entries until the cache fits the budget.
-  defp evict_ram_cache_to_budget(state, budget) do
-    if state.ram_cache_bytes <= budget do
-      state
-    else
-      [evicted | rest] = state.ram_cache
-      state = %{state | ram_cache: rest, ram_cache_bytes: state.ram_cache_bytes - evicted.bytes}
-      emit_ram_cache_telemetry(state, :evict, evicted)
-      evict_ram_cache_to_budget(state, budget)
+  @doc false
+  # FIFO eviction: drop oldest entries until the cache fits the budget. The
+  # empty-cache clause is defensive — entries larger than the whole budget
+  # are never stored, so over-budget implies non-empty today.
+  def evict_ram_cache_to_budget(state, budget) do
+    case state.ram_cache do
+      _ when state.ram_cache_bytes <= budget ->
+        state
+
+      [] ->
+        %{state | ram_cache_bytes: 0}
+
+      [evicted | rest] ->
+        state = %{state | ram_cache: rest, ram_cache_bytes: state.ram_cache_bytes - evicted.bytes}
+        emit_ram_cache_telemetry(state, :evict, evicted)
+        evict_ram_cache_to_budget(state, budget)
     end
   end
 
@@ -1102,16 +1121,17 @@ defmodule LlamaCppEx.Server do
 
   defp validate_donor(_candidate, _state, _own_match), do: nil
 
-  defp donor_prefix_match(%{state: :idle} = slot, tokens) do
+  @doc false
+  def donor_prefix_match(%{state: :idle} = slot, tokens) do
     common_prefix_length(tokens, slot.cached_tokens)
   end
 
-  defp donor_prefix_match(%{state: :prefilling} = slot, tokens) do
+  def donor_prefix_match(%{state: :prefilling} = slot, tokens) do
     # Only positions 0..prefill_pos-1 are in the KV so far.
     min(common_prefix_length(tokens, slot.prompt_tokens), slot.prefill_pos)
   end
 
-  defp donor_prefix_match(%{state: :generating} = slot, tokens) do
+  def donor_prefix_match(%{state: :generating} = slot, tokens) do
     fed = slot.prompt_tokens ++ Enum.reverse(slot.generated_token_ids)
     min(common_prefix_length(tokens, fed), slot.pos)
   end
@@ -1692,12 +1712,15 @@ defmodule LlamaCppEx.Server do
 
   defp completion_reply(slot, _stop_reason), do: accumulated_text(slot)
 
+  # Error replies are shaped {:error, atom | {atom, detail}} across all
+  # failure paths: :context_full, :queue_full, :empty_prompt, and
+  # {:inference_failed, reason} here.
   defp fail_all_active_slots(state, reason) do
     active_slots =
       Enum.filter(state.slots, fn {_id, slot} -> slot.state != :idle end)
 
     Enum.reduce(active_slots, state, fn {seq_id, _slot}, state ->
-      fail_slot(state, seq_id, "inference failed: #{reason}")
+      fail_slot(state, seq_id, {:inference_failed, reason})
     end)
   end
 
