@@ -1,5 +1,27 @@
 # Changelog
 
+## v0.8.34
+
+Maintenance release: llama.cpp bump to b9932. Full suite against the rebuilt
+NIF: 191 tests, 0 failures.
+
+### Changed
+
+- **llama.cpp submodule** — Updated from cb295bf59 to a646006f0 (44 commits, tag b9932). No NIF changes were required: the header diffs in this range are additive only — new `GGML_TYPE_Q2_0`/`GGML_FTYPE_MOSTLY_Q2_0`/`LLAMA_FTYPE_MOSTLY_Q2_0` enum values in `ggml.h`/`llama.h`, a new `common_speculative_init_result` helper in `common/speculative.h`, and a `server_base` field plus `<fstream>` include in `common/common.h`.
+  - **llama core**: fix allowed decreasing positions in a sequence in llama-batch (#25449); add `n_keep_tail` in `split_equal` for recurrent models (#25278); refactor fused ops (#24646); fix quantized KV cache for dsv4 (#25202); fix OOB reads in the UGM tokenizer's `precompiled_charsmap` handling (#18750).
+  - **speculative**: fix out-of-bounds read in ngram-map on prompt shrink (#23936); fix draft-model fit vs load inconsistency in the server (#25056); naming/spacing cleanup (#25410).
+  - **ggml**: add Q2_0 quantization type definition + CPU backend (#24448); CPU f16→f16 `GGML_OP_SET_ROWS` (#25344); fix A-indexing in the simd_gemm scalar tail-column path (#25390); make `ggml_time_init` idempotent (#24422); better default thread count on ppc/AIX (#25237).
+  - **Metal**: add `set_rows` with f16 src0 (#25434); add `col2im_1d` op for f32/f16/bf16 (#25176).
+  - **CUDA**: f16→f16 `SET_ROWS` (#25367); fuse MMVQ post-scale for NVFP4 (#24481); remove `-sm row`, refactor cuBLAS (#24216).
+  - **Vulkan**: disable FA `mask_opt` on GCN (#24362); reduce submission threshold on small AMD GPUs by CU count (#25240); guard unimplemented f16 `SET_ROWS` (#25351).
+  - **OpenCL**: ragged-tile MoE prefill FP16 GEMM optimization (#25433); flash-attention decode perf (#25366); fix potential crash in aos reconstruct (#25383).
+  - **SYCL/HIP/hexagon**: eight SYCL commits (col2im_1d, cross-entropy-loss ops, argsort coverage, AOT double fix, env-var renames); HIP `-fno-finite-math-only` alongside `-ffast-math` (#25373); hexagon VTCM layouts + pipeline improvements for MUL_MAT/MUL_MAT_ID/FLASH_ATTN_EXT (#25425).
+  - **tools/server/ui** (not linked into the binding): llama-cli moved to an HTTP-based implementation (#24948); SSE replay-buffer follow-up (#25047); timings/progress in `/responses` API streams (#25348); prompt-cache RAM limit enforcement (#25070); fix `load_models()` deadlock (#25358); context-usage gauge in the web UI (#25340).
+
+### Added
+
+- **Speculative-decoding docs** — README and `LlamaCppEx.MTP` moduledoc now state which upstream speculative types the binding exposes (MTP only) and document DFlash status on Apple Silicon: functional end-to-end on Metal at b9932 via upstream tools, but measured slower than plain decoding at small target sizes (Qwen3.5-4B + 0.6B drafter on M4 Max: 42 tok/s vs 85 tok/s plain, 30% acceptance greedy), with community drafter-GGUF conversions still incompatible across converter revisions (#25116, #25110).
+
 ## v0.8.33
 
 Performance and robustness release for the batching `Server` and generation paths
