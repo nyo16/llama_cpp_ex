@@ -494,6 +494,12 @@ Multi-Token Prediction speculative decoding (upstream PR [#22673](https://github
 >
 > Larger `n_draft` hurts on Metal because verify cost grows faster than acceptance benefit. On NVIDIA, `n_draft: 3` is the right default — that's what the upstream 2× number assumes.
 
+### Other speculative types (EAGLE-3, DFlash, n-gram)
+
+Upstream llama.cpp implements more speculative types behind the same `common_speculative` API — `draft-eagle3`, `draft-dflash` (block-diffusion drafting via a separate drafter GGUF), and several n-gram self-speculation modes. **This binding currently exposes only MTP**: `MTP.init/2` pins `COMMON_SPECULATIVE_TYPE_DRAFT_MTP` and builds both contexts from the same model, so there is no way to load a separate drafter model yet.
+
+> **DFlash status (July 2026, llama.cpp b9932).** DFlash runs end-to-end on Metal via upstream `llama-cli`/`llama-server`, but we measured it *slower* than plain decoding on Apple Silicon at small target sizes: Qwen3.5-4B target + z-lab 0.6B drafter on M4 Max reached 42 tok/s with DFlash vs 85 tok/s plain (greedy sampling; 30% draft acceptance, mean accepted run 2.8 — and stochastic sampling at `temp 0.8` collapses acceptance to ~7%). The Metal economics are the same as the MTP note above (wide verify batches are expensive), and the community drafter-GGUF conversions are still churning: of three third-party Qwen 4B drafter repos tested, only one loads with current upstream (the others hit the `dflash-draft` arch mismatch [#25116](https://github.com/ggml-org/llama.cpp/issues/25116) or lack the `target_layers` metadata added by the conversion refactor [#25110](https://github.com/ggml-org/llama.cpp/pull/25110)). Worth revisiting when the drafter format settles; the natural entry point is a `spec_type` + drafter-model option on `speculative_init`.
+
 ### Models with MTP heads
 
 - [`ggml-org/Qwen3.6-35B-A3B-MTP-GGUF`](https://huggingface.co/ggml-org/Qwen3.6-35B-A3B-MTP-GGUF) (recommended: `Q4_K_M`, ~21 GB)

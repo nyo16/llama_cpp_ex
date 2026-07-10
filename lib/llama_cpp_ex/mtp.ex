@@ -30,6 +30,14 @@ defmodule LlamaCppEx.MTP do
   that — a single MTP session decodes one sequence at a time. Reuse the same
   `%MTP{}` value across calls to `stream/3` / `generate/3` to avoid rebuilding
   the contexts; KV caches are cleared on each call.
+
+  MTP is the only speculative type this binding exposes. Upstream llama.cpp
+  also implements EAGLE-3, DFlash (block-diffusion drafting via a separate
+  drafter GGUF), and n-gram self-speculation behind the same
+  `common_speculative` API, but the NIF pins the MTP type and both contexts
+  are built from the same model, so a separate drafter model cannot be loaded
+  yet. See the "Speculative decoding" section of the README for the current
+  status of DFlash on Apple Silicon.
   """
 
   alias LlamaCppEx.{Context, Model, Sampler, Tokenizer}
