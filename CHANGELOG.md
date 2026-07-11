@@ -1,5 +1,22 @@
 # Changelog
 
+## v0.8.35
+
+Maintenance release: llama.cpp bump to b9967. Full suite against the rebuilt
+NIF: 252 tests, 0 failures.
+
+### Changed
+
+- **llama.cpp submodule** — Updated from a646006f0 to 4f37f5197 (35 commits, tag b9967). No NIF changes were required: the only header change in this range is additive — a new `ggml/include/ggml-et.h` for the initial ET backend; `llama.h`, `common/chat.h`, `common/common.h`, `common/sampling.h`, `common/speculative.h`, and `common/json-schema-to-grammar.h` are all untouched.
+  - **llama core**: make all KQ masks f16 when flash attention is used, remove zero attention bias and raw_k repeats in DeepSeek V4 (#25370); make tensor-split regex patterns static (#24710); add llama-batch unit test (#25471).
+  - **ggml**: initial ET backend (#24179); process data in smaller chunks in CUDA `ggml_top_k()`/`ggml_argsort()` to reduce temporary buffer memory (#24776); fix depthwise conv2d (#25490); ggml syncs including `ggml_vqtbl1q_u8` for 32-bit compat.
+  - **Metal**: add CONV_2D_DW (depthwise convolution) support (#21565).
+  - **CUDA**: mmvq indexing simplification with always multiply/add (#25445); align snake fusion matcher with other backends (#25460).
+  - **HIP/WebGPU/OpenCL**: enable `-funsafe-math-optimizations` on HIP (#24668); tune subgroup split in WebGPU `flash_attn_vec` (#25418); OpenCL cluster-parallel decode FA for Adreno (#25473) and Q6_K GEMM/GEMV fix for weight `ne01` not a multiple of 128 (#25464).
+  - **hexagon**: ARGSORT performance for small tensors (#25512); tiling, tracing and optimizations for unary ops (#25474); VISION RoPE support (#25216).
+  - **mtmd**: deepseek-ocr v1 multi-tile (#24717).
+  - **tools/server/ui** (not linked into the binding): accept null sampling params (#25538); respect min-step when splitting prompt batches (#25420); move chat-template thinking probe inside the init try/catch (#24093); prevent duplicate speculative model downloads (#25527); `llama-cli --output` option (#25484) and crash fix on wrong server base URL (#25497); assorted web UI improvements.
+
 ## v0.8.34
 
 Maintenance release: llama.cpp bump to b9932. Full suite against the rebuilt
