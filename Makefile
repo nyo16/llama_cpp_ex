@@ -125,6 +125,16 @@ else
   ifneq ($(shell $(CXX) -fopenmp -E - < /dev/null 2>/dev/null && echo yes),)
     LDFLAGS += -lgomp
   endif
+  # ggml-cuda.a leaves the CUDA runtime, cuBLAS, and driver API unresolved.
+  # The stubs dir lets -lcuda link on hosts without a driver (e.g. release CI);
+  # the real libcuda.so.1 is picked up from the driver at load time.
+  ifneq (,$(filter -DGGML_CUDA=ON,$(CMAKE_FLAGS)))
+    CUDA_HOME ?= $(patsubst %/bin/nvcc,%,$(shell which nvcc 2>/dev/null))
+    ifneq ($(CUDA_HOME),)
+      LDFLAGS += -L$(CUDA_HOME)/lib64 -L$(CUDA_HOME)/lib64/stubs
+    endif
+    LDFLAGS += -lcudart -lcublas -lcublasLt -lcuda
+  endif
 endif
 
 # CPU count for parallel builds
