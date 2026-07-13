@@ -2178,12 +2178,20 @@ fine::Ok<> generate_mtp_tokens(
 
                 // Re-decode the accepted tokens on the target so the next
                 // iteration's draft starts from a consistent state.
+                //
+                // The KV must be rebuilt with the token that was `sampled` at
+                // the top of this iteration (batch element 0, at pos n_past),
+                // followed by all but the LAST emitted token. The last emitted
+                // token becomes the next iteration's `sampled` and is decoded
+                // then — including it here would duplicate it in the context.
+                // `sampled` sits at prompt[size - n_accepted_total - 1], since
+                // the accept loop pushed n_accepted_total tokens after it.
                 if (n_accepted_total > 0) {
                     llama_batch redo = llama_batch_init(n_accepted_total, 0, 1);
                     BatchFreeGuard redo_guard(redo);
                     for (int i = 0; i < n_accepted_total; i++) {
                         llama_token tok =
-                            prompt[prompt.size() - n_accepted_total + i];
+                            prompt[prompt.size() - n_accepted_total - 1 + i];
                         common_batch_add(redo, tok,
                                          n_past + static_cast<llama_pos>(i),
                                          { seq_id },
