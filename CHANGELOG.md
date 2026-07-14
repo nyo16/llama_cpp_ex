@@ -1,5 +1,25 @@
 # Changelog
 
+## v0.8.36
+
+Maintenance release: llama.cpp bump to b10001. Full suite against the rebuilt
+NIF: 178 passed, 4 skipped, 8 excluded, 0 failures.
+
+### Changed
+
+- **llama.cpp submodule** — Updated from 4f37f5197 to 657e01125 (34 commits, tag b10001). No NIF changes were required: the header diffs in this range are additive only — `llama.h`, `common/chat.h`, `common/sampling.h`, `common/speculative.h`, and `common/json-schema-to-grammar.h` are untouched. `ggml/include/ggml.h` gains a `GGML_OP_LIGHTNING_INDEXER` enum value plus a new `ggml_lightning_indexer()` function, `ggml/include/gguf.h` gains a `gguf_get_tensor_ne()` shape accessor, `common/common.h` gains an optional `id_task` field on `common_prompt_checkpoint`, and `ggml/include/ggml-rpc.h` bumps its RPC protocol patch version.
+  - **llama core**: add Hy3 (hy_v3) support with MTP speculative decoding (#25395); Minimax2 eagle3 speculative support; DeepSeek V4 clears cache per-seq rather than fully (#25521); fix reasoning leak with force-opened bare `<think>` templates (#24674).
+  - **ggml**: `GGML_OP_LIGHTNING_INDEXER` implementing the DeepSeek V3.2/V4 lightning indexer (#24231); uniformize im2col dst_type for all conv ops (#23660); gguf tensor shape accessor (#24405) and rejection of empty metadata keys (#24917).
+  - **Metal**: add Q2_0 support (#25419).
+  - **CUDA**: refactor MMQ kernel configuration (#24127); don't crash when querying memory on a device with no free memory (#25157).
+  - **SYCL**: add fused top-k MoE (#25217); add Q2_K to the DMMV reorder path (#25064); set `fattn_vec_nthreads` to 256 for Battlemage (#25205).
+  - **Vulkan**: native e2m1/e4m3 conversions for mxfp4/nvfp4 (#25338); route large matmuls to medium tile on Adreno (#24877).
+  - **OpenCL**: int8 dp4 dense and MoE prefill optimization for Adreno (#25537).
+  - **kleidiai**: add SME2 f32 kernel (#24414).
+  - **mtmd**: fix silent prompt truncation on embedded NUL (#25548).
+  - **convert/build**: `convert_hf_to_gguf` split MTP export for HY V3 (#25641); flush log before exiting after `usage()` (#25504); fix the `LLAMA_SPLIT_MODE_TENSOR not implemented` message conditional (#24926); test harness cleanups (#25616, #25619).
+  - **tools/server/ui** (not linked into the binding): honour per-request `reasoning_budget_tokens` in chat completions (#23116); refactor `server_stream` (#25541) and allow stream for `exec_shell_command` (#25526); evict checkpoints within min-step of each other (#25472); don't treat `--no-mmproj-auto` models as multimodal (#25590); fix image blocks dropped in tool_result during Anthropic↔OpenAI conversion (#22536); update cpp-httplib to 0.50.1 (#25576); assorted web UI improvements.
+
 ## v0.8.35
 
 Maintenance release: llama.cpp bump to b9967. Full suite against the rebuilt
