@@ -1,5 +1,27 @@
 # Changelog
 
+## v0.8.36
+
+Maintenance release: llama.cpp bump to b10052. Full suite against the rebuilt
+NIF: 178 passed, 0 failures (4 skipped, 8 smoke tests excluded — they need real
+GGUF models).
+
+### Changed
+
+- **llama.cpp submodule** — Updated from 4f37f5197 to b2dd28a3b (85 commits, tag b10052). No NIF changes were required: `include/llama.h` is untouched and every other binding-relevant header change in this range is additive only — `common/common.h` gains a `LLAMA_EXAMPLE_TOKENIZE` enum value, server CORS fields, `tokenize_*` fields, and an `id_task` field on `common_prompt_checkpoint`; `ggml/include/ggml.h` gains a `GGML_OP_LIGHTNING_INDEXER` op plus `ggml_is_contiguous_to_{1,2,3}` and `ggml_lightning_indexer`; `ggml-cpu.h` gains `ggml_cpu_has_sme2`; `gguf.h` gains a `gguf_get_tensor_ne` shape accessor; `ggml-rpc.h` only bumps its protocol patch version (not linked into the binding).
+  - **llama core / models**: add Hy3 (`hy_v3`) with MTP speculative decoding (#25395); Minimax2 eagle3 speculative support; DeepSeek V4 fixes — reduce graph splits (#25702), fix `seq_rm` (#25588), clear cache per-seq rather than full (#25521); tensor-parallel fixes for Phi3/Bert/Plamo2-3/ChatGLM (#25536); fix crash with draft-simple (#25720); fix reasoning leak with force-opened bare `<think>` templates (#24674).
+  - **ggml**: add `GGML_OP_LIGHTNING_INDEXER` for the DeepSeek V3.2/V4 lightning indexer (#24231); add inner-dimension contiguity check functions (#25650); uniformize im2col dst_type across conv ops (#23660); add f16 `out_prod` (CPU) and `out_prod` op for Vulkan (#23997); support f16 as `SET_ROWS` src for Vulkan/CPU (#25432).
+  - **gguf**: add tensor shape accessor `gguf_get_tensor_ne` (#24405); reject empty metadata keys (#24917).
+  - **Metal**: fuse snake activation (mul, sin, sqr, mul, add) (#25459); add Q2_0 support (#25419).
+  - **CUDA**: LIGHTNING_INDEXER kernel — generic vector + wmma (#25545); CUDA Virtual Devices (#25228); CUDA graphs on Volta/Turing (#25749); dedup MoE gate/up activation quantization (#25441); relax tensor contiguity for quantized concat (#25678); MMQ kernel config refactor (#24127); don't crash querying memory on a device with no free memory (#25157).
+  - **Vulkan**: native e2m1/e4m3 conversions for mxfp4/nvfp4 (#25338); sync on event_wait for transfer-queue async copies (#25229); route large matmuls to medium tile on Adreno (#24877).
+  - **OpenCL**: int8 dp4 dense + MoE prefill optimization for Adreno (#25537); assorted Adreno a7x/850 flash-attention and MoE fixes/guards (#25745, #25698, #25697, #25671, #25640, #25639, #25673).
+  - **SYCL**: flash attention via oneDNN XMX engine (#25222); fused top-k MoE (#25217); xielu op (#25550); get_rows Q2_K/Q4_K/Q5_K fix (#25656); Q2_K DMMV reorder path (#25064).
+  - **kleidiai / hexagon**: SME2 f32 kernel (#24414) and SME-vs-SME2 dispatch (#25478); hexagon L2 cache rework with lazy flushing (#25762) and hmx-queue enum-narrowing fix (#25677).
+  - **mtmd**: fix silent prompt truncation on embedded NUL (#25548).
+  - **convert**: accept `BitNetForCausalLM` architecture name (#25769); fix dflash target tokenizer mismatch (#25733); split MTP export for HY V3 (#25641).
+  - **tools/server/ui** (not linked into the binding): `--cors-*` options (#25655) and ignore empty `Origin` headers (#25756); per-request `reasoning_budget_tokens` in chat completions (#23116); prompt-cache state ownership refactor (#25649); text-only slot save/restore with mtmd (#25076); fix dropped image blocks in tool_result during Anthropic/OpenAI conversion (#22536); `tokenize` tool aligned to common args (#25516, #25672); assorted web UI / MCP fixes.
+
 ## v0.8.35
 
 Maintenance release: llama.cpp bump to b9967. Full suite against the rebuilt
