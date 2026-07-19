@@ -1,5 +1,20 @@
 # Changelog
 
+## v0.8.37
+
+Maintenance release: llama.cpp bump to b10068. Full suite against the rebuilt
+NIF with real GGUF models (smoke tests included): 252 passed, 0 failures.
+
+### Changed
+
+- **llama.cpp submodule** — Updated from b2dd28a3b to 571d0d540 (16 commits, tag b10068). No NIF changes were required: `include/llama.h`, `common/chat.h`, `common/common.h`, and `common/json-schema-to-grammar.h` are all untouched, and the remaining header changes are additive only — `ggml/include/ggml.h` gains three DeepSeek V4 hyper-connection ops (`GGML_OP_DSV4_HC_COMB`/`_PRE`/`_POST`) with matching `ggml_dsv4_hc_comb`/`_pre`/`_post` API functions, `common/download.h` gains `download_eagle3`/`download_dflash` options plus eagle3/dflash plan fields, and `ggml-rpc.h` only bumps its protocol patch version (not linked into the binding).
+  - **llama core / models**: DeepSeek V4 fused hyper-connection ops — a richer stream-based replacement for the plain residual connection (#25585); rotate injected K/V cache for DFlash (#25823); llama-quant excludes the i32 `ffn_gate_tid2eid` routing table from quantization (#25787).
+  - **ggml**: version bumped to 0.17.0 (ggml/1568) plus a ggml sync; ggml-blas defaults hadamard mul_mat to the CPU routine (#25710); initialize all tensors in `test_dsv4_hc` to avoid NaNs in sentinel tensors (#25822).
+  - **Vulkan**: Q2_0 support (#25430).
+  - **OpenCL**: q6_K MoE GEMM kernel loaded from the binary kernel lib (#25797); MoE dp4a activation tiles read/written to local memory as 128-bit vectorized LD/ST for Adreno (#25810); transposed q4_K noshuffle scales for coalesced reads (#25805); q4_K/q5_K flat mv loads quants as uint for Adreno A7x (#25780); ABS op (#25115); Adreno 810 usage note in docs (#25786).
+  - **SYCL**: fix row calculation when `K_QUANTS_PER_ITERATION` is 1 (#25690).
+  - **common** (download helpers, not linked into the binding): auto-download dflash- and eagle3- HF sidecars (#25811).
+
 ## v0.8.36
 
 Maintenance release: llama.cpp bump to b10052. Full suite against the rebuilt
