@@ -87,8 +87,13 @@ defmodule LlamaCppEx.ServerSmokeTest do
       server = start_server([])
       attach_collector([:llama_cpp_ex, :server, :request, :start])
 
-      a1 = "Chat A. User: Name three colors.\nAssistant:"
-      b1 = "Chat B, unrelated. User: Name three animals.\nAssistant:"
+      # The two prompts must share no leading tokens. pick_cached_slot/2 reuses a
+      # slot when longest-common-prefix / prompt_len > 0.1, so a shared opener
+      # (both prompts used to start with "Chat ") is enough to route b1 onto a1's
+      # slot on some tokenizers — this test then failed on Llama-3.2 while
+      # passing on Qwen3.5. Keep the first tokens distinct.
+      a1 = "Weather log. User: Name three colors.\nAssistant:"
+      b1 = "Zoology notes, unrelated. User: Name three animals.\nAssistant:"
 
       {:ok, ra} = Server.generate(server, a1, max_tokens: 12, session: :a)
       {_, %{seq_id: slot_a}} = next_telemetry()
