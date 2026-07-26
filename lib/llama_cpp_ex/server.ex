@@ -153,6 +153,7 @@ defmodule LlamaCppEx.Server do
   require Logger
 
   alias LlamaCppEx.{Context, Model, Sampler, Tokenizer, UTF8Stream}
+  alias LlamaCppEx.Server.Slots
 
   # Sampling options accepted both at server start (defaults) and per request
   # (overrides). Owned by Sampler, so this cannot drift out of sync; the
@@ -719,60 +720,20 @@ defmodule LlamaCppEx.Server do
         :no_slots
 
       slots ->
-        session_pick = session_slot_if_idle(state, Keyword.get(req_opts, :session), slots)
+        session_pick =
+          Slots.session_slot_if_idle(state.sessions, Keyword.get(req_opts, :session), slots)
 
         cond do
           session_pick != nil ->
             {:ok, session_pick, state}
 
           tokens != [] and request_cache_prompt?(state, req_opts) ->
-            {:ok, pick_cached_slot(slots, tokens), state}
+            {:ok, Slots.pick_cached_slot(slots, tokens), state}
 
           true ->
-            {:ok, pick_lru_slot(slots), state}
+            {:ok, Slots.pick_lru_slot(slots), state}
         end
     end
-  end
-
-  @doc false
-  # Session affinity: the slot that served this session last, if it is idle.
-  # Overrides the similarity rule — the session's cache lives there.
-  def session_slot_if_idle(_state, nil, _idle_slots), do: nil
-
-  def session_slot_if_idle(state, session, idle_slots) do
-    with seq_id when seq_id != nil <- Map.get(state.sessions, session),
-         true <- Enum.any?(idle_slots, fn {id, _} -> id == seq_id end) do
-      seq_id
-    else
-      _ -> nil
-    end
-  end
-
-  @doc false
-  # llama-server's slot-pick rule (server-context.cpp): reuse the slot with the
-  # best cached-prefix similarity only when it clears a threshold
-  # (LCP/prompt_len > 0.1); otherwise take the least-recently-used idle slot so
-  # a tiny unrelated request doesn't evict a valuable long cache.
-  # Public (like common_prefix_length/2) for direct unit testing.
-  def pick_cached_slot(idle_slots, tokens) do
-    prompt_len = length(tokens)
-
-    {best_id, best_lcp} =
-      idle_slots
-      |> Enum.map(fn {id, slot} -> {id, common_prefix_length(tokens, slot.cached_tokens)} end)
-      |> Enum.max_by(fn {_id, lcp} -> lcp end)
-
-    if best_lcp / prompt_len > 0.1 do
-      best_id
-    else
-      pick_lru_slot(idle_slots)
-    end
-  end
-
-  @doc false
-  def pick_lru_slot(idle_slots) do
-    {seq_id, _} = Enum.min_by(idle_slots, fn {_id, slot} -> slot.t_last_used end)
-    seq_id
   end
 
   defp init_slot(state, seq_id, tokens, max_tokens, from, stream_pid, stream_ref, req_opts) do
@@ -796,7 +757,7 @@ defmodule LlamaCppEx.Server do
 
     raw_match =
       if cache_prompt? do
-        min(common_prefix_length(tokens, slot.cached_tokens), max_reuse)
+        min(Slots.common_prefix_length(tokens, slot.cached_tokens), max_reuse)
       else
         0
       end
@@ -993,7 +954,7 @@ defmodule LlamaCppEx.Server do
   def ram_cache_covers?(entries, cached_tokens, cached_pos) do
     Enum.any?(entries, fn entry ->
       entry.len >= cached_pos and
-        common_prefix_length(cached_tokens, entry.tokens) == cached_pos
+        Slots.common_prefix_length(cached_tokens, entry.tokens) == cached_pos
     end)
   end
 
@@ -1028,7 +989,7 @@ defmodule LlamaCppEx.Server do
     {entry, lcp} =
       state.ram_cache
       |> Enum.map(fn entry ->
-        {entry, min(common_prefix_length(tokens, entry.tokens), max_reuse)}
+        {entry, min(Slots.common_prefix_length(tokens, entry.tokens), max_reuse)}
       end)
       |> Enum.max_by(fn {_entry, lcp} -> lcp end)
 
@@ -1084,7 +1045,9 @@ defmodule LlamaCppEx.Server do
 
       state.slots
       |> Enum.reject(fn {id, _slot} -> id == dst_seq_id end)
-      |> Enum.map(fn {id, slot} -> {id, min(donor_prefix_match(slot, tokens), max_reuse)} end)
+      |> Enum.map(fn {id, slot} ->
+        {id, min(Slots.donor_prefix_match(slot, tokens), max_reuse)}
+      end)
       |> Enum.max_by(fn {_id, lcp} -> lcp end, fn -> {nil, 0} end)
       |> validate_donor(state, own_match)
     else
@@ -1099,21 +1062,6 @@ defmodule LlamaCppEx.Server do
   end
 
   defp validate_donor(_candidate, _state, _own_match), do: nil
-
-  @doc false
-  def donor_prefix_match(%{state: :idle} = slot, tokens) do
-    common_prefix_length(tokens, slot.cached_tokens)
-  end
-
-  def donor_prefix_match(%{state: :prefilling} = slot, tokens) do
-    # Only positions 0..prefill_pos-1 are in the KV so far.
-    min(common_prefix_length(tokens, slot.prompt_tokens), slot.prefill_pos)
-  end
-
-  def donor_prefix_match(%{state: :generating} = slot, tokens) do
-    fed = slot.prompt_tokens ++ Enum.reverse(slot.generated_token_ids)
-    min(common_prefix_length(tokens, fed), slot.pos)
-  end
 
   defp slot_mode(%{stream_pid: pid}) when is_pid(pid), do: :stream
   defp slot_mode(_slot), do: :generate
@@ -1159,7 +1107,11 @@ defmodule LlamaCppEx.Server do
       Enum.reduce(requests, {state, []}, fn request, {state, rest} ->
         opts = request_opts(request)
 
-        case session_slot_if_idle(state, Keyword.get(opts, :session), idle_slots(state)) do
+        case Slots.session_slot_if_idle(
+               state.sessions,
+               Keyword.get(opts, :session),
+               idle_slots(state)
+             ) do
           nil ->
             {state, [request | rest]}
 
@@ -1711,11 +1663,4 @@ defmodule LlamaCppEx.Server do
       %{state | tick_scheduled: true}
     end
   end
-
-  @doc false
-  # Single-pass count of the shared prefix length — no intermediate zip list.
-  def common_prefix_length(a, b), do: common_prefix_length(a, b, 0)
-
-  defp common_prefix_length([x | a], [x | b], n), do: common_prefix_length(a, b, n + 1)
-  defp common_prefix_length(_, _, n), do: n
 end
