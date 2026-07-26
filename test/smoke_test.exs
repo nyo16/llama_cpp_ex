@@ -10,9 +10,13 @@ defmodule LlamaCppEx.SmokeTest do
   is slow. Run it explicitly after bumping the `vendor/llama.cpp` submodule or
   rebuilding the NIF:
 
+      GGML_METAL_NO_RESIDENCY=1 \\
       LLAMA_SMOKE_GEN_MODEL=/path/to/chat-model.gguf \\
       LLAMA_SMOKE_EMB_MODEL=/path/to/embedding-model.gguf \\
         mix test test/smoke_test.exs --include smoke
+
+  On Metal, `GGML_METAL_NO_RESIDENCY=1` keeps a passing run from aborting with
+  exit 134 while the VM tears down; `test/test_helper.exs` explains why.
 
   `LLAMA_SMOKE_GEN_MODEL` is required for the generation/chat/grammar tests;
   `LLAMA_SMOKE_EMB_MODEL` is optional and only enables the embedding tests.

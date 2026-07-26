@@ -6,7 +6,8 @@ Maintenance release: llama.cpp bump to b10133, on top of b10075 from v0.8.38.
 Unlike recent bumps this range **breaks the upstream C API**, so one NIF change
 was required — see the `model_load/10` entry below. The public Elixir API is
 unchanged. Full suite against the rebuilt NIF with real GGUF models (smoke, slow
-and MTP speculative-decoding tests all included): 252 passed, 0 failures.
+and MTP speculative-decoding tests all included): 263 passed, 0 failures, over 12
+consecutive runs.
 
 ### Changed
 
@@ -30,6 +31,10 @@ and MTP speculative-decoding tests all included): 252 passed, 0 failures.
   - **tools/server/ui** (not linked into the binding): MCP stdio support (#26062) and MCP display-name conflict fix (#26011); `"reasoning_effort": "none"` in the OAI API (#26045); a `format` arg on the datetime tool (#26117); missing `adaptive_target`/`adaptive_decay` task parameters in `generation_settings` (#25830); return 400 instead of 500 on validation errors with `X-Conversation-Id` (#25760); properly handle a null `llama_context` (#25868); reduced per-token render cost while streaming (#26053); assorted web UI fixes.
   - **vendor / ci**: update cpp-httplib to 0.51.0 (#26067) and `subprocess.h` (#26061); fix the SYCL package shared-library lookup (#25987).
 - **NIF `model_load/10`** — Now maps the existing `:use_mmap` / `:use_mlock` / `:use_direct_io` options onto the new `llama_load_mode` enum instead of setting the three removed booleans. The documented precedence is preserved (direct I/O takes precedence over mmap, and mlock implies mmap): `dio` > `mlock` > `mmap` > `none`. The Elixir API and its defaults are unchanged, so no caller updates are needed; all four resolved modes were verified against a real model load.
+
+### Fixed
+
+- **Documented the Metal teardown abort in the smoke-test instructions (exit 134)** — On Metal, a fully green suite could still abort while the VM shut down, printing `263 passed, 0 failures` and then exiting 134 with `ggml-metal-device.m:622: GGML_ASSERT([rsets->data count] == 0) failed`. llama.cpp's Metal device is owned by a function-local `static std::vector`, so it is destroyed by `__cxa_finalize_ranges` *after* the BEAM calls `exit(3)`, and its destructor asserts that the global `MTLResidencySet` collection is empty. The BEAM makes no promise that NIF resource destructors have run by then, so a model or context still holding Metal buffers trips the assert; it reproduced on 3 of 12 all-green full-suite runs. `test/test_helper.exs` now explains the mechanism and the documented smoke-test commands set `GGML_METAL_NO_RESIDENCY=1`, which stops the collection from being allocated at all so `ggml_metal_rsets_free` returns early — removing the assert rather than racing it (12 of 12 clean runs). A residency set is only an OS memory-residency hint, so buffer allocation and compute are unchanged. The variable has to come from the shell: `System.put_env/2` does not reach the C `getenv` ggml reads. Nothing in the library changed — production keeps the upstream default, and CI is unaffected either way because it runs on Linux with `LLAMA_BACKEND=cpu` and loads no models. The same exit-ordering race applies to any node that halts while a model or context is still referenced; `backend_free/0` does not help, as it only reaches `ggml_quantize_free()`.
 
 ## v0.8.38
 
