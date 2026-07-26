@@ -143,11 +143,15 @@ model_load(ErlNifEnv* env, std::string path, int64_t n_gpu_layers, bool use_mmap
            bool use_mlock, bool use_direct_io, bool vocab_only, bool check_tensors) {
     auto params = llama_model_default_params();
     params.n_gpu_layers = static_cast<int32_t>(n_gpu_layers);
-    params.use_mmap = use_mmap;
     params.main_gpu = static_cast<int32_t>(main_gpu);
     params.split_mode = static_cast<enum llama_split_mode>(split_mode);
-    params.use_mlock = use_mlock;
-    params.use_direct_io = use_direct_io;
+    // Upstream collapsed the use_mmap/use_mlock/use_direct_io booleans into a
+    // single llama_load_mode enum. Preserve the documented precedence of the
+    // Elixir options: direct I/O wins over mmap, and mlock implies mmap.
+    params.load_mode = use_direct_io ? LLAMA_LOAD_MODE_DIRECT_IO
+                     : use_mlock     ? LLAMA_LOAD_MODE_MLOCK
+                     : use_mmap      ? LLAMA_LOAD_MODE_MMAP
+                                     : LLAMA_LOAD_MODE_NONE;
     params.vocab_only = vocab_only;
     params.check_tensors = check_tensors;
 

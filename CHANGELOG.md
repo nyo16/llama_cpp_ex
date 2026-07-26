@@ -1,5 +1,36 @@
 # Changelog
 
+## v0.8.39
+
+Maintenance release: llama.cpp bump to b10133, on top of b10075 from v0.8.38.
+Unlike recent bumps this range **breaks the upstream C API**, so one NIF change
+was required — see the `model_load/10` entry below. The public Elixir API is
+unchanged. Full suite against the rebuilt NIF with real GGUF models (smoke, slow
+and MTP speculative-decoding tests all included): 252 passed, 0 failures.
+
+### Changed
+
+- **llama.cpp submodule** — Updated from 76f46ad29 to ff067f76d (58 commits, tag b10133). Two binding-relevant headers changed, one of them breaking:
+  - `include/llama.h` — **breaking**: `llama_model_params` loses the `use_mmap`, `use_direct_io` and `use_mlock` booleans; they are replaced by a single `enum llama_load_mode load_mode` field with values `LLAMA_LOAD_MODE_NONE` / `_MMAP` / `_MLOCK` / `_DIRECT_IO` (`none`/`mmap`/`mlock`/`dio`), plus new `llama_load_mode_name` / `llama_load_mode_from_str` helpers (#20834). Note `LLAMA_LOAD_MODE_MLOCK` means "mmap **and** mlock" — the two are no longer independent.
+  - `common/chat.h` — `common_chat_params::thinking_end_tag` (`std::string`) became `thinking_end_tags` (`std::vector<std::string>`) so the reasoning-budget sampler can accept multiple end sequences (#25544). The binding never read that field, so no change was needed.
+  - `common/common.h` changes (`common_params::load_mode`, `reasoning_budget_end` widened to `std::vector<llama_tokens>`, new MCP server config fields) do not affect the binding, which does not use `common_params`. `common/json-schema-to-grammar.h`, `common/speculative.h`, `common/sampling.h` and every `ggml/include/` header are untouched in this range.
+  - **llama core / models**: add GLM 5.2 Indexer support (#25407); add support for Laguna XS.2 & M.1 (#25165); assorted llama bug fixes (#26051); fix DeepSeek4 APE tensor op in llama-arch (#25945); fix the crafted DeepSeek4 template (#25414); fix the reasoning-preserve variable for DS4 (#25999); cohere2 MoE template parser enforces the JSON schema for text responses when a response schema is provided (#26018); synchronize save-load-state generation in the tests (#26056).
+  - **common**: support multiple end sequences in the reasoning budget sampler (#25544); fix a use-after-free when loading a LoRA adapter fails (#25611); skip the empty implicit default preset (#25643); infer the speculative type from draft-repo sidecars (#25989) and resolve a draft repo to its requested sidecar (#25955).
+  - **ggml**: declare `gguf_writer_base`'s destructor virtual (#25867); enable PowerPC backend variants on AIX (#25983); add the `GGML_BACKEND_DL_IMPL` invocation for the OpenVINO backend (#25795).
+  - **Metal**: add f16 type support to leaky relu (#25981).
+  - **CUDA**: `GET_ROWS` for quantized types (#25962); vectorize same-type `get_rows` with an int4 copy (#25929); improve NVFP4 W4A4 activation quantization (#25730); add `sqrt_softplus` in topk-moe for dsv4 (#25896); fix external compilation of q1_0 MMQ (#25778).
+  - **Vulkan**: refactor `vk_queue` to use per-instance mutexes and unique handles (#23570).
+  - **HIP**: remove rocWMMA FlashAttention (#26046).
+  - **WebGPU**: add a CONV_2D_DW (depthwise conv2d) kernel (#25847); fix WASM compilation with OpenMP (#25943).
+  - **OpenCL**: cache compiled `cl_program` binaries on disk (#26050); do not treat NULL-mask flash attention as causal (#25771).
+  - **hexagon**: further pipeline improvements to the core bits (L2, DMA, MM, FA) (#26049); partial im2col support (#26007); activation ops update (#25974); check tensor type when reusing descriptors (#25968); fix a Windows crash when `op_poll` is enabled (#26029).
+  - **kleidiai**: warn once when a weight type has no KleidiAI kernel (#25701).
+  - **mtmd**: use RAII for setting and resetting non-causal attention (#25723); use `align_corners` for qwen3vl vision position embedding interpolation (#25781).
+  - **convert**: fix the non-MoE NomicBert GGUF conversion error (#25996); handle the HunyuanVL XD-RoPE config (#25514).
+  - **tools/server/ui** (not linked into the binding): MCP stdio support (#26062) and MCP display-name conflict fix (#26011); `"reasoning_effort": "none"` in the OAI API (#26045); a `format` arg on the datetime tool (#26117); missing `adaptive_target`/`adaptive_decay` task parameters in `generation_settings` (#25830); return 400 instead of 500 on validation errors with `X-Conversation-Id` (#25760); properly handle a null `llama_context` (#25868); reduced per-token render cost while streaming (#26053); assorted web UI fixes.
+  - **vendor / ci**: update cpp-httplib to 0.51.0 (#26067) and `subprocess.h` (#26061); fix the SYCL package shared-library lookup (#25987).
+- **NIF `model_load/10`** — Now maps the existing `:use_mmap` / `:use_mlock` / `:use_direct_io` options onto the new `llama_load_mode` enum instead of setting the three removed booleans. The documented precedence is preserved (direct I/O takes precedence over mmap, and mlock implies mmap): `dio` > `mlock` > `mmap` > `none`. The Elixir API and its defaults are unchanged, so no caller updates are needed; all four resolved modes were verified against a real model load.
+
 ## v0.8.38
 
 Maintenance release: llama.cpp bump to b10075. Full suite against the rebuilt

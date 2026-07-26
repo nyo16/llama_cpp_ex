@@ -21,11 +21,21 @@ defmodule LlamaCppEx.Model do
       Defaults to `:none`.
     * `:tensor_split` - List of floats specifying the proportion of work per GPU
       (e.g. `[0.5, 0.5]` for two GPUs). Defaults to `[]`.
-    * `:use_mlock` - Pin model memory in RAM to prevent swapping. Defaults to `false`.
+    * `:use_mlock` - Pin model memory in RAM to prevent swapping. Implies `:use_mmap`.
+      Defaults to `false`.
     * `:use_direct_io` - Bypass page cache when loading (takes precedence over mmap).
       Defaults to `false`.
     * `:vocab_only` - Load vocabulary and metadata only, skip weights. Defaults to `false`.
     * `:check_tensors` - Validate model tensor data on load. Defaults to `false`.
+
+  > #### Load mode {: .info}
+  >
+  > llama.cpp collapsed its three loading booleans into one `load_mode` enum, so
+  > these options resolve to a single mode with `:use_direct_io` > `:use_mlock` >
+  > `:use_mmap` precedence — respectively `dio`, `mlock`, `mmap`, and `none` when
+  > all are false. Because `mlock` now implies mmap upstream, passing
+  > `use_mlock: true, use_mmap: false` memory-maps the file rather than reading
+  > it into anonymous memory.
 
   ## Examples
 
