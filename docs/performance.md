@@ -275,11 +275,16 @@ Additional options when loading models:
 {:ok, model} = LlamaCppEx.load_model("model.gguf",
   n_gpu_layers: -1,       # Offload all layers to GPU
   use_mmap: true,          # Memory-map file (default, faster loading)
-  use_mlock: true,         # Pin in RAM (prevent swapping)
+  use_mlock: true,         # Pin in RAM (prevent swapping); implies use_mmap
   use_direct_io: false,    # Bypass page cache
   check_tensors: true      # Validate tensor data (debugging)
 )
 ```
+
+These three flags resolve to llama.cpp's single `load_mode` enum, with
+`use_direct_io` > `use_mlock` > `use_mmap` precedence (`dio`, `mlock`, `mmap`,
+or `none` when all are false). Only one mode is ever active, so combining them
+is not additive.
 
 ## Complete Optimization Example
 
