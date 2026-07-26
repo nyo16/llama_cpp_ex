@@ -1,7 +1,11 @@
 defmodule LlamaCppEx.ServerSmokeTest do
   # Integration tests for Server behaviors that need a real model. Run with:
   #
+  #   GGML_METAL_NO_RESIDENCY=1 \
   #   LLAMA_SMOKE_GEN_MODEL=/path/to/chat-model.gguf mix test --include smoke
+  #
+  # On Metal, GGML_METAL_NO_RESIDENCY=1 keeps a passing run from aborting with
+  # exit 134 while the VM tears down; test/test_helper.exs explains why.
   #
   # async: false — each test starts its own server against the GPU.
   use ExUnit.Case, async: false
