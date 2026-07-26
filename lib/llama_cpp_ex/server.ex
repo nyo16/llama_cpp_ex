@@ -155,19 +155,9 @@ defmodule LlamaCppEx.Server do
   alias LlamaCppEx.{Context, Model, Sampler, Tokenizer, UTF8Stream}
 
   # Sampling options accepted both at server start (defaults) and per request
-  # (overrides). Keep in sync with LlamaCppEx.Sampler.create/2.
-  @sampler_opt_keys [
-    :seed,
-    :temp,
-    :top_k,
-    :top_p,
-    :min_p,
-    :penalty_repeat,
-    :penalty_freq,
-    :penalty_present,
-    :grammar,
-    :grammar_root
-  ]
+  # (overrides). Owned by Sampler, so this cannot drift out of sync; the
+  # compile-time dependency recompiles this module when that list changes.
+  @sampler_opt_keys Sampler.option_keys()
 
   # Per-request options accepted by generate/stream and carried through the
   # queue into the slot. Server-level options provide the defaults.
@@ -258,6 +248,18 @@ defmodule LlamaCppEx.Server do
       `LlamaCppEx.Server.Strategy.DecodeMaximal`. See `LlamaCppEx.Server.BatchStrategy`.
     * Sampling options: `:temp`, `:top_k`, `:top_p`, `:min_p`, `:seed`, `:penalty_repeat`,
       `:penalty_freq`, `:penalty_present`, `:grammar`, `:grammar_root`.
+    * Context tuning options are forwarded to `LlamaCppEx.Context.create/2` —
+      `:n_threads`, `:n_threads_batch`, `:n_ubatch`, `:type_k`, `:type_v`,
+      `:flash_attn`, `:offload_kqv`, `:op_offload`, the RoPE/YaRN options,
+      `:attention_type`, `:no_perf` and `:swa_full`. See
+      `LlamaCppEx.Context.tuning_option_keys/0` for the authoritative list.
+      `:n_ctx`, `:n_batch`, `:n_seq_max` and `:kv_unified` are set by the server
+      from the options above and cannot be overridden here.
+    * Model loading options are forwarded to `LlamaCppEx.Model.load/2` —
+      `:main_gpu`, `:split_mode`, `:tensor_split`, `:use_mmap`, `:use_mlock`,
+      `:use_direct_io` and `:check_tensors`. The three load flags collapse into
+      llama.cpp's single `load_mode` with `:use_direct_io` > `:use_mlock` >
+      `:use_mmap` precedence; see `LlamaCppEx.Model.load/2`.
     * GenServer options like `:name`.
 
   """
@@ -509,35 +511,12 @@ defmodule LlamaCppEx.Server do
 
     sampler_opts = Keyword.take(opts, @sampler_opt_keys)
 
-    model_opts =
-      Keyword.take(opts, [
-        :main_gpu,
-        :split_mode,
-        :tensor_split,
-        :use_mlock,
-        :use_direct_io,
-        :check_tensors
-      ])
-
-    context_opts =
-      Keyword.take(opts, [
-        :type_k,
-        :type_v,
-        :flash_attn,
-        :offload_kqv,
-        :op_offload,
-        :rope_scaling_type,
-        :rope_freq_base,
-        :rope_freq_scale,
-        :yarn_ext_factor,
-        :yarn_attn_factor,
-        :yarn_beta_fast,
-        :yarn_beta_slow,
-        :yarn_orig_ctx,
-        :attention_type,
-        :no_perf,
-        :swa_full
-      ])
+    # Both lists are owned by the modules that consume them. The values this
+    # function computes below (n_gpu_layers, n_ctx, n_batch, n_seq_max,
+    # kv_unified) are prepended at the call sites and win, because Keyword.get/3
+    # returns the first match.
+    model_opts = Keyword.take(opts, Model.tuning_option_keys())
+    context_opts = Keyword.take(opts, Context.tuning_option_keys())
 
     # Trap exits so terminate/2 reliably erases the persistent_term model
     # cache on shutdown.
