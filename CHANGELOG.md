@@ -1,5 +1,19 @@
 # Changelog
 
+## v0.8.38
+
+Maintenance release: llama.cpp bump to b10075. Full suite against the rebuilt
+NIF with the generation smoke tests included (real GGUF model): 191 passed, 0
+failures (4 skipped; embedding smoke tests opt-in and left skipped).
+
+### Changed
+
+- **llama.cpp submodule** — Updated from 571d0d540 to 76f46ad29 (7 commits, tag b10075). No NIF changes were required: every binding-relevant header is untouched — `include/llama.h`, `common/chat.h`, `common/common.h`, `common/json-schema-to-grammar.h`, and `ggml/include/ggml.h` are all unchanged. The only header edits in this range are two internal hexagon backend headers (`ggml/src/ggml-hexagon/htp/htp-ops.h`, `unary-ops.h`), which are not part of the public API and not linked into the macOS/Linux binding.
+  - **llama core**: DeepSeek V4 KV-cache state serialization now writes only the used rows rather than the full cache (#25325).
+  - **hexagon**: add CLAMP op (#25934).
+  - **OpenCL**: support broadcast for Adreno `MUL_MAT` and honor `view_offs` for Adreno Q8_0 `MUL_MAT` in llama-server multi-stream (#25910).
+  - **tools/server/ui** (not linked into the binding): sidebar conversation bulk actions plus settings logic/UI improvements (#25815); enable the agentic flow when only the JS sandbox is active (#25865); fix Settings/Display tool-call content toggle (#25783); fix collapsed user bubble with markdown rendering (#25869).
+
 ## v0.8.37
 
 Maintenance release: llama.cpp bump to b10068. Full suite against the rebuilt
