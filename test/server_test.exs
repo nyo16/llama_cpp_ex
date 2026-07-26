@@ -2,6 +2,7 @@ defmodule LlamaCppEx.ServerTest do
   use ExUnit.Case, async: true
 
   alias LlamaCppEx.Server
+  alias LlamaCppEx.Server.Slots
 
   # --- Pure slot/cache logic (no model files needed) ---
 
@@ -23,7 +24,7 @@ defmodule LlamaCppEx.ServerTest do
       ]
 
       # 8/10 of the prompt matches slot 0
-      assert Server.pick_cached_slot(slots, [1, 2, 3, 4, 5, 6, 7, 8, 20, 21]) == 0
+      assert Slots.pick_cached_slot(slots, [1, 2, 3, 4, 5, 6, 7, 8, 20, 21]) == 0
     end
 
     test "falls back to LRU when the best match is below the threshold" do
@@ -35,12 +36,12 @@ defmodule LlamaCppEx.ServerTest do
 
       prompt = [1] ++ Enum.to_list(900..950)
       # 1/52 match < 0.1 → LRU (slot 0, oldest) — protects slot 1's cache.
-      assert Server.pick_cached_slot(slots, prompt) == 0
+      assert Slots.pick_cached_slot(slots, prompt) == 0
     end
 
     test "pick_lru_slot returns the least recently used" do
       slots = [idle_slot(0, [], 300), idle_slot(1, [], 100), idle_slot(2, [], 200)]
-      assert Server.pick_lru_slot(slots) == 1
+      assert Slots.pick_lru_slot(slots) == 1
     end
   end
 
@@ -48,33 +49,33 @@ defmodule LlamaCppEx.ServerTest do
     test "returns the session's slot when idle" do
       state = %{sessions: %{"conv-a" => 1}}
       idle = [idle_slot(0, [], 0), idle_slot(1, [], 0)]
-      assert Server.session_slot_if_idle(state, "conv-a", idle) == 1
+      assert Slots.session_slot_if_idle(state.sessions, "conv-a", idle) == 1
     end
 
     test "returns nil when the session's slot is busy" do
       state = %{sessions: %{"conv-a" => 1}}
       idle = [idle_slot(0, [], 0)]
-      assert Server.session_slot_if_idle(state, "conv-a", idle) == nil
+      assert Slots.session_slot_if_idle(state.sessions, "conv-a", idle) == nil
     end
 
     test "returns nil for unknown or nil sessions" do
       state = %{sessions: %{}}
       idle = [idle_slot(0, [], 0)]
-      assert Server.session_slot_if_idle(state, "ghost", idle) == nil
-      assert Server.session_slot_if_idle(state, nil, idle) == nil
+      assert Slots.session_slot_if_idle(state.sessions, "ghost", idle) == nil
+      assert Slots.session_slot_if_idle(state.sessions, nil, idle) == nil
     end
   end
 
   describe "donor_prefix_match/2 (only fed tokens count)" do
     test "idle donor matches against its cached tokens" do
       slot = %{state: :idle, cached_tokens: [1, 2, 3, 4]}
-      assert Server.donor_prefix_match(slot, [1, 2, 3, 9]) == 3
+      assert Slots.donor_prefix_match(slot, [1, 2, 3, 9]) == 3
     end
 
     test "prefilling donor is capped at prefill_pos" do
       slot = %{state: :prefilling, prompt_tokens: [1, 2, 3, 4, 5, 6], prefill_pos: 2}
       # Prompt matches 6 tokens, but only 2 are in the KV so far.
-      assert Server.donor_prefix_match(slot, [1, 2, 3, 4, 5, 6]) == 2
+      assert Slots.donor_prefix_match(slot, [1, 2, 3, 4, 5, 6]) == 2
     end
 
     test "generating donor is capped at fed position" do
@@ -86,7 +87,7 @@ defmodule LlamaCppEx.ServerTest do
       }
 
       # Fed history is [1, 2, 3, 4, 5] but only pos=4 tokens are in KV.
-      assert Server.donor_prefix_match(slot, [1, 2, 3, 4, 5, 6]) == 4
+      assert Slots.donor_prefix_match(slot, [1, 2, 3, 4, 5, 6]) == 4
     end
   end
 

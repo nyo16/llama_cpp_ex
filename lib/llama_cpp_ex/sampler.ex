@@ -11,6 +11,30 @@ defmodule LlamaCppEx.Sampler do
 
   @type t :: %__MODULE__{ref: reference()}
 
+  @option_keys [
+    :seed,
+    :temp,
+    :top_k,
+    :top_p,
+    :min_p,
+    :penalty_repeat,
+    :penalty_freq,
+    :penalty_present,
+    :grammar,
+    :grammar_root
+  ]
+
+  @doc """
+  The options `create/2` accepts.
+
+  This module is the single source of truth: callers that forward user sampling
+  options (`LlamaCppEx`, `LlamaCppEx.Server`) select them with this function
+  instead of keeping their own copy of the list. Every sampling option is safe
+  to forward, so there is no tuning/structural split here.
+  """
+  @spec option_keys() :: [atom()]
+  def option_keys, do: @option_keys
+
   @doc """
   Creates a new sampler chain.
 

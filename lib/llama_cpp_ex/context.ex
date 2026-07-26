@@ -1,12 +1,82 @@
 defmodule LlamaCppEx.Context do
   @moduledoc """
   Inference context with KV cache.
+
+  ## Option ownership
+
+  This module is the single source of truth for the options `create/2` accepts.
+  Callers that forward user options into a context (`LlamaCppEx`,
+  `LlamaCppEx.Server`, `LlamaCppEx.MTP`) must select them with
+  `tuning_option_keys/0` rather than keeping their own copy of the list — three
+  hand-maintained copies had already drifted, silently dropping `:n_threads`,
+  `:n_threads_batch` and `:n_ubatch` on `LlamaCppEx.Server`.
+
+  The keys are split by kind:
+
+    * `tuning_option_keys/0` — performance knobs that are safe to forward from
+      any caller. They never change what the context *is*.
+    * `structural_option_keys/0` — options that decide the context's purpose or
+      size (`:embeddings`, `:pooling_type`, `:ctx_type`, `:n_ctx`, ...). Each
+      caller sets these explicitly; forwarding them blindly would let, say,
+      `embeddings: true` turn a generation server into an embedding context.
+
+  Callers pass their own values as `[n_ctx: computed] ++ forwarded_opts`, which
+  wins because `Keyword.get/3` returns the first match.
   """
 
   @enforce_keys [:ref, :model]
   defstruct [:ref, :model]
 
   @type t :: %__MODULE__{ref: reference(), model: LlamaCppEx.Model.t()}
+
+  @tuning_option_keys [
+    :n_threads,
+    :n_threads_batch,
+    :n_batch,
+    :n_ubatch,
+    :type_k,
+    :type_v,
+    :flash_attn,
+    :offload_kqv,
+    :op_offload,
+    :rope_scaling_type,
+    :rope_freq_base,
+    :rope_freq_scale,
+    :yarn_ext_factor,
+    :yarn_attn_factor,
+    :yarn_beta_fast,
+    :yarn_beta_slow,
+    :yarn_orig_ctx,
+    :attention_type,
+    :no_perf,
+    :swa_full
+  ]
+
+  @structural_option_keys [
+    :n_ctx,
+    :n_seq_max,
+    :kv_unified,
+    :embeddings,
+    :pooling_type,
+    :ctx_type,
+    :n_rs_seq
+  ]
+
+  @doc """
+  Options that are safe for a caller to forward from user-supplied opts.
+
+  See the "Option ownership" section in the module doc.
+  """
+  @spec tuning_option_keys() :: [atom()]
+  def tuning_option_keys, do: @tuning_option_keys
+
+  @doc """
+  Options a caller must set explicitly rather than forward blindly.
+
+  See the "Option ownership" section in the module doc.
+  """
+  @spec structural_option_keys() :: [atom()]
+  def structural_option_keys, do: @structural_option_keys
 
   @doc """
   Creates a new inference context for the given model.

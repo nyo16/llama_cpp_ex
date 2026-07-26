@@ -8,6 +8,36 @@ defmodule LlamaCppEx.Model do
 
   @type t :: %__MODULE__{ref: reference()}
 
+  @tuning_option_keys [
+    :main_gpu,
+    :split_mode,
+    :tensor_split,
+    :use_mmap,
+    :use_mlock,
+    :use_direct_io,
+    :check_tensors
+  ]
+
+  @structural_option_keys [:n_gpu_layers, :vocab_only]
+
+  @doc """
+  Options that are safe for a caller to forward from user-supplied opts.
+
+  `LlamaCppEx.Server` selects its model options with this function rather than
+  keeping its own copy of the list.
+  """
+  @spec tuning_option_keys() :: [atom()]
+  def tuning_option_keys, do: @tuning_option_keys
+
+  @doc """
+  Options a caller must set explicitly rather than forward blindly.
+
+  `:vocab_only` in particular must never be forwarded into a server — it would
+  load a model with no weights.
+  """
+  @spec structural_option_keys() :: [atom()]
+  def structural_option_keys, do: @structural_option_keys
+
   @doc """
   Loads a GGUF model from the given file path.
 

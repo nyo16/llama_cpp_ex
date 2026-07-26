@@ -42,43 +42,9 @@ defmodule LlamaCppEx do
     UTF8Stream
   }
 
-  @context_opt_keys [
-    :n_threads,
-    :n_threads_batch,
-    :n_batch,
-    :n_ubatch,
-    :type_k,
-    :type_v,
-    :flash_attn,
-    :offload_kqv,
-    :op_offload,
-    :rope_scaling_type,
-    :rope_freq_base,
-    :rope_freq_scale,
-    :yarn_ext_factor,
-    :yarn_attn_factor,
-    :yarn_beta_fast,
-    :yarn_beta_slow,
-    :yarn_orig_ctx,
-    :attention_type,
-    :no_perf,
-    :swa_full
-  ]
-
-  # Sampling options forwarded to Sampler.create/2 by the generation entry
-  # points. Keep in sync with the options documented on generate/3.
-  @sampler_opt_keys [
-    :seed,
-    :temp,
-    :top_k,
-    :top_p,
-    :min_p,
-    :penalty_repeat,
-    :penalty_freq,
-    :penalty_present,
-    :grammar,
-    :grammar_root
-  ]
+  # Context and sampling options are owned by the modules that consume them —
+  # see Context.tuning_option_keys/0 and Sampler.option_keys/0. Do not copy the
+  # lists here; three copies had already drifted apart.
 
   # Chat-templating options split off before the rest flows to generation.
   @chat_opt_keys [:add_assistant, :enable_thinking, :chat_template_kwargs]
@@ -266,8 +232,8 @@ defmodule LlamaCppEx do
       max_tokens: Keyword.get(opts, :max_tokens, 256),
       n_ctx: Keyword.get(opts, :n_ctx, 2048),
       timeout: Keyword.get(opts, :timeout, 60_000),
-      sampler_opts: Keyword.take(opts, @sampler_opt_keys),
-      ctx_opts: Keyword.take(opts, @context_opt_keys)
+      sampler_opts: Keyword.take(opts, Sampler.option_keys()),
+      ctx_opts: Keyword.take(opts, Context.tuning_option_keys())
     }
   end
 

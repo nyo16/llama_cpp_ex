@@ -52,29 +52,13 @@ defmodule LlamaCppEx.MTP do
           n_draft: pos_integer()
         }
 
-  @context_opt_keys [
-    :n_threads,
-    :n_threads_batch,
-    :n_batch,
-    :n_ubatch,
-    :type_k,
-    :type_v,
-    :flash_attn,
-    :offload_kqv,
-    :op_offload,
-    :rope_scaling_type,
-    :rope_freq_base,
-    :rope_freq_scale,
-    :yarn_ext_factor,
-    :yarn_attn_factor,
-    :yarn_beta_fast,
-    :yarn_beta_slow,
-    :yarn_orig_ctx,
-    :attention_type,
-    :no_perf,
-    :swa_full,
-    :n_ctx
-  ]
+  # Context options forwarded to both the target and draft contexts. The list is
+  # owned by Context (tuning_option_keys/0); MTP additionally lets the caller set
+  # :n_ctx, which is structural everywhere else because each caller normally
+  # computes it.
+  defp forwardable_context_opts(opts) do
+    Keyword.take(opts, [:n_ctx | Context.tuning_option_keys()])
+  end
 
   @doc """
   Initializes an MTP speculative session: builds the target context, the MTP
@@ -98,7 +82,7 @@ defmodule LlamaCppEx.MTP do
     n_draft = Keyword.get(opts, :n_draft, 3)
 
     if is_integer(n_draft) and n_draft > 0 do
-      base_ctx_opts = Keyword.take(opts, @context_opt_keys)
+      base_ctx_opts = forwardable_context_opts(opts)
       main_opts = Keyword.merge(base_ctx_opts, ctx_type: :default)
       # Match upstream server: MTP draft context is created with n_rs_seq=0.
       # The MTP impl handles state rollback internally via cached hidden
@@ -166,19 +150,7 @@ defmodule LlamaCppEx.MTP do
     emit_stats_every = Keyword.get(opts, :emit_stats_every, 0)
     timeout = Keyword.get(opts, :timeout, 60_000)
 
-    sampler_opts =
-      Keyword.take(opts, [
-        :seed,
-        :temp,
-        :top_k,
-        :top_p,
-        :min_p,
-        :penalty_repeat,
-        :penalty_freq,
-        :penalty_present,
-        :grammar,
-        :grammar_root
-      ])
+    sampler_opts = Keyword.take(opts, Sampler.option_keys())
 
     Stream.resource(
       fn ->

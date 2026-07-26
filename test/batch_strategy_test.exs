@@ -1,6 +1,7 @@
 defmodule LlamaCppEx.Server.BatchStrategyTest do
   use ExUnit.Case, async: true
 
+  alias LlamaCppEx.Server.Slots
   alias LlamaCppEx.Server.Strategy.{Balanced, DecodeMaximal, PrefillPriority}
 
   # We need a mock model_ref for token_to_piece calls.
@@ -182,31 +183,31 @@ defmodule LlamaCppEx.Server.BatchStrategyTest do
 
   describe "common_prefix_length/2" do
     test "matching prefix" do
-      assert LlamaCppEx.Server.common_prefix_length([1, 2, 3, 4], [1, 2, 3, 5]) == 3
+      assert Slots.common_prefix_length([1, 2, 3, 4], [1, 2, 3, 5]) == 3
     end
 
     test "identical lists" do
-      assert LlamaCppEx.Server.common_prefix_length([1, 2, 3], [1, 2, 3]) == 3
+      assert Slots.common_prefix_length([1, 2, 3], [1, 2, 3]) == 3
     end
 
     test "no match" do
-      assert LlamaCppEx.Server.common_prefix_length([1, 2, 3], [4, 5, 6]) == 0
+      assert Slots.common_prefix_length([1, 2, 3], [4, 5, 6]) == 0
     end
 
     test "first empty" do
-      assert LlamaCppEx.Server.common_prefix_length([], [1, 2]) == 0
+      assert Slots.common_prefix_length([], [1, 2]) == 0
     end
 
     test "second empty" do
-      assert LlamaCppEx.Server.common_prefix_length([1, 2], []) == 0
+      assert Slots.common_prefix_length([1, 2], []) == 0
     end
 
     test "both empty" do
-      assert LlamaCppEx.Server.common_prefix_length([], []) == 0
+      assert Slots.common_prefix_length([], []) == 0
     end
 
     test "different lengths with match" do
-      assert LlamaCppEx.Server.common_prefix_length([1, 2, 3, 4, 5], [1, 2]) == 2
+      assert Slots.common_prefix_length([1, 2, 3, 4, 5], [1, 2]) == 2
     end
   end
 end
