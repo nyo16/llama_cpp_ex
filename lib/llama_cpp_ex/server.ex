@@ -750,8 +750,14 @@ defmodule LlamaCppEx.Server do
       n_parallel = Keyword.get(opts, :n_parallel, 4)
       n_ctx = Keyword.get(opts, :n_ctx, 8192)
 
-      # Trap exits so terminate/2 runs on shutdown, and so a linked stream
-      # consumer's death does not take the model down with it.
+      # Trap exits so terminate/2 runs on shutdown — that is the only reason.
+      #
+      # It does NOT insulate the server from a linked process dying: the
+      # `{:EXIT, _, reason}` clause in handle_info/2 honours the signal with
+      # `{:stop, reason, state}`, so a link that breaks takes the model down. An
+      # earlier version of this comment claimed the opposite, which matters because
+      # the two readings imply opposite failure modes for anything that links
+      # itself to a server.
       Process.flag(:trap_exit, true)
 
       state = %__MODULE__{
@@ -993,7 +999,16 @@ defmodule LlamaCppEx.Server do
   end
 
   def handle_info({:EXIT, _pid, reason}, state) do
-    # trap_exit is on (for terminate/2 cleanup) — honor exit signals.
+    # trap_exit is on so terminate/2 runs on shutdown (see init/1); honouring the
+    # signal here is what keeps a supervisor's `Process.exit(pid, :shutdown)`
+    # working. The cost is that *every* exit signal stops the server, `:normal`
+    # included — which an untrapped process would silently ignore.
+    #
+    # That makes this clause a landmine for anything that links itself here and
+    # then exits normally. `LlamaCppEx.Generator` used to leave exactly such a
+    # signal behind — an already-queued `{:EXIT, pid, :normal}` survives
+    # `Process.unlink/1` — so a server driving a generator would have shut down
+    # with reason `:normal` and no log line. `Generator.stop/1` drains it now.
     {:stop, reason, state}
   end
 
