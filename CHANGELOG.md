@@ -65,25 +65,27 @@ facade's streams emit errors instead of truncating silently.
   `Sampler.reset/1` or `accept/2` dereferenced freed heap. `LlamaSampler` now holds
   a `fine::ResourcePtr<LlamaModel>`, matching what `LlamaContext` and
   `LlamaSpeculative` already did.
-- **The memory, state and sampling NIFs now range-check their arguments.**
+- **Every value crossing the NIF boundary is now range-checked.**
   `GGML_ASSERT` is never `NDEBUG`-gated, so it calls `ggml_abort()` → `abort()`: a
   bad integer from Elixir took down the entire BEAM with no exception, no
-  supervisor and no crash report. Verified by removing one guard, rebuilding, and
-  watching `memory_seq_rm(ctx, 99, 0, -1)` abort the VM through `ggml_abort` with
-  `NDEBUG` active.
+  supervisor and no crash report. Verified by removing each guard in turn,
+  rebuilding, and watching the VM abort with `NDEBUG` active — `embed_decode/3`
+  with an out-of-range `seq_id` exits the OS process with `SIGABRT`.
 
-  > #### Not yet complete {: .warning}
-  >
-  > This does **not** yet cover every NIF. `embed_decode/4`,
-  > `embed_batch_decode/2` and `batch_eval_sample/4`'s `purgeable_seq_ids` still
-  > pass an unchecked caller-supplied `seq_id` to `llama_memory_seq_rm` before any
-  > batch is built, so upstream's batch validation never sees it and the abort is
-  > still reachable from Elixir. Do not treat the boundary as closed. The NIFs
-  > enumerated below *are* guarded; anything not listed is not.
-
-  - `seq_id` is validated against `llama_n_seq_max/1` in `memory_seq_rm/4`,
-    `memory_seq_cp/5`, `memory_seq_keep/2`, `memory_seq_pos_max/2`,
-    `state_seq_get_size/2`, `state_seq_get_data/2` and `state_seq_set_data/3`.
+  - `seq_id` is validated against `llama_n_seq_max/1` in every NIF that can reach
+    a `llama_memory_*` or `llama_state_seq_*` call outside a batch:
+    `memory_seq_rm/4`, `memory_seq_cp/5`, `memory_seq_keep/2`,
+    `memory_seq_pos_max/2`, `state_seq_get_size/2`, `state_seq_get_data/2`,
+    `state_seq_set_data/3`, `embed_decode/3`, `embed_batch_decode/2` and
+    `batch_eval_sample/4`'s `purgeable_seq_ids`.
+  - Sequence ids carried *inside* a `llama_batch` are bounded by upstream's
+    `llama_batch_allocr::init`, which returns `false` rather than asserting, so
+    `llama_decode` returns non-zero and the NIF returns `{:error, _}`. That is why
+    `prefill/3`, `decode_batch/3`, `decode_token/4`, `batch_eval/2` and
+    `batch_eval_sample/4`'s entries need no local guard — a distinction now
+    recorded in code and enumerated in `test/nif_guards_test.exs`, whose
+    `@seq_id_surface` table is checked against `LlamaCppEx.NIF`'s own source so a
+    new `seq_id`-taking NIF fails the suite until it is classified.
   - The logits index in `sampler_sample/2` and `sampler_sample_at/3` is validated
     against the shape of the last successful decode, reproducing all three cases
     upstream's `output_resolve_row` rejects. `llama_get_logits_ith` only degrades

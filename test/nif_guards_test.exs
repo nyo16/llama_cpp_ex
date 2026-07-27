@@ -60,86 +60,188 @@ defmodule LlamaCppEx.NIFGuardsTest do
     assert is_integer(NIF.sampler_sample(sampler.ref, ctx.ref))
   end
 
-  describe "seq_id bounds (raising NIFs)" do
-    test "memory_seq_rm/4", %{ctx: ctx, tokens: tokens, model: model} do
-      for seq <- @bad_seq_ids do
-        assert_erlang_error(:invalid_seq_id, fn -> NIF.memory_seq_rm(ctx.ref, seq, 0, -1) end)
-      end
+  # --- The guarded surface, declared in one place ---
+  #
+  # `{nif, arity, which_argument, outcome}`. `which_argument` is also the
+  # `probe/3` clause that supplies the call shape.
+  #
+  # Outcomes differ only in how the rejection is *reported* — the safety property
+  # is identical and asserted the same way for all of them: the VM survives and
+  # the context still decodes and samples.
+  #
+  #   * `:raise`    — `** (ErlangError) :invalid_seq_id`. Used where the success
+  #     value is a bare integer or boolean; widening it into a tuple would cost a
+  #     per-token allocation on `sampler_sample/2`-class paths.
+  #   * `:atom`     — `{:error, :invalid_seq_id}`, for NIFs already returning an
+  #     atom error.
+  #   * `:message`  — `{:error, "invalid seq_id N (must be ...)"}`, for NIFs
+  #     already returning a string error. Adding a guard never changes a NIF's
+  #     error *type*.
+  #   * `:upstream` — no local guard: the id is carried *inside a `llama_batch`*,
+  #     and `llama_batch_allocr::init`
+  #     (`vendor/llama.cpp/src/llama-batch.cpp:61-64`) range-checks batch seq ids
+  #     and returns false, so `llama_decode` returns non-zero. The three blockers
+  #     this enumeration was written for were distinct precisely because they
+  #     reached `llama_memory_seq_rm` *outside* any batch.
+  #   * `:lookup`   — no local guard: `llama_get_embeddings_seq` is a
+  #     `std::map::find` (`llama-context.cpp:921-928`) returning nullptr.
+  #
+  # The previous version of this file hand-picked 7 seq_id-bearing NIFs and missed
+  # exactly the three that were unguarded, so a green run proved only that the
+  # guards someone had already thought of were load-bearing — which is how a
+  # break-verification (remove one guard, watch the VM abort) came back green on
+  # an incomplete guard set. `covers every seq_id-bearing NIF` below checks this
+  # table against `LlamaCppEx.NIF`'s own source, so a new seq_id-taking NIF fails
+  # the suite until it is listed here with an outcome.
+  @seq_id_surface [
+    {:memory_seq_rm, 4, :memory_seq_rm, :raise},
+    {:memory_seq_cp, 5, :memory_seq_cp_src, :atom},
+    {:memory_seq_cp, 5, :memory_seq_cp_dst, :atom},
+    {:memory_seq_keep, 2, :memory_seq_keep, :raise},
+    {:memory_seq_pos_max, 2, :memory_seq_pos_max, :raise},
+    {:state_seq_get_size, 2, :state_seq_get_size, :raise},
+    {:state_seq_get_data, 2, :state_seq_get_data, :raise},
+    {:state_seq_set_data, 3, :state_seq_set_data, :atom},
+    {:embed_decode, 3, :embed_decode, :message},
+    {:embed_batch_decode, 2, :embed_batch_decode, :message},
+    {:batch_eval_sample, 4, :batch_eval_sample_purgeable, :message},
+    {:get_embeddings, 3, :get_embeddings, :lookup},
+    {:prefill, 3, :prefill, :upstream},
+    {:decode_batch, 3, :decode_batch, :upstream},
+    {:decode_token, 4, :decode_token, :upstream},
+    {:batch_eval, 2, :batch_eval, :upstream},
+    {:batch_eval_sample, 4, :batch_eval_sample_entries, :upstream}
+  ]
 
-      assert NIF.memory_seq_rm(ctx.ref, 0, 0, -1) == true
-      assert NIF.memory_seq_rm(ctx.ref, @n_seq_max - 1, 0, -1) == true
-      assert_context_healthy(ctx, tokens, model)
-    end
+  defp probe(:memory_seq_rm, seq, f), do: NIF.memory_seq_rm(f.ctx.ref, seq, 0, -1)
+  defp probe(:memory_seq_cp_src, seq, f), do: NIF.memory_seq_cp(f.ctx.ref, seq, 0, 0, -1)
+  defp probe(:memory_seq_cp_dst, seq, f), do: NIF.memory_seq_cp(f.ctx.ref, 0, seq, 0, -1)
+  defp probe(:memory_seq_keep, seq, f), do: NIF.memory_seq_keep(f.ctx.ref, seq)
+  defp probe(:memory_seq_pos_max, seq, f), do: NIF.memory_seq_pos_max(f.ctx.ref, seq)
+  defp probe(:state_seq_get_size, seq, f), do: NIF.state_seq_get_size(f.ctx.ref, seq)
+  defp probe(:state_seq_get_data, seq, f), do: NIF.state_seq_get_data(f.ctx.ref, seq)
+  defp probe(:state_seq_set_data, seq, f), do: NIF.state_seq_set_data(f.ctx.ref, f.blob, seq)
+  defp probe(:embed_decode, seq, f), do: NIF.embed_decode(f.ctx.ref, f.tokens, seq)
+  defp probe(:get_embeddings, seq, f), do: NIF.get_embeddings(f.ctx.ref, seq, 2)
+  defp probe(:prefill, seq, f), do: NIF.prefill(f.ctx.ref, f.tokens, seq)
+  defp probe(:decode_token, seq, f), do: NIF.decode_token(f.ctx.ref, hd(f.tokens), 0, seq)
 
-    test "memory_seq_keep/2", %{ctx: ctx, tokens: tokens, model: model} do
-      for seq <- @bad_seq_ids do
-        assert_erlang_error(:invalid_seq_id, fn -> NIF.memory_seq_keep(ctx.ref, seq) end)
-      end
+  defp probe(:embed_batch_decode, seq, f),
+    do: NIF.embed_batch_decode(f.ctx.ref, [{seq, f.tokens}])
 
-      assert NIF.memory_seq_keep(ctx.ref, 0) == :ok
-      assert_context_healthy(ctx, tokens, model)
-    end
+  defp probe(:decode_batch, seq, f),
+    do: NIF.decode_batch(f.ctx.ref, f.sampler.ref, [{seq, hd(f.tokens), 0}])
 
-    test "memory_seq_pos_max/2", %{ctx: ctx, tokens: tokens, model: model} do
-      for seq <- @bad_seq_ids do
-        assert_erlang_error(:invalid_seq_id, fn -> NIF.memory_seq_pos_max(ctx.ref, seq) end)
-      end
+  defp probe(:batch_eval, seq, f),
+    do: NIF.batch_eval(f.ctx.ref, [{hd(f.tokens), 0, seq, true}])
 
-      assert is_integer(NIF.memory_seq_pos_max(ctx.ref, 0))
-      assert_context_healthy(ctx, tokens, model)
-    end
+  defp probe(:batch_eval_sample_entries, seq, f),
+    do: NIF.batch_eval_sample(f.ctx.ref, [{hd(f.tokens), 0, seq, true}], [], [])
 
-    test "state_seq_get_size/2", %{ctx: ctx, tokens: tokens, model: model} do
-      for seq <- @bad_seq_ids do
-        assert_erlang_error(:invalid_seq_id, fn -> NIF.state_seq_get_size(ctx.ref, seq) end)
-      end
+  # The purge list is the one that mattered: it goes to llama_memory_seq_rm in
+  # bes_decode_range's KV-pressure loop, outside the batch. The entries here are
+  # deliberately valid so only the purge id is out of range.
+  defp probe(:batch_eval_sample_purgeable, seq, f),
+    do: NIF.batch_eval_sample(f.ctx.ref, [{hd(f.tokens), 0, 0, true}], [], [seq])
 
-      assert NIF.state_seq_get_size(ctx.ref, 0) > 0
-      assert_context_healthy(ctx, tokens, model)
-    end
+  defp assert_rejected(:raise, label, fun) do
+    error = assert_raise ErlangError, fun
 
-    test "state_seq_get_data/2", %{ctx: ctx, tokens: tokens, model: model} do
-      for seq <- @bad_seq_ids do
-        assert_erlang_error(:invalid_seq_id, fn -> NIF.state_seq_get_data(ctx.ref, seq) end)
-      end
+    assert error.original == :invalid_seq_id,
+           "#{label} raised #{inspect(error.original)} rather than :invalid_seq_id"
+  end
 
-      assert {:ok, blob} = NIF.state_seq_get_data(ctx.ref, 0)
-      assert byte_size(blob) > 0
-      assert_context_healthy(ctx, tokens, model)
+  defp assert_rejected(:atom, label, fun) do
+    assert fun.() == {:error, :invalid_seq_id},
+           "#{label} did not return {:error, :invalid_seq_id}"
+  end
+
+  defp assert_rejected(:message, label, fun) do
+    case fun.() do
+      {:error, message} ->
+        assert message =~ "invalid seq_id",
+               "#{label} was refused with #{inspect(message)}, which does not name the " <>
+                 "seq_id — that reads like an unrelated decode failure rather than a " <>
+                 "boundary rejection"
+
+      other ->
+        flunk("#{label} was accepted: #{inspect(other, limit: 5)}")
     end
   end
 
-  describe "seq_id bounds (error-returning NIFs)" do
-    test "memory_seq_cp/5 rejects either end being out of range", %{
-      ctx: ctx,
-      tokens: tokens,
-      model: model
-    } do
-      for seq <- @bad_seq_ids do
-        assert NIF.memory_seq_cp(ctx.ref, seq, 0, 0, -1) == {:error, :invalid_seq_id}
-        assert NIF.memory_seq_cp(ctx.ref, 0, seq, 0, -1) == {:error, :invalid_seq_id}
-      end
+  # `:upstream` and `:lookup` have no local guard by design, so the assertion is
+  # the safety property only: refused somehow, VM alive. The `assert_context_healthy`
+  # call in the generated test is the other half.
+  defp assert_rejected(class, label, fun) when class in [:upstream, :lookup] do
+    assert refused?(fun), "#{label} accepted an out-of-range seq_id"
+  end
 
-      assert_context_healthy(ctx, tokens, model)
+  defp refused?(fun) do
+    match?({:error, _}, fun.())
+  rescue
+    ErlangError -> true
+  end
+
+  defp fixtures(%{ctx: ctx, tokens: tokens, model: model}) do
+    {:ok, sampler} = Sampler.create(model, temp: 0.0)
+    {:ok, blob} = NIF.state_seq_get_data(ctx.ref, 0)
+    %{ctx: ctx, tokens: tokens, model: model, sampler: sampler, blob: blob}
+  end
+
+  describe "seq_id bounds, enumerated over the whole surface" do
+    for {nif, arity, which, outcome} <- @seq_id_surface do
+      test "#{nif}/#{arity} bounds #{which} (#{outcome})", context do
+        %{ctx: ctx, tokens: tokens, model: model} = context
+        f = fixtures(context)
+
+        for seq <- @bad_seq_ids do
+          label = "#{unquote(nif)}/#{unquote(arity)} via #{unquote(which)} with seq_id #{seq}"
+          assert_rejected(unquote(outcome), label, fn -> probe(unquote(which), seq, f) end)
+        end
+
+        assert_context_healthy(ctx, tokens, model)
+      end
     end
 
-    test "state_seq_set_data/3 rejects an out-of-range destination", %{
-      ctx: ctx,
-      tokens: tokens,
-      model: model
-    } do
-      :ok = NIF.decode(ctx.ref, tokens)
-      {:ok, blob} = NIF.state_seq_get_data(ctx.ref, 0)
+    test "covers every seq_id-bearing NIF" do
+      # Scanned from the NIF stub module rather than listed by hand, which is the
+      # whole point: the hand-written list is what was incomplete.
+      declared = @seq_id_surface |> Enum.map(&elem(&1, 0)) |> Enum.uniq() |> Enum.sort()
 
-      for seq <- @bad_seq_ids do
-        assert NIF.state_seq_set_data(ctx.ref, blob, seq) == {:error, :invalid_seq_id}
+      source =
+        "lib/llama_cpp_ex/nif.ex"
+        |> File.read!()
+        |> String.replace(~r/\s+/, " ")
+
+      found =
+        Regex.scan(~r/def ([a-z_0-9]+)\(([^)]*)\)/, source)
+        |> Enum.filter(fn [_, _name, args] ->
+          args =~ ~r/\b_(?:dest_)?seq_id/ or args =~ "_seq_ids" or args =~ "_sequences" or
+            args =~ "_entries"
+        end)
+        |> Enum.map(fn [_, name, _args] -> String.to_existing_atom(name) end)
+        |> Enum.uniq()
+        |> Enum.sort()
+
+      assert found -- declared == [],
+             """
+             These NIFs take a sequence id and are not in @seq_id_surface:
+             #{inspect(found -- declared)}
+
+             Add each one with its outcome class. A seq_id that reaches a
+             llama_memory_* call outside a batch needs a local guard
+             (:raise/:atom/:message); one carried inside a llama_batch is bounded
+             by upstream (:upstream). Guessing wrong is safe — the generated test
+             will disagree with you.
+             """
+
+      assert declared -- found == [],
+             "@seq_id_surface lists NIFs that no longer exist: #{inspect(declared -- found)}"
+
+      for {nif, arity, _which, _outcome} <- @seq_id_surface do
+        assert function_exported?(NIF, nif, arity),
+               "@seq_id_surface declares #{nif}/#{arity}, which is not exported"
       end
-
-      # The same blob into a valid sequence still works, so the guard rejected
-      # the id rather than the payload.
-      assert {:ok, bytes} = NIF.state_seq_set_data(ctx.ref, blob, 1)
-      assert bytes == byte_size(blob)
-      assert_context_healthy(ctx, tokens, model)
     end
   end
 
@@ -148,10 +250,28 @@ defmodule LlamaCppEx.NIFGuardsTest do
   # `cross_slot_sharing`; the NIF boundary did not, so any direct caller killed
   # the VM. Reproduced by a benchmark, which is how it was found.
   describe "memory_seq_cp/5 on a split KV cache" do
-    test "a partial cross-sequence copy is refused", %{ctx: ctx, tokens: tokens, model: model} do
-      assert NIF.memory_seq_cp(ctx.ref, 0, 1, 0, 5) == {:error, :unsupported}
-      assert NIF.memory_seq_cp(ctx.ref, 0, 1, 3, -1) == {:error, :unsupported}
-      assert NIF.memory_seq_cp(ctx.ref, 0, 1, 2, 7) == {:error, :unsupported}
+    test "a partial cross-sequence copy is refused, and copies nothing", %{
+      ctx: ctx,
+      tokens: tokens,
+      model: model
+    } do
+      # Give seq 0 something worth copying, so "nothing was copied" is a real
+      # observation rather than a property of an empty cache.
+      :ok = NIF.decode(ctx.ref, tokens)
+      assert NIF.memory_seq_pos_max(ctx.ref, 0) == length(tokens) - 1
+      assert NIF.memory_seq_pos_max(ctx.ref, 1) == -1
+
+      # `{:error, :unsupported}` is the easy half. The property that matters is
+      # that the refusal is *before* any copy: a guard that rejected after
+      # partially writing the destination would satisfy the assertion below and
+      # still hand the caller a sequence it does not believe it has.
+      for {p0, p1} <- [{0, 5}, {3, -1}, {2, 7}] do
+        assert NIF.memory_seq_cp(ctx.ref, 0, 1, p0, p1) == {:error, :unsupported}
+
+        assert NIF.memory_seq_pos_max(ctx.ref, 1) == -1,
+               "memory_seq_cp(0, 1, #{p0}, #{p1}) was refused but left KV in seq 1"
+      end
+
       assert_context_healthy(ctx, tokens, model)
     end
 

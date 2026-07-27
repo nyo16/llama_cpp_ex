@@ -105,6 +105,32 @@ defmodule LlamaCppEx.Sampler do
     end
   end
 
+  @doc """
+  Checks that the `:grammar` in `opts` compiles, without building a chain.
+
+  `create/2` only discovers a bad grammar as a side effect of building the
+  sampler, which is too late for `LlamaCppEx.Server`: the request is already
+  admitted to a slot inside the process that owns the model, so the failure
+  crashed the server rather than the request. This is the same check
+  `create/2`'s NIF runs, callable before a request is queued.
+
+  Returns `:ok` when `opts` carries no `:grammar`, or an empty one.
+  """
+  @spec validate_grammar(LlamaCppEx.Model.t(), keyword()) :: :ok | {:error, :invalid_grammar}
+  def validate_grammar(%LlamaCppEx.Model{ref: model_ref}, opts) do
+    case Keyword.get(opts, :grammar, "") do
+      grammar when grammar in [nil, ""] ->
+        :ok
+
+      grammar ->
+        LlamaCppEx.NIF.grammar_validate(
+          model_ref,
+          grammar,
+          Keyword.get(opts, :grammar_root, "root")
+        )
+    end
+  end
+
   @doc "Resets the sampler state."
   @spec reset(t()) :: :ok
   def reset(%__MODULE__{ref: ref}), do: LlamaCppEx.NIF.sampler_reset(ref)

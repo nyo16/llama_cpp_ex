@@ -49,16 +49,37 @@ defmodule LlamaCppEx.Generator do
   @spec stop(%{ref: reference(), pid: pid(), cancel: reference()}) :: :ok
   def stop(%{ref: ref, pid: pid, cancel: cancel}) do
     LlamaCppEx.NIF.request_cancel(cancel)
+
+    # `Process.unlink/1` stops *future* exit signals but does not remove one
+    # already in the mailbox, and the runner exits `:normal` the instant the NIF
+    # returns — which is the common case, since a stream is usually torn down
+    # right after its last token. So a trapping consumer was left holding a stray
+    # `{:EXIT, pid, :normal}`: noise for a `handle_info` catch-all, and a *silent
+    # shutdown* for a consumer using the `{:stop, reason, state}` shape, which is
+    # what `LlamaCppEx.Server`'s own `{:EXIT, _, reason}` clause does.
+    #
+    # Draining after the unlink is exact rather than best-effort: once
+    # `Process.unlink/1` has returned, no further exit signal from `pid` can be
+    # delivered, so anything matching is already queued and `after 0` finds it.
+    # The kill therefore has to come *after* the unlink, which it does.
     Process.unlink(pid)
     Process.exit(pid, :kill)
-    drain(ref)
+    drain(ref, pid)
   end
 
   @doc "Discards any messages still queued for `ref`."
   @spec drain(reference()) :: :ok
-  def drain(ref) do
+  def drain(ref), do: drain(ref, nil)
+
+  @doc """
+  Discards messages queued for `ref`, and the runner's exit signal if `pid` is
+  given and the caller traps exits.
+  """
+  @spec drain(reference(), pid() | nil) :: :ok
+  def drain(ref, pid) do
     receive do
-      {^ref, _} -> drain(ref)
+      {^ref, _} -> drain(ref, pid)
+      {:EXIT, ^pid, _reason} when is_pid(pid) -> drain(ref, pid)
     after
       0 -> :ok
     end

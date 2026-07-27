@@ -157,11 +157,18 @@ defmodule LlamaCppEx.MTP do
         start_mtp_stream(mtp, prompt, sampler_opts, max_tokens, emit_stats_every, timeout)
       end,
       fn
-        %{setup_error: reason} = state ->
-          {[{:error, reason}], %{state | done?: true}}
-
+        # The halt clause MUST come first. `start_mtp_stream/6` reports failure by
+        # adding a `:setup_error` key rather than by flipping the `:done?`
+        # discriminant, so `%{state | done?: true}` still matches the
+        # `%{setup_error: _}` pattern — with the clauses the other way round this
+        # stream emitted the same `{:error, reason}` element forever. `generate/3`
+        # drives it with `Enum.to_list/1`, so the caller hung with a growing heap.
+        # Reachable from `grammar: "not gbnf"` or any `Tokenizer.encode/2` failure.
         %{done?: true} = state ->
           {:halt, state}
+
+        %{setup_error: reason} = state ->
+          {[{:error, reason}], %{state | done?: true}}
 
         %{ref: ref, timeout: timeout} = state ->
           receive do

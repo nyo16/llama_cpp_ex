@@ -58,10 +58,28 @@ static void check_seq_id(ErlNifEnv* env, llama_context* ctx, int64_t seq_id) {
     }
 }
 
-// Single choke point for every llama_decode that runs on a LlamaContext
-// resource, so the recorded batch shape cannot drift from reality as decode
-// paths are added. Only a successful decode publishes a new shape; a failed one
-// leaves the previous logits (and therefore the previous shape) in place.
+// String form of the same predicate, for the NIFs whose error type is a message
+// rather than an atom. One definition of "valid", two error shapes — the shape
+// follows the NIF's existing return type so adding a guard is never a breaking
+// change.
+static std::string invalid_seq_id_message(llama_context* ctx, int64_t seq_id) {
+    return "invalid seq_id " + std::to_string(seq_id) +
+           " (must be 0 <= seq_id < " + std::to_string(llama_n_seq_max(ctx)) + ")";
+}
+
+// Single choke point for every llama_decode in this file, so the recorded batch
+// shape cannot drift from reality as decode paths are added. Only a successful
+// decode publishes a new shape; a failed one leaves the previous logits (and
+// therefore the previous shape) in place.
+//
+// This claim was false for seven direct `llama_decode` calls (the two streaming
+// generators, the blocking `generate`, and the MTP prefill/verify/rollback), and
+// false in the *permissive* direction: `sampler_sample_at`'s bound was computed
+// from a stale batch, so it accepted indices upstream would abort on. A
+// permissively-stale bound is worse than no bound because it reads as safe.
+// Every `llama_decode` in this translation unit now goes through here; the only
+// decodes that do not are inside upstream's `common_speculative_*`, which run on
+// the draft context and are never sampled through this boundary.
 static int decode_tracked(LlamaContext& c, const llama_batch& batch) {
     int ret = llama_decode(c.ctx, batch);
     if (ret == 0) {
@@ -645,6 +663,47 @@ sampler_init(
 // Server.handle_call/3.
 FINE_NIF(sampler_init, ERL_NIF_DIRTY_JOB_CPU_BOUND);
 
+// Validate-only grammar entry point.
+//
+// `sampler_init` compiles the grammar as a side effect of building the chain,
+// which is too late for `LlamaCppEx.Server`: by then the request has been
+// admitted to a slot inside the GenServer that owns the model, and a compile
+// failure took the whole server down with it. This lets the *calling* process
+// reject a bad `:grammar` synchronously, before the request is queued, without
+// allocating a chain it would immediately throw away.
+//
+// It runs exactly the two checks `sampler_init` runs, in the same order, and
+// nothing else — the admission check and `sampler_init` must agree on what
+// "valid" means or a request would pass admission and still fail in the slot.
+std::variant<fine::Ok<>, fine::Error<fine::Atom>>
+grammar_validate(
+    ErlNifEnv* env,
+    fine::ResourcePtr<LlamaModel> model,
+    std::string grammar_str,
+    std::string grammar_root)
+{
+    if (grammar_str.empty()) {
+        return fine::Ok();
+    }
+
+    if (grammar_str.size() > kMaxGrammarBytes ||
+        gbnf_group_depth(grammar_str) > kMaxGrammarDepth) {
+        return fine::Error(atoms::invalid_grammar);
+    }
+
+    auto* grammar = llama_sampler_init_grammar(
+        model->vocab(), grammar_str.c_str(), grammar_root.c_str());
+    if (!grammar) {
+        return fine::Error(atoms::invalid_grammar);
+    }
+
+    llama_sampler_free(grammar);
+    return fine::Ok();
+}
+// Dirty for the same reason as sampler_init: it runs the same GBNF parse, whose
+// cost is linear in rule count (190 µs on a 245-rule schema).
+FINE_NIF(grammar_validate, ERL_NIF_DIRTY_JOB_CPU_BOUND);
+
 fine::Ok<> sampler_accept(ErlNifEnv* env, fine::ResourcePtr<LlamaSampler> sampler, int64_t token) {
     llama_sampler_accept(sampler->sampler, static_cast<llama_token>(token));
     return fine::Ok();
@@ -836,6 +895,15 @@ embed_decode(
         return fine::Error(std::string("empty token list"));
     }
 
+    // `seq_id` goes to llama_memory_seq_rm below, which is OUTSIDE any batch, so
+    // upstream's llama_batch_allocr::init never sees it and
+    // GGML_ASSERT(seq_id == -1 || (seq_id >= 0 && ...)) at
+    // llama-kv-cache.cpp:385 aborts the VM. Batch-carried seq ids are bounded by
+    // upstream; ones that reach a memory op first are not.
+    if (!valid_seq_id(ctx->ctx, seq_id)) {
+        return fine::Error(invalid_seq_id_message(ctx->ctx, seq_id));
+    }
+
     // Fresh decode for THIS sequence only — clearing the whole memory would
     // clobber every other sequence if the context is ever shared.
     llama_memory_seq_rm(llama_get_memory(ctx->ctx),
@@ -943,6 +1011,16 @@ embed_batch_decode(
     }
     if (total == 0) {
         return fine::Error(std::string("no tokens to decode"));
+    }
+
+    // Every seq_id is validated before the first memory op, for the reason on
+    // embed_decode above: the loop below calls llama_memory_seq_rm outside any
+    // batch. Validating all of them first also means a bad id in the middle of
+    // the list cannot clear the sequences before it and then fail.
+    for (auto& [seq_id, tokens] : sequences) {
+        if (!valid_seq_id(ctx->ctx, seq_id)) {
+            return fine::Error(invalid_seq_id_message(ctx->ctx, seq_id));
+        }
     }
 
     // Fresh decode for the sequences in THIS batch only (successive groups
@@ -1329,6 +1407,18 @@ batch_eval_sample(
     int64_t n_splits = 0;
     size_t purge_idx = 0;
 
+    // `purgeable_seq_ids` reaches llama_memory_seq_rm inside bes_decode_range's
+    // KV-pressure loop, outside any batch — same abort as embed_decode's. The
+    // entries' seq ids are batch-carried and bounded by upstream's
+    // llama_batch_allocr::init; these are not, so they are rejected here rather
+    // than filtered: a purge id the caller cannot name is a bookkeeping bug in
+    // the caller, not a condition to paper over.
+    for (int64_t seq_id : purgeable_seq_ids) {
+        if (!valid_seq_id(ctx->ctx, seq_id)) {
+            return fine::Error(invalid_seq_id_message(ctx->ctx, seq_id));
+        }
+    }
+
     llama_batch& batch = ctx->reserve_batch(static_cast<int32_t>(entries.size()));
 
     int rc = bes_decode_range(*ctx, vocab, entries, 0, entries.size(),
@@ -1707,6 +1797,8 @@ fine::Ok<> generate_mtp_tokens(
     // Wipe any prior KV on seq 0 in both contexts so the spec begins fresh.
     llama_memory_clear(llama_get_memory(ctx_tgt), true);
     llama_memory_clear(llama_get_memory(ctx_dft), true);
+    sp.ctx_tgt->forget_batch();
+    sp.ctx_dft->forget_batch();
 
     // For MTP, hidden states are extracted via set_embeddings_pre_norm on
     // ctx_tgt (set up in the MTP impl's constructor). We only need to know
@@ -1734,7 +1826,7 @@ fine::Ok<> generate_mtp_tokens(
                              { seq_id }, want_logits);
         }
 
-        int ret = llama_decode(ctx_tgt, batch);
+        int ret = decode_tracked(*sp.ctx_tgt, batch);
         if (ret != 0) {
             send_error("prompt decode failed: code=" + std::to_string(ret));
             return fine::Ok();
@@ -1953,7 +2045,7 @@ fine::Ok<> generate_mtp_tokens(
                 std::chrono::duration_cast<std::chrono::microseconds>(t0 - t_anchor).count(),
                 std::memory_order_relaxed);
 
-            int ret = llama_decode(ctx_tgt, batch);
+            int ret = decode_tracked(*sp.ctx_tgt, batch);
             if (ret != 0) {
                 send_error("verify decode failed: code=" + std::to_string(ret));
                 return fine::Ok();
@@ -2048,7 +2140,7 @@ fine::Ok<> generate_mtp_tokens(
                                          { seq_id },
                                          /*logits=*/ i == n_accepted_total - 1);
                     }
-                    int ret = llama_decode(ctx_tgt, redo);
+                    int ret = decode_tracked(*sp.ctx_tgt, redo);
                     if (ret != 0) {
                         send_error("rollback re-decode failed: code=" + std::to_string(ret));
                         return fine::Ok();
@@ -2145,7 +2237,7 @@ fine::Ok<> generate_tokens(
     for (size_t i = 0; i < prompt_tokens.size(); i += n_batch) {
         int n = std::min(static_cast<int>(prompt_tokens.size() - i), n_batch);
         llama_batch batch = llama_batch_get_one(prompt_tokens.data() + i, n);
-        int ret = llama_decode(ctx, batch);
+        int ret = decode_tracked(*ctx_res, batch);
         if (ret == 2) {
             // Aborted by the cancel flag mid-prefill — stop quietly.
             return fine::Ok();
@@ -2223,7 +2315,7 @@ fine::Ok<> generate_tokens(
 
         // Decode next token
         llama_batch batch = llama_batch_get_one(&new_token, 1);
-        int ret = llama_decode(ctx, batch);
+        int ret = decode_tracked(*ctx_res, batch);
         if (ret == 2) {
             // Aborted by the cancel flag — stop quietly.
             return fine::Ok();
@@ -2281,7 +2373,7 @@ generate(
     for (size_t i = 0; i < prompt_tokens.size(); i += n_batch) {
         int n = std::min(static_cast<int>(prompt_tokens.size() - i), n_batch);
         llama_batch batch = llama_batch_get_one(prompt_tokens.data() + i, n);
-        int ret = llama_decode(ctx, batch);
+        int ret = decode_tracked(*ctx_res, batch);
         if (ret == 2) {
             return fine::Ok(std::string());
         }
@@ -2320,7 +2412,7 @@ generate(
 
         // Decode the new token for next iteration
         llama_batch batch = llama_batch_get_one(&new_token, 1);
-        int ret = llama_decode(ctx, batch);
+        int ret = decode_tracked(*ctx_res, batch);
         if (ret == 2) {
             break;
         }

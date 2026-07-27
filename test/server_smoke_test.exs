@@ -315,4 +315,78 @@ defmodule LlamaCppEx.ServerSmokeTest do
     {%{prefix_cache_tokens: default_again}, _} = next_telemetry()
     assert default_again > 0
   end
+
+  # W-6. `stream/3` and `stream_tokens/3` truncated silently on a per-token
+  # timeout, which is indistinguishable from a completed generation and
+  # contradicted their own `@doc` and the three facade pipelines. `:timeout` is 1
+  # ms, so the wait expires before the first token on any model.
+  #
+  # W-5. The request is still generating when the consumer gives up, so the
+  # cleanup has to cancel it. On the facade's server path the after-function read
+  # `phase != :done` to decide, and `halt_with_error/2` sets `phase: :done` —
+  # so a timed-out stream held its slot and decoded to `max_tokens` for a consumer
+  # that had gone. The slot assertion is the half that catches that.
+  describe "a stream whose per-token timeout expires" do
+    @long_prompt "User: Write a very long story about the sea.\nAssistant:"
+
+    test "Server.stream/3 emits {:error, :timeout} and releases the slot" do
+      server = start_server(n_parallel: 1)
+
+      elements =
+        server
+        |> Server.stream(@long_prompt, max_tokens: 400, timeout: 1)
+        |> Enum.to_list()
+
+      assert List.last(elements) == {:error, :timeout}
+      assert_slots_released(server)
+    end
+
+    test "Server.stream_tokens/3 emits {:error, :timeout} and releases the slot" do
+      server = start_server(n_parallel: 1)
+      {:ok, tokens} = LlamaCppEx.Tokenizer.encode(Server.get_model(server), @long_prompt)
+
+      elements =
+        server
+        |> Server.stream_tokens(tokens, max_tokens: 400, timeout: 1)
+        |> Enum.to_list()
+
+      assert List.last(elements) == {:error, :timeout}
+      assert_slots_released(server)
+    end
+
+    test "the facade's server-routed stream cancels the request it abandoned" do
+      server = start_server(n_parallel: 1)
+      messages = [%{role: "user", content: "Write a very long story about the sea."}]
+
+      chunks =
+        server
+        |> LlamaCppEx.stream_chat_completion(messages, max_tokens: 400, timeout: 1)
+        |> Enum.to_list()
+
+      assert List.last(chunks) == {:error, :timeout}
+      assert_slots_released(server)
+    end
+
+    test "the server keeps serving afterwards" do
+      server = start_server(n_parallel: 1)
+
+      _ = server |> Server.stream(@long_prompt, max_tokens: 400, timeout: 1) |> Enum.to_list()
+      assert_slots_released(server)
+
+      assert {:ok, text} = Server.generate(server, "2 + 2 =", max_tokens: 4)
+      assert is_binary(text)
+    end
+  end
+
+  # A cancelled request frees its slot and empties the queue. Polled through the
+  # server's own stats, so a pass is an observed fact rather than a sleep.
+  defp assert_slots_released(server) do
+    stats =
+      await_stats(server, fn s ->
+        s.active_slots == 0 and s.prefilling_slots == 0 and s.queue_depth == 0
+      end)
+
+    assert stats.active_slots == 0
+    assert stats.queue_depth == 0
+  end
 end

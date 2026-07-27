@@ -124,12 +124,22 @@ defmodule LlamaCppEx.ModelManager.ModelIOTest do
     end
 
     test "a genuinely unknown option still fails loudly" do
-      # The complement: native_opts/1 drops the keys it knows about, it does not
-      # swallow typos. A misspelled server option must not be silently ignored.
-      assert {:error, {%ArgumentError{} = error, _stacktrace}} =
-               ModelIO.start_server("chat", "/nonexistent/model.gguf", n_paralell: 2)
+      # The complement of the allowlists: they select what each destination reads,
+      # they do not swallow typos. This used to be caught by accident — the
+      # `Keyword.drop/2` denylist forwarded everything it did not recognise, so
+      # `Server.start_link/1`'s own validation raised inside the supervised child.
+      # Two allowlists would have dropped `n_paralell` silently and started a
+      # server with the default `:n_parallel`, so the union is now validated here,
+      # naming the function the caller actually called.
+      error =
+        assert_raise ArgumentError, fn ->
+          ModelIO.start_server("chat", "/nonexistent/model.gguf", n_paralell: 2)
+        end
 
-      assert Exception.message(error) =~ "n_paralell"
+      message = Exception.message(error)
+      assert message =~ "n_paralell"
+      assert message =~ "did you mean :n_parallel?"
+      assert message =~ "LlamaCppEx.ModelManager.load/3"
     end
 
     test "the child is temporary, so a crashed server is not resurrected" do

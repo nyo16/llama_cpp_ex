@@ -368,6 +368,60 @@ defmodule LlamaCppEx.ServerTest do
       task = Task.async(fn -> catch_error(Server.get_model(:no_such_server)) end)
       assert %ArgumentError{} = Task.await(task)
     end
+
+    # The exit shapes that escaped. `fetch_model/1`'s @spec promised
+    # `{:ok, _} | {:error, :noproc | :not_ready}` while its `catch` handled only
+    # `:noproc`, `:normal` and `:timeout` — so `handle_continue/2`'s
+    # `{:stop, {:load_failed, reason}, state}` exited the *caller*, from inside
+    # both `Stream.resource` start-functions where nothing can catch it. Same
+    # defect the function was written to fix, one layer down.
+    #
+    # A stub GenServer reproduces it exactly: `fetch_model/1` resolves a live pid,
+    # finds no Registry entry, and falls through to the `:get_model` call.
+    defmodule Stopping do
+      @moduledoc false
+      use GenServer
+
+      def start_link(reason), do: GenServer.start_link(__MODULE__, reason)
+
+      @impl true
+      def init(reason), do: {:ok, reason}
+
+      @impl true
+      def handle_call(:get_model, _from, reason), do: {:stop, reason, reason}
+    end
+
+    @exit_reasons [
+      {{:load_failed, "no such file"}, {:load_failed, "no such file"}},
+      {{:shutdown, :supervisor_said_so}, :noproc},
+      {:shutdown, :noproc},
+      {:killed, :noproc},
+      {:normal, :noproc},
+      {:a_reason_nobody_catalogued, :a_reason_nobody_catalogued}
+    ]
+
+    for {reason, expected} <- @exit_reasons do
+      test "fetch_model/1 turns a #{inspect(reason)} exit into #{inspect(expected)}" do
+        Process.flag(:trap_exit, true)
+        {:ok, pid} = Stopping.start_link(unquote(Macro.escape(reason)))
+
+        assert Server.fetch_model(pid) == {:error, unquote(Macro.escape(expected))}
+
+        assert_receive {:EXIT, ^pid, _}
+      end
+    end
+
+    test "no exit reason escapes fetch_model/1 as an exit" do
+      # The catch-all is the point: an uncatalogued reason must still become a
+      # value, because every caller is inside a stream start-function or a `with`.
+      Process.flag(:trap_exit, true)
+      {:ok, pid} = Stopping.start_link({:totally, :novel, [:shape]})
+
+      task = Task.async(fn -> Server.fetch_model(pid) end)
+      assert {:error, {:totally, :novel, [:shape]}} = Task.await(task)
+
+      assert_receive {:EXIT, ^pid, _}
+    end
   end
 
   describe "PromptCache bookkeeping" do

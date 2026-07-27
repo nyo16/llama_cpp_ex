@@ -204,6 +204,17 @@ defmodule LlamaCppEx.Server do
                       Context.tuning_option_keys()
                   )
 
+  @doc """
+  The options `start_link/1` accepts.
+
+  Exposed for the same reason as `request_option_keys/0`: callers that forward
+  user options into a server must select them rather than guess. The one caller
+  that guessed — `LlamaCppEx.ModelManager.ModelIO` — used a `Keyword.drop/2`
+  denylist, so `:vocab_only` reached `init/1` and raised there.
+  """
+  @spec start_option_keys() :: [atom()]
+  def start_option_keys, do: @start_opt_keys
+
   # A zero queue meant the reject branch was dead code and the documented
   # `:queue_full` error could never fire, so the queue was unbounded — and each
   # entry holds a full token list. 64 is deep enough that a burst is absorbed
@@ -237,9 +248,12 @@ defmodule LlamaCppEx.Server do
     # byte budget. 0 MB = disabled.
     prompt_cache: nil,
     prefix_instability_warned: false,
-    # `:part`/`:rs` = partial seq_rm works; `:full` = whole-sequence only
-    # (hybrid GDN models like Qwen 3.5/3.6); `:no` = no memory module. We
-    # only do prefix-cache partial trims when this is `:part` or `:rs`.
+    # `:part` = any position range; `:full` = whole-sequence only (hybrid GDN
+    # models like Qwen 3.5/3.6); `:rs` = partial, but only within the last
+    # `n_rs_seq` positions — beyond that `llama_memory_recurrent::seq_rm` returns
+    # `false` rather than raising, which every partial-trim call site must handle;
+    # `:no` = no memory module. Partial prefix-cache trims are attempted on
+    # `:part` and `:rs`, and a refusal falls back to a full clear.
     seq_rm_kind: :part,
     batch_strategy: LlamaCppEx.Server.Strategy.DecodeMaximal,
     tick_scheduled: false
@@ -348,6 +362,7 @@ defmodule LlamaCppEx.Server do
     # Tokenize in the caller: parallel across clients and off the server's
     # mailbox. The model handle comes from LlamaCppEx.Registry.
     with {:ok, model} <- fetch_model(server),
+         :ok <- Sampler.validate_grammar(model, req_opts),
          {:ok, token_ids} <- Tokenizer.encode(model, prompt) do
       GenServer.call(server, {:generate_tokens, token_ids, max_tokens, req_opts}, timeout)
     end
@@ -356,15 +371,18 @@ defmodule LlamaCppEx.Server do
   @doc """
   Returns a stream of generated text chunks.
 
-  If the request is rejected (`:queue_full`) or fails mid-generation, the
-  stream emits a single `{:error, reason}` element and halts — consumers that
-  need to distinguish errors from text should match on it.
+  If the request is rejected (`:queue_full`), fails mid-generation, or a chunk
+  does not arrive within `:timeout`, the stream emits a single
+  `{:error, reason}` element and halts — consumers that need to distinguish
+  errors from text should match on it. A per-token timeout emits
+  `{:error, :timeout}` and cancels the request server-side; it used to truncate
+  the stream silently, which is indistinguishable from a completed generation.
 
   ## Options
 
     * `:max_tokens` - Maximum tokens to generate. Defaults to `256`.
-    * `:timeout` - Per-token timeout. Defaults to
-      `#{LlamaCppEx.Options.stream_timeout()}`.
+    * `:timeout` - Per-token timeout, and the budget for being admitted to a slot
+      or the queue. Defaults to `#{LlamaCppEx.Options.stream_timeout()}`.
 
   Also accepts the per-request options documented on `generate/3`.
   """
@@ -378,6 +396,7 @@ defmodule LlamaCppEx.Server do
     Stream.resource(
       fn ->
         with {:ok, model} <- fetch_model(server),
+             :ok <- Sampler.validate_grammar(model, req_opts),
              {:ok, token_ids} <- Tokenizer.encode(model, prompt) do
           start_token_stream(server, token_ids, max_tokens, req_opts, timeout)
         else
@@ -391,12 +410,74 @@ defmodule LlamaCppEx.Server do
 
   # Shared stream start: a rejected request becomes a single {:error, reason}
   # element rather than silence followed by a timeout.
+  #
+  # The admission call is bounded by the caller's `:timeout` rather than
+  # `GenServer.call/2`'s implicit 5000 ms. On a busy batching server the old
+  # default *exited* from inside a `Stream.resource` start-function — which no
+  # consumer can catch and which bypasses the `{:error, reason}` element the
+  # `:rejected` branch below exists to produce. A caller who asked for a 60 s
+  # budget meant it for getting into the queue too.
   defp start_token_stream(server, token_ids, max_tokens, req_opts, timeout) do
     ref = make_ref()
+    message = {:stream_tokens, token_ids, max_tokens, self(), ref, req_opts}
 
-    case GenServer.call(server, {:stream_tokens, token_ids, max_tokens, self(), ref, req_opts}) do
+    case call_or_error(server, message, timeout) do
       :ok -> {server, ref, timeout}
       {:error, reason} -> {:rejected, ref, reason}
+    end
+  end
+
+  # A `GenServer.call/3` that reports an exit as a value. Every caller runs inside
+  # a `Stream.resource` start-function or a `with` chain, where an exit escapes
+  # past every element the stream would otherwise have emitted.
+  defp call_or_error(server, message, timeout) do
+    GenServer.call(server, message, timeout)
+  catch
+    :exit, {:timeout, _} -> {:error, :timeout}
+    :exit, {reason, {GenServer, :call, _}} -> {:error, call_exit_reason(reason)}
+    :exit, reason -> {:error, call_exit_reason(reason)}
+  end
+
+  # Maps a `GenServer.call/3` exit reason onto an error value.
+  #
+  # The three shapes anyone thinks of are `:noproc`, `:normal` and `:timeout`, and
+  # those were the three that were handled. `handle_continue/2`'s
+  # `{:stop, {:load_failed, reason}, state}` exits with
+  # `{{:load_failed, reason}, {GenServer, :call, _}}`, and a supervisor shutting
+  # the server down produces `{:shutdown, _}` or `:killed` — all of which escaped
+  # from inside both `Stream.resource` start-functions past a `@spec` that
+  # promised a total function.
+  #
+  # The catch-all is deliberate. An uncatalogued reason must still become a value,
+  # because no caller here has another way to observe it. `:timeout` is left out:
+  # it means "still loading" to `fetch_model/1` and "the mailbox is saturated" to
+  # the streaming admission call, so each maps it itself.
+  defp call_exit_reason(:normal), do: :noproc
+  defp call_exit_reason(:noproc), do: :noproc
+  defp call_exit_reason(:killed), do: :noproc
+  defp call_exit_reason(:shutdown), do: :noproc
+  defp call_exit_reason({:shutdown, _}), do: :noproc
+  defp call_exit_reason(other), do: other
+
+  # Admission-time grammar check for the entry points that do not already hold a
+  # `%Model{}`. `:grammar` is a per-request *value* and `Options.validate!/3`
+  # only checks key names, so an uncompilable grammar used to travel all the way
+  # into `init_slot/4` — inside the GenServer that owns the model, where it
+  # crashed the server rather than the request. Rejecting here means the request
+  # never reaches a slot and the caller gets `{:error, :invalid_grammar}`
+  # synchronously.
+  #
+  # The model is fetched only when a grammar is actually present, so a request
+  # without one pays nothing.
+  defp validate_request_grammar(server, req_opts) do
+    case Keyword.get(req_opts, :grammar, "") do
+      grammar when grammar in [nil, ""] ->
+        :ok
+
+      _ ->
+        with {:ok, model} <- fetch_model(server) do
+          Sampler.validate_grammar(model, req_opts)
+        end
     end
   end
 
@@ -407,19 +488,30 @@ defmodule LlamaCppEx.Server do
   # abandoned stream would keep consuming batch budget to max_tokens.
   defp stream_next({:rejected, ref, reason}), do: {[{:error, reason}], {:done, ref}}
   defp stream_next({:done, _ref} = state), do: {:halt, state}
+  defp stream_next({:timed_out, _server, _ref} = state), do: {:halt, state}
 
-  defp stream_next({server, ref, timeout} = state) do
+  defp stream_next({server, ref, timeout}) do
     receive do
-      {^ref, {:token, text}} -> {[text], state}
+      {^ref, {:token, text}} -> {[text], {server, ref, timeout}}
       {^ref, {:done, _reason}} -> {:halt, {:done, ref}}
       {^ref, {:error, reason}} -> {[{:error, reason}], {:done, ref}}
     after
-      timeout -> {:halt, {server, ref, timeout}}
+      # A per-token timeout is an error, not the end of the text. Truncating
+      # silently here contradicted this function's own `@doc` and left these two
+      # streams as the only ones in the library that ended a failed generation
+      # indistinguishably from a successful one. The request is still in flight,
+      # so the `:timed_out` state carries `server` for the cleanup to cancel.
+      timeout -> {[{:error, :timeout}], {:timed_out, server, ref}}
     end
   end
 
   defp stream_cleanup({:rejected, ref, _reason}), do: drain_stream_messages(ref)
   defp stream_cleanup({:done, ref}), do: drain_stream_messages(ref)
+
+  defp stream_cleanup({:timed_out, server, ref}) do
+    cancel(server, ref)
+    drain_stream_messages(ref)
+  end
 
   defp stream_cleanup({server, ref, _timeout}) do
     cancel(server, ref)
@@ -453,7 +545,10 @@ defmodule LlamaCppEx.Server do
     timeout = Options.timeout(opts, :blocking)
     max_tokens = Keyword.get(opts, :max_tokens, 256)
     req_opts = Keyword.take(opts, @request_opt_keys)
-    GenServer.call(server, {:generate_tokens, token_ids, max_tokens, req_opts}, timeout)
+
+    with :ok <- validate_request_grammar(server, req_opts) do
+      GenServer.call(server, {:generate_tokens, token_ids, max_tokens, req_opts}, timeout)
+    end
   end
 
   @doc """
@@ -471,7 +566,10 @@ defmodule LlamaCppEx.Server do
     timeout = Options.timeout(opts, :blocking)
     max_tokens = Keyword.get(opts, :max_tokens, 256)
     req_opts = Keyword.take(opts, @request_opt_keys) ++ [reply: :full]
-    GenServer.call(server, {:generate_tokens, token_ids, max_tokens, req_opts}, timeout)
+
+    with :ok <- validate_request_grammar(server, req_opts) do
+      GenServer.call(server, {:generate_tokens, token_ids, max_tokens, req_opts}, timeout)
+    end
   end
 
   @doc false
@@ -479,21 +577,46 @@ defmodule LlamaCppEx.Server do
   # {ref, {:token, piece}} per piece, then {ref, {:done, :eog | :max_tokens}}
   # or {ref, {:error, reason}}. Internal — used by the chat-completion
   # streaming path; library users should call stream/3 or stream_tokens/3.
-  @spec subscribe_stream_tokens(GenServer.server(), [integer()], reference(), keyword()) :: :ok
+  #
+  # The `@spec` used to say `:ok`. The body returns `GenServer.call/2` verbatim
+  # and its only caller depends on the `{:error, :queue_full}` the spec denied;
+  # Dialyzer could not see the lie because `GenServer.call/2` is typed `term()`.
+  #
+  # It also never validated its options, so every key the facade accepted and
+  # the server does not was silently dropped on the streaming path while the
+  # blocking path raised for it.
+  @spec subscribe_stream_tokens(GenServer.server(), [integer()], reference(), keyword()) ::
+          :ok | {:error, term()}
   def subscribe_stream_tokens(server, token_ids, ref, opts \\ []) when is_list(token_ids) do
+    opts = Options.validate!(opts, @call_opt_keys, "LlamaCppEx.Server.subscribe_stream_tokens/4")
     max_tokens = Keyword.get(opts, :max_tokens, 256)
     req_opts = Keyword.take(opts, @request_opt_keys)
-    GenServer.call(server, {:stream_tokens, token_ids, max_tokens, self(), ref, req_opts})
+
+    # Bounded by the caller's `:timeout` for the same reason as
+    # `start_token_stream/5`: the only caller runs this inside a
+    # `Stream.resource` start-function, where the implicit 5000 ms default exited
+    # instead of producing the `{:error, reason}` element the caller's
+    # `:setup_failed` branch was written for.
+    with :ok <- validate_request_grammar(server, req_opts) do
+      call_or_error(
+        server,
+        {:stream_tokens, token_ids, max_tokens, self(), ref, req_opts},
+        Options.timeout(opts, :stream)
+      )
+    end
   end
 
   @doc """
   Returns a stream of generated text chunks from pre-tokenized input.
 
+  Emits a single `{:error, reason}` element and halts on rejection, mid-generation
+  failure, or a per-token timeout — see `stream/3`.
+
   ## Options
 
     * `:max_tokens` - Maximum tokens to generate. Defaults to `256`.
-    * `:timeout` - Per-token timeout. Defaults to
-      `#{LlamaCppEx.Options.stream_timeout()}`.
+    * `:timeout` - Per-token timeout, and the budget for being admitted to a slot
+      or the queue. Defaults to `#{LlamaCppEx.Options.stream_timeout()}`.
 
   """
   @spec stream_tokens(GenServer.server(), [integer()], keyword()) :: Enumerable.t()
@@ -504,7 +627,12 @@ defmodule LlamaCppEx.Server do
     req_opts = Keyword.take(opts, @request_opt_keys)
 
     Stream.resource(
-      fn -> start_token_stream(server, token_ids, max_tokens, req_opts, timeout) end,
+      fn ->
+        case validate_request_grammar(server, req_opts) do
+          :ok -> start_token_stream(server, token_ids, max_tokens, req_opts, timeout)
+          {:error, reason} -> {:rejected, make_ref(), reason}
+        end
+      end,
       &stream_next/1,
       &stream_cleanup/1
     )
@@ -533,11 +661,18 @@ defmodule LlamaCppEx.Server do
   operations like tokenization. Served from `LlamaCppEx.Registry` — an ETS read,
   no round-trip through the server's mailbox.
 
-  Returns `{:error, :noproc}` when `server` does not resolve to a live process and
-  `{:error, :not_ready}` when the server is still loading its model (the window
-  between `start_link/1` returning and `handle_continue/2` finishing).
+  Returns `{:error, :noproc}` when `server` does not resolve to a live process or
+  died on its way down, and `{:error, :not_ready}` when the server is still
+  loading its model (the window between `start_link/1` returning and
+  `handle_continue/2` finishing).
+
+  A server whose model load *failed* returns `{:error, {:load_failed, reason}}`:
+  `handle_continue/2` stops with that reason, so the `:get_model` call exits with
+  it. That escaped the previous three `catch` clauses — from inside both
+  `Stream.resource` start-functions, where nothing can catch it — even though the
+  `@spec` promised a total function.
   """
-  @spec fetch_model(GenServer.server()) :: {:ok, Model.t()} | {:error, :noproc | :not_ready}
+  @spec fetch_model(GenServer.server()) :: {:ok, Model.t()} | {:error, term()}
   def fetch_model(server) do
     case GenServer.whereis(server) do
       pid when is_pid(pid) ->
@@ -560,9 +695,11 @@ defmodule LlamaCppEx.Server do
   defp fetch_model_via_call(pid) do
     {:ok, GenServer.call(pid, :get_model, Options.blocking_timeout())}
   catch
-    :exit, {:noproc, _} -> {:error, :noproc}
-    :exit, {:normal, _} -> {:error, :noproc}
+    # A timeout means handle_continue/2 has not published the model yet: still
+    # loading, not broken. Every other reason is classified by call_exit_reason/1.
     :exit, {:timeout, _} -> {:error, :not_ready}
+    :exit, {reason, {GenServer, :call, _}} -> {:error, call_exit_reason(reason)}
+    :exit, reason -> {:error, call_exit_reason(reason)}
   end
 
   @doc """
@@ -927,12 +1064,53 @@ defmodule LlamaCppEx.Server do
     end
   end
 
+  # Builds the request's sampler before anything else, so a rejection costs
+  # nothing to undo, then hands off to install_slot/5.
+  #
+  # `:grammar` is a caller-supplied *value* and `Options.validate!/3` checks key
+  # names only. The public entry points now reject an uncompilable grammar at
+  # admission (validate_request_grammar/2); this `case` is the depth-2 defence
+  # for the two disagreeing. The previous `{:ok, sampler} = Sampler.create(...)`
+  # made that disagreement a crash of the GenServer holding the model — and
+  # because backing servers run `restart: :temporary`, it never came back.
+  defp init_slot(state, seq_id, %Request{opts: req_opts} = request, lcp) do
+    # Fresh sampler per request: request opts override server defaults, and a
+    # new chain means clean grammar/penalty state and a fresh seed. The old
+    # sampler resource is dropped and freed by GC.
+    sampler_opts = Keyword.merge(state.sampler_opts, Keyword.take(req_opts, @sampler_opt_keys))
+
+    case Sampler.create(state.model, sampler_opts) do
+      {:ok, sampler} ->
+        install_slot(state, seq_id, request, lcp, sampler)
+
+      {:error, reason} ->
+        Logger.warning(
+          "LlamaCppEx.Server: failing request for slot #{seq_id} — sampler " <>
+            "creation refused #{inspect(reason)}"
+        )
+
+        reject_request(state, request, reason)
+    end
+  end
+
+  # Fails a request that never entered its slot. No slot field was written and
+  # no KV was touched, so unlike fail_slot/3 there is nothing to reset.
+  defp reject_request(state, %Request{} = request, reason) do
+    if request.from, do: GenServer.reply(request.from, {:error, reason})
+
+    if request.stream_pid && request.stream_ref do
+      send(request.stream_pid, {request.stream_ref, {:error, reason}})
+    end
+
+    state
+  end
+
   # Takes the whole %Request{} rather than seven positional arguments: the old
   # `init_slot(state, seq_id, tokens, max_tokens, from, stream_pid, stream_ref,
   # req_opts, lcp)` was easy to call with `from` and `stream_pid` transposed,
   # and the two call shapes (sync vs stream) each passed `nil` for the other's
   # three fields.
-  defp init_slot(state, seq_id, %Request{} = request, lcp) do
+  defp install_slot(state, seq_id, %Request{} = request, lcp, sampler) do
     %Request{tokens: tokens, max_tokens: max_tokens, opts: req_opts} = request
 
     state = update_session_mapping(state, seq_id, Keyword.get(req_opts, :session))
@@ -954,12 +1132,6 @@ defmodule LlamaCppEx.Server do
       resolve_prefix_cache(state, seq_id, tokens, own_match, cache_prompt?, scope)
 
     slot = state.slots[seq_id]
-
-    # Fresh sampler per request: request opts override server defaults, and a
-    # new chain means clean grammar/penalty state and a fresh seed. The old
-    # sampler resource is dropped and freed by GC.
-    sampler_opts = Keyword.merge(state.sampler_opts, Keyword.take(req_opts, @sampler_opt_keys))
-    {:ok, sampler} = Sampler.create(state.model, sampler_opts)
 
     # Watch the consumer (stream subscriber or sync caller) so its death
     # cancels the request instead of burning batch budget to max_tokens.
@@ -1128,12 +1300,31 @@ defmodule LlamaCppEx.Server do
 
   defp keep_own_cache(state, seq_id, slot, own_match) do
     if own_match < slot.cached_pos do
-      # Trim KV cache beyond the matched prefix (only safe on `:part`/`:rs`).
-      # The truncated tail may still be valuable to another conversation —
-      # offer the full state to the RAM cache before cutting it.
+      # Trim KV cache beyond the matched prefix. The truncated tail may still be
+      # valuable to another conversation — offer the full state to the RAM cache
+      # before cutting it.
       state = maybe_save_to_ram_cache(state, seq_id, slot)
-      true = LlamaCppEx.NIF.memory_seq_rm(state.ctx.ref, seq_id, own_match, -1)
-      {state, own_match}
+
+      # `memory_seq_rm` *returns false*, it does not raise, when the memory module
+      # refuses the range: `llama_memory_recurrent::seq_rm` honours a partial
+      # rollback of at most `n_rs_seq` positions and returns false beyond that
+      # (`vendor/llama.cpp/src/llama-memory-recurrent.cpp:181-187`). The
+      # `seq_rm_kind` guard above covers only `:full`, so on an `:rs` context
+      # `true = ...` was a MatchError inside the tick — a crash of the process
+      # holding the model for a condition whose correct answer is "re-prefill".
+      # Same shape as the donor-refusal branch above.
+      if LlamaCppEx.NIF.memory_seq_rm(state.ctx.ref, seq_id, own_match, -1) do
+        {state, own_match}
+      else
+        Logger.warning(
+          "LlamaCppEx.Server: partial seq_rm refused for seq #{seq_id} " <>
+            "(trim to #{own_match} of #{slot.cached_pos} cached positions); " <>
+            "re-prefilling from scratch"
+        )
+
+        _ = LlamaCppEx.NIF.memory_seq_rm(state.ctx.ref, seq_id, 0, -1)
+        {state, 0}
+      end
     else
       # Exact-prefix continuation; nothing to trim.
       {state, own_match}

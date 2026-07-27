@@ -209,16 +209,39 @@ defmodule LlamaCppEx.Server.PromptCache do
           {:ok, non_neg_integer()} | {:error, term()}
   def restore(ctx_ref, seq_id, entry, lcp) do
     case LlamaCppEx.NIF.state_seq_set_data(ctx_ref, entry.bin, seq_id) do
-      {:ok, _bytes} ->
-        if lcp < entry.len do
-          true = LlamaCppEx.NIF.memory_seq_rm(ctx_ref, seq_id, lcp, -1)
-        end
-
-        {:ok, lcp}
-
-      {:error, reason} ->
-        _ = LlamaCppEx.NIF.memory_seq_rm(ctx_ref, seq_id, 0, -1)
-        {:error, reason}
+      {:ok, _bytes} -> trim_restored_tail(ctx_ref, seq_id, entry, lcp)
+      {:error, reason} -> clear_and_fail(ctx_ref, seq_id, reason)
     end
+  end
+
+  defp trim_restored_tail(_ctx_ref, _seq_id, entry, lcp) when lcp >= entry.len, do: {:ok, lcp}
+
+  # `memory_seq_rm` *returns false*, it does not raise, when the memory module
+  # refuses the range: `llama_memory_recurrent::seq_rm` only honours a partial
+  # rollback of at most `n_rs_seq` positions
+  # (`vendor/llama.cpp/src/llama-memory-recurrent.cpp:181-187`) and returns false
+  # beyond that. The Elixir-side guard covered only `seq_rm_kind == :full`, so on
+  # an `:rs` context this was a `MatchError` inside the Server's tick — a crash of
+  # the process holding the model for a condition whose correct answer is
+  # "re-prefill".
+  #
+  # Latent today: `:n_rs_seq` defaults to 0 and is not in
+  # `Context.tuning_option_keys/0`, so `Options.validate!/3` rejects it. It fires
+  # the day that changes.
+  #
+  # The blob is already in KV at this point, so a refused trim leaves positions
+  # past `lcp` that the caller believes are gone. Dropping the whole sequence is
+  # the only safe answer.
+  defp trim_restored_tail(ctx_ref, seq_id, _entry, lcp) do
+    if LlamaCppEx.NIF.memory_seq_rm(ctx_ref, seq_id, lcp, -1) do
+      {:ok, lcp}
+    else
+      clear_and_fail(ctx_ref, seq_id, :seq_rm_refused)
+    end
+  end
+
+  defp clear_and_fail(ctx_ref, seq_id, reason) do
+    _ = LlamaCppEx.NIF.memory_seq_rm(ctx_ref, seq_id, 0, -1)
+    {:error, reason}
   end
 end

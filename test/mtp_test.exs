@@ -133,6 +133,58 @@ defmodule LlamaCppEx.MTPTest do
     end
   end
 
+  # B-2, and it needs no MTP model: the setup failure happens in
+  # `start_mtp_stream/6` before anything reaches `generate_mtp_tokens/9`, so a
+  # hand-built `%MTP{}` over an ordinary context reproduces it exactly. One gate
+  # tag for this describe (`:smoke`, the generation model) — it must not carry
+  # `:mtp` as well, because `--include` beats `--exclude` and a second gate tag
+  # would drag it into runs that have no model for it.
+  describe "a stream that fails during setup" do
+    @describetag :smoke
+    @describetag timeout: 120_000
+
+    setup do
+      :ok = LlamaCppEx.init()
+      {:ok, model} = LlamaCppEx.load_model(LlamaCppEx.TestModels.path!(:gen), n_gpu_layers: 0)
+      {:ok, ctx} = LlamaCppEx.Context.create(model, n_ctx: 256)
+
+      # spec_ref is never dereferenced: Sampler.create/2 fails on the grammar
+      # first, and that is the whole point of the test.
+      %{mtp: %MTP{main_ctx: ctx, mtp_ctx: ctx, spec_ref: make_ref(), n_draft: 2}}
+    end
+
+    # `start_mtp_stream/6` reports failure by *adding* a `:setup_error` key rather
+    # than flipping the `:done?` discriminant the clauses dispatch on, so
+    # `%{state | done?: true}` still matched the `%{setup_error: _}` clause and the
+    # stream emitted the same error element forever. Driven through a Task with a
+    # timeout so a regression fails this test instead of wedging the suite with a
+    # growing heap — which is what `generate/3`'s `Enum.to_list/1` did.
+    test "emits exactly one error element and halts", %{mtp: mtp} do
+      task =
+        Task.async(fn -> mtp |> MTP.stream_events("hi", grammar: "{{{") |> Enum.to_list() end)
+
+      assert {:ok, elements} = Task.yield(task, 2_000) || Task.shutdown(task, :brutal_kill),
+             "stream_events/3 did not terminate — the halt clause is being shadowed again"
+
+      assert elements == [{:error, :invalid_grammar}]
+    end
+
+    test "generate/3 returns the error instead of hanging", %{mtp: mtp} do
+      task = Task.async(fn -> MTP.generate(mtp, "hi", grammar: "{{{") end)
+
+      assert {:ok, result} = Task.yield(task, 2_000) || Task.shutdown(task, :brutal_kill),
+             "generate/3 did not terminate — it drives stream_events/3 with Enum.to_list/1"
+
+      assert result == {:error, :invalid_grammar}
+    end
+
+    test "stream/3 yields nothing rather than looping", %{mtp: mtp} do
+      task = Task.async(fn -> mtp |> MTP.stream("hi", grammar: "{{{") |> Enum.to_list() end)
+
+      assert {:ok, []} = Task.yield(task, 2_000) || Task.shutdown(task, :brutal_kill)
+    end
+  end
+
   # The event vocabulary stream_events/3 documents.
   defp event_kind({:token, id, text}) when is_integer(id) and is_binary(text), do: :token
   defp event_kind({:stats, snapshot}) when is_map(snapshot), do: :stats

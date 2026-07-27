@@ -29,6 +29,7 @@ defmodule LlamaCppEx.OptionForwardingTest do
   use ExUnit.Case, async: true
 
   alias LlamaCppEx.{Context, Model, Options, Sampler, Server}
+  alias LlamaCppEx.ModelManager.ModelIO
 
   # --- Source scanning ---
 
@@ -325,11 +326,23 @@ defmodule LlamaCppEx.OptionForwardingTest do
         accepted = accepted_keys(fun)
         assert_accepts(accepted, Server.request_option_keys(), "LlamaCppEx.#{label} (server)")
 
-        # And they are exactly the model-routed set plus those request options.
-        model_side =
-          accepted_keys(fn -> LlamaCppEx.chat_completion(@unowned, [], [{@unknown_key, 1}]) end)
+        # And nothing else: the server-routed set is the request options plus what
+        # this module handles itself. It used to be `@gen_opt_keys ++
+        # request_option_keys()`, which accepted `:n_ctx` and all 20
+        # `Context.tuning_option_keys()` — 21 keys a running server cannot honour,
+        # each of which passed this gate and then raised inside
+        # `Server.complete_tokens/3`. The containment test below pins the
+        # relationship from the server's side; this pins the list.
+        extra = MapSet.difference(accepted, MapSet.new(Server.request_option_keys()))
 
-        assert MapSet.union(model_side, MapSet.new(Server.request_option_keys())) == accepted,
+        assert Enum.sort(extra) == [
+                 :add_assistant,
+                 :chat_template_kwargs,
+                 :enable_thinking,
+                 :json_schema,
+                 :max_tokens,
+                 :timeout
+               ],
                "#{label} accepts something that is neither a generation nor a request option"
       end
     end
@@ -392,6 +405,135 @@ defmodule LlamaCppEx.OptionForwardingTest do
                  "Server.#{label} must not accept the start-time option #{inspect(key)}"
         end
       end
+    end
+  end
+
+  # The invariant every widened-contract bug in this codebase violated: a key an
+  # outer gate accepts must be accepted by every inner gate it can route to,
+  # except the keys the outer consumes itself.
+  #
+  # Manual review missed this class four times — `:cache_scope` missing from the
+  # facade's copy of the server's request options, `Sampler.create/2`'s widened
+  # return type with three of four call sites updated, `@server_opt_keys`
+  # accepting 21 keys `Server`'s own gate rejects, and `ModelIO.native_opts/1`'s
+  # denylist forwarding `:vocab_only` into `Server.start_link/1` — three of them
+  # introduced by the change set that was fixing the first. Every other test in
+  # this file pins one instance. These pin the invariant, so instance five fails
+  # here rather than in a user's ArgumentError.
+  describe "no outer gate accepts a key its inner gate rejects" do
+    # Keys the facade reads and consumes before forwarding: chat templating is
+    # split off by `split_chat_opts/1` and `:json_schema` is rewritten into
+    # `:grammar` by `resolve_grammar_opts/1`. Everything else must survive the
+    # inner gate intact.
+    @facade_consumed [
+      :add_assistant,
+      :chat_template_kwargs,
+      :enable_thinking,
+      :json_schema
+    ]
+
+    # Held in a function rather than a module attribute: a `fn` cannot be escaped
+    # into an attribute.
+    defp server_routes do
+      [
+        {"LlamaCppEx.chat_completion/3", "LlamaCppEx.Server.complete_tokens/3",
+         fn -> LlamaCppEx.chat_completion(:no_such_server, [], [{@unknown_key, 1}]) end,
+         fn -> Server.complete_tokens(:none, [1], [{@unknown_key, 1}]) end},
+        {"LlamaCppEx.stream_chat_completion/3", "LlamaCppEx.Server.subscribe_stream_tokens/4",
+         fn -> LlamaCppEx.stream_chat_completion(:no_such_server, [], [{@unknown_key, 1}]) end,
+         fn -> Server.subscribe_stream_tokens(:none, [1], make_ref(), [{@unknown_key, 1}]) end}
+      ]
+    end
+
+    test "the facade's server-routed sets contain exactly what the server accepts" do
+      for {outer_label, inner_label, outer, inner} <- server_routes() do
+        outer_set = accepted_keys(outer)
+        inner_set = accepted_keys(inner)
+
+        escaping = MapSet.difference(outer_set, inner_set)
+
+        assert MapSet.equal?(escaping, MapSet.new(@facade_consumed)),
+               """
+               #{outer_label} does not agree with #{inner_label}.
+
+               Accepted by the outer gate and not the inner: #{inspect(Enum.sort(escaping))}
+               Expected exactly the keys the facade consumes: #{inspect(@facade_consumed)}
+
+               An extra key here reaches the inner gate and raises an
+               ArgumentError naming #{inner_label} — a function the caller never
+               called. A missing one is an option the facade advertises and then
+               silently drops.
+               """
+
+        unreachable = MapSet.difference(inner_set, outer_set)
+
+        assert MapSet.equal?(unreachable, MapSet.new([])),
+               """
+               #{inner_label} accepts #{inspect(Enum.sort(unreachable))}, which
+               #{outer_label} rejects — the feature is unreachable through the
+               route most callers take. This is the `:cache_scope` bug verbatim.
+               """
+      end
+    end
+
+    test "ModelManager.load/3's backend routes every key it accepts somewhere" do
+      backend =
+        accepted_keys(fn ->
+          ModelIO.start_server("probe", "/nonexistent", [{@unknown_key, 1}])
+        end)
+
+      assert_accepts(backend, Server.start_option_keys(), "ModelIO (server route)")
+      assert_accepts(backend, Model.structural_option_keys(), "ModelIO (direct route)")
+      assert_accepts(backend, [:cache_dir, :token, :revision, :force, :progress], "ModelIO (hub)")
+      assert_accepts(backend, [:mode, :capabilities, :default, :memory_budget, :io], "ModelIO")
+
+      # The bug: `:vocab_only` is a legitimate `Model.load/2` option that must
+      # never be forwarded into a server, and the denylist forwarded it. The
+      # backend accepts it (above) and routes it to `Model.load/2` only.
+      #
+      # `:n_gpu_layers` is the other structural Model option and is deliberately
+      # NOT in this list: the server reads it in `handle_continue/2` to load its
+      # own model, so it is a legitimate `start_link/1` option too.
+      refute :vocab_only in Server.start_option_keys(),
+             ":vocab_only must not be forwarded into a server — it produces a " <>
+               "model with no weights, and Server.init/1 rejects it"
+    end
+
+    test "every key LlamaCppEx.generate/3 accepts is read by someone" do
+      accepted = accepted_keys(fn -> LlamaCppEx.generate(@unowned, "x", [{@unknown_key, 1}]) end)
+
+      # A key earns its place by being read out of an `*opts` keyword list in the
+      # facade or the chat layer, or by being declared by a downstream owner.
+      # Anything else is advertised and then ignored — the mirror image of the
+      # containment failure above, and exactly how `:template` came to be
+      # documented on `chat/3` for a release while `apply_template/3` never read
+      # it.
+      #
+      # `:timeout` is read through `Options.timeout/2` rather than a literal
+      # `Keyword.get(opts, :timeout, ...)`, which is the point of that function —
+      # the scanner cannot see it, so it is named here.
+      consumed =
+        MapSet.new(
+          ["timeout"] ++
+            opts_read_anywhere_in("lib/llama_cpp_ex.ex") ++
+            opts_read_anywhere_in("lib/llama_cpp_ex/chat.ex") ++
+            declared(Sampler.option_keys() ++ Context.tuning_option_keys())
+        )
+
+      orphans =
+        accepted
+        |> Enum.map(&Atom.to_string/1)
+        |> Enum.reject(&MapSet.member?(consumed, &1))
+        |> Enum.sort()
+
+      assert orphans == [],
+             """
+             LlamaCppEx.generate/3 accepts options nothing reads: #{inspect(orphans)}
+
+             Either wire the option up or drop it from the accepted set. An
+             accepted-but-unread option is indistinguishable from a working one
+             at the call site.
+             """
     end
   end
 

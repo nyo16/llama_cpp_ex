@@ -48,8 +48,15 @@ defmodule LlamaCppEx do
   # see Context.tuning_option_keys/0 and Sampler.option_keys/0. Do not copy the
   # lists here; three copies had already drifted apart.
 
-  # Chat-templating options split off before the rest flows to generation.
-  @chat_opt_keys [:add_assistant, :enable_thinking, :chat_template_kwargs, :template]
+  # Chat-templating options split off before the rest flows to generation. Owned
+  # by LlamaCppEx.Chat (apply_template/3 reads all three).
+  #
+  # `:template` used to be here and documented on chat/3 and chat_completion/3 as
+  # "Custom chat template string", but nothing ever read it: apply_template/3
+  # goes through chat_apply_template_jinja, which takes the model and uses its
+  # embedded template. An accepted-and-ignored option is worse than no option, so
+  # it is gone and a caller passing it now gets an unknown-option error.
+  @chat_opt_keys [:add_assistant, :enable_thinking, :chat_template_kwargs]
 
   # Options this module reads itself, as opposed to forwarding.
   @own_opt_keys [:max_tokens, :n_ctx, :timeout, :grammar, :json_schema]
@@ -64,10 +71,21 @@ defmodule LlamaCppEx do
                     Context.tuning_option_keys()
                 )
 
-  # Server-routed calls additionally accept the Server's per-request options.
-  # Taken from Server rather than copied: the copy here had already drifted,
-  # silently rejecting `:cache_scope` while Server.complete_tokens/3 accepted it.
-  @server_opt_keys Enum.uniq(@gen_opt_keys ++ Server.request_option_keys())
+  # Server-routed calls accept what the *server* accepts, plus this module's own
+  # chat-templating and schema options. Assembling from @gen_opt_keys instead
+  # dragged in `:n_ctx` and all 20 `Context.tuning_option_keys()`: 21 keys that
+  # passed this gate and were then rejected by `Server`'s inner
+  # `Options.validate!/3`, raising an ArgumentError that named
+  # `LlamaCppEx.Server.complete_tokens/3` — a function the user never called.
+  # A request cannot resize a running server's KV cache, so the honest answer is
+  # to reject those keys here, naming this function.
+  #
+  # `:json_schema` stays: resolve_grammar_opts/1 turns it into `:grammar` before
+  # anything is forwarded, so the server never sees the key.
+  @server_opt_keys Enum.uniq(
+                     [:max_tokens, :timeout, :json_schema] ++
+                       @chat_opt_keys ++ Server.request_option_keys()
+                   )
 
   @doc """
   Initializes the llama.cpp backend. Call once at application start.
@@ -342,9 +360,9 @@ defmodule LlamaCppEx do
 
   ## Options
 
-  Accepts all options from `generate/3` plus:
-
-    * `:template` - Custom chat template string. Defaults to the model's embedded template.
+  Accepts all options from `generate/3` plus the chat-templating options from
+  `LlamaCppEx.Chat.apply_template/3` (`:add_assistant`, `:enable_thinking`,
+  `:chat_template_kwargs`).
 
   ## Examples
 
@@ -397,9 +415,9 @@ defmodule LlamaCppEx do
 
   ## Options
 
-  Accepts all options from `generate/3` plus:
-
-    * `:template` - Custom chat template string. Defaults to the model's embedded template.
+  Accepts all options from `generate/3` plus the chat-templating options from
+  `LlamaCppEx.Chat.apply_template/3` (`:add_assistant`, `:enable_thinking`,
+  `:chat_template_kwargs`).
 
   ## Examples
 
@@ -685,9 +703,14 @@ defmodule LlamaCppEx do
           {:halt, state}
       end,
       fn
-        %{ref: ref, phase: phase} ->
-          # Halted before the final chunk — cancel server-side generation.
-          if phase != :done, do: Server.cancel(server, ref)
+        %{ref: ref, phase: phase, aborted?: aborted?} ->
+          # `phase: :done` is not the same as "finished cleanly": `halt_with_error/2`
+          # sets it too, both on a mid-stream error and on a per-chunk timeout.
+          # Reading only that flag meant a *timed-out* stream never cancelled — the
+          # slot stayed occupied and the model kept decoding to `max_tokens` for a
+          # consumer that had gone. That is precisely the leak `stop_generator/3`
+          # prevents on the model-routed path, reintroduced on the server path.
+          if aborted? or phase != :done, do: Server.cancel(server, ref)
           flush_stream_messages(ref)
 
         %{} ->
@@ -698,9 +721,13 @@ defmodule LlamaCppEx do
 
   # Emits any held-back text, then the error, then halts. Shared by both
   # streaming clauses so the two cannot drift apart again.
+  #
+  # `aborted?` is what the server-routed after-function reads: it has to
+  # distinguish "the generation ended" from "we stopped listening", and `:phase`
+  # cannot carry both because this function has to set `:done` to halt.
   defp halt_with_error(state, reason) do
     {tail, state} = flush_pending_chunks(state)
-    {tail ++ [{:error, reason}], %{state | phase: :done}}
+    {tail ++ [{:error, reason}], %{state | phase: :done, aborted?: true}}
   end
 
   defp flush_pending_chunks(%{utf8_pending: ""} = state), do: {[], state}
@@ -720,6 +747,7 @@ defmodule LlamaCppEx do
       created: System.os_time(:second),
       model: model_desc,
       phase: :first,
+      aborted?: false,
       utf8_pending: "",
       enable_thinking: enable_thinking,
       thinking_parser: if(enable_thinking, do: Thinking.stream_parser(thinking: true), else: nil)

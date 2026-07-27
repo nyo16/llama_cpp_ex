@@ -110,6 +110,9 @@ defmodule LlamaCppEx.NIF do
       ),
       do: :erlang.nif_error(:not_loaded)
 
+  def grammar_validate(_model, _grammar_str, _grammar_root),
+    do: :erlang.nif_error(:not_loaded)
+
   def sampler_accept(_sampler, _token), do: :erlang.nif_error(:not_loaded)
   def sampler_reset(_sampler), do: :erlang.nif_error(:not_loaded)
   def sampler_sample(_sampler, _ctx), do: :erlang.nif_error(:not_loaded)
