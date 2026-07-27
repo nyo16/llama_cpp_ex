@@ -33,8 +33,10 @@ defmodule LlamaCppEx do
     ChatCompletionChunk,
     Context,
     Embedding,
+    Generator,
     Grammar,
     Model,
+    Options,
     Sampler,
     Server,
     Thinking,
@@ -47,7 +49,25 @@ defmodule LlamaCppEx do
   # lists here; three copies had already drifted apart.
 
   # Chat-templating options split off before the rest flows to generation.
-  @chat_opt_keys [:add_assistant, :enable_thinking, :chat_template_kwargs]
+  @chat_opt_keys [:add_assistant, :enable_thinking, :chat_template_kwargs, :template]
+
+  # Options this module reads itself, as opposed to forwarding.
+  @own_opt_keys [:max_tokens, :n_ctx, :timeout, :grammar, :json_schema]
+
+  # The complete accepted key set for the generation entry points. Assembled from
+  # the owning modules at compile time so it cannot drift; a compile-time
+  # dependency means this module recompiles when either list changes.
+  @gen_opt_keys Enum.uniq(
+                  @own_opt_keys ++
+                    @chat_opt_keys ++
+                    Sampler.option_keys() ++
+                    Context.tuning_option_keys()
+                )
+
+  # Server-routed calls additionally accept the Server's per-request options.
+  # Taken from Server rather than copied: the copy here had already drifted,
+  # silently rejecting `:cache_scope` while Server.complete_tokens/3 accepted it.
+  @server_opt_keys Enum.uniq(@gen_opt_keys ++ Server.request_option_keys())
 
   @doc """
   Initializes the llama.cpp backend. Call once at application start.
@@ -154,12 +174,17 @@ defmodule LlamaCppEx do
       `"additionalProperties" => false` for tighter grammars.
 
   """
-  @spec generate(Model.t(), String.t(), keyword()) :: {:ok, String.t()} | {:error, String.t()}
+  @spec generate(Model.t(), String.t(), keyword()) ::
+          {:ok, String.t()} | {:error, term()}
   def generate(%Model{} = model, prompt, opts \\ []) when is_binary(prompt) do
-    cfg = opts |> resolve_grammar_opts() |> gen_config()
-    {:ok, tokens} = Tokenizer.encode(model, prompt)
+    cfg =
+      opts
+      |> Options.validate!(@gen_opt_keys, "LlamaCppEx.generate/3")
+      |> resolve_grammar_opts()
+      |> gen_config(:blocking)
 
-    with {:ok, ctx, sampler} <- create_gen_resources(model, tokens, cfg) do
+    with {:ok, tokens} <- Tokenizer.encode(model, prompt),
+         {:ok, ctx, sampler} <- create_gen_resources(model, tokens, cfg) do
       Context.generate(ctx, sampler, tokens, max_tokens: cfg.max_tokens)
     end
   end
@@ -170,7 +195,16 @@ defmodule LlamaCppEx do
   Each element is a string (the text piece for one token). The stream ends
   when an end-of-generation token is produced or `max_tokens` is reached.
 
-  Accepts the same options as `generate/3`.
+  Accepts the same options as `generate/3`, except that `:timeout` bounds the
+  wait for the *next* chunk rather than the whole generation and therefore
+  defaults to `#{LlamaCppEx.Options.stream_timeout()}` ms.
+
+  ## Errors
+
+  A generation failure is emitted as a final `{:error, reason}` element rather
+  than truncating the stream silently, matching `LlamaCppEx.Server.stream/3`.
+  Elements are otherwise always strings, so `Enum.join/1` on a stream that may
+  fail is unsafe — match on the element shape if you care.
 
   ## Examples
 
@@ -181,21 +215,35 @@ defmodule LlamaCppEx do
   """
   @spec stream(Model.t(), String.t(), keyword()) :: Enumerable.t()
   def stream(%Model{} = model, prompt, opts \\ []) when is_binary(prompt) do
-    cfg = opts |> resolve_grammar_opts() |> gen_config()
+    cfg =
+      opts
+      |> Options.validate!(@gen_opt_keys, "LlamaCppEx.stream/3")
+      |> resolve_grammar_opts()
+      |> gen_config(:stream)
 
     Stream.resource(
       fn ->
-        # Start: tokenize, create context+sampler, spawn generator
-        {:ok, tokens} = Tokenizer.encode(model, prompt)
-        {:ok, ctx, sampler} = create_gen_resources(model, tokens, cfg)
-        {ref, gen_pid, cancel} = spawn_generator(ctx, sampler, tokens, cfg.max_tokens)
-        {ref, gen_pid, cancel, cfg.timeout, _utf8_pending = ""}
+        # Start: tokenize, create context+sampler, spawn generator. Failures
+        # here surface as an {:error, reason} element rather than a raise from
+        # inside the first Enum.take — Stream.resource start functions run
+        # lazily, so a hard match would blow up in the consumer's face at a
+        # point unrelated to the call that configured it.
+        with {:ok, tokens} <- Tokenizer.encode(model, prompt),
+             {:ok, ctx, sampler} <- create_gen_resources(model, tokens, cfg) do
+          {ref, gen_pid, cancel} = spawn_generator(ctx, sampler, tokens, cfg.max_tokens)
+          {ref, gen_pid, cancel, cfg.timeout, _utf8_pending = ""}
+        else
+          {:error, reason} -> {:setup_failed, reason}
+        end
       end,
       fn
+        {:setup_failed, reason} ->
+          {[{:error, reason}], {:flushed, nil, nil, nil}}
+
         {:flushed, _ref, _gen_pid, _cancel} = state ->
           {:halt, state}
 
-        {ref, gen_pid, cancel, timeout, pending} = state ->
+        {ref, gen_pid, cancel, timeout, pending} ->
           receive do
             {^ref, {:token, _id, text}} ->
               # Emit only whole codepoints; hold back a split multibyte tail.
@@ -206,13 +254,16 @@ defmodule LlamaCppEx do
             {^ref, outcome} when outcome in [:eog, :done] ->
               flush_then_halt(pending, {:flushed, ref, gen_pid, cancel})
 
-            {^ref, {:error, _reason}} ->
-              {:halt, state}
+            {^ref, {:error, reason}} ->
+              {flush_pending(pending) ++ [{:error, reason}], {:flushed, ref, gen_pid, cancel}}
           after
-            timeout -> {:halt, state}
+            timeout ->
+              {flush_pending(pending) ++ [{:error, :timeout}], {:flushed, ref, gen_pid, cancel}}
           end
       end,
       fn
+        {:setup_failed, _reason} -> :ok
+        {:flushed, nil, nil, nil} -> :ok
         {:flushed, ref, gen_pid, cancel} -> stop_generator(ref, gen_pid, cancel)
         {ref, gen_pid, cancel, _timeout, _pending} -> stop_generator(ref, gen_pid, cancel)
       end
@@ -224,14 +275,18 @@ defmodule LlamaCppEx do
   defp flush_then_halt("", state), do: {:halt, state}
   defp flush_then_halt(pending, state), do: {[pending], state}
 
+  defp flush_pending(""), do: []
+  defp flush_pending(pending), do: [pending]
+
   # --- Shared generation plumbing ---
 
-  # Option handling shared by the generation entry points.
-  defp gen_config(opts) do
+  # Option handling shared by the generation entry points. `mode` picks the
+  # :timeout default; both defaults are owned by LlamaCppEx.Options.
+  defp gen_config(opts, mode) do
     %{
       max_tokens: Keyword.get(opts, :max_tokens, 256),
       n_ctx: Keyword.get(opts, :n_ctx, 2048),
-      timeout: Keyword.get(opts, :timeout, 60_000),
+      timeout: Options.timeout(opts, mode),
       sampler_opts: Keyword.take(opts, Sampler.option_keys()),
       ctx_opts: Keyword.take(opts, Context.tuning_option_keys())
     }
@@ -251,15 +306,11 @@ defmodule LlamaCppEx do
 
   # Runs the NIF token generator in a linked process that sends
   # {ref, {:token, id, text} | :eog | :done | {:error, reason}} to the caller.
-  # The cancel flag lets stop_generator/3 halt the NIF loop cooperatively —
-  # killing the process alone cannot interrupt a running NIF.
+  # The lifecycle protocol (cancel flag, unlink, kill, drain) lives in
+  # LlamaCppEx.Generator — it used to be spelled out at three call sites.
   defp spawn_generator(ctx, sampler, tokens, max_tokens) do
-    ref = make_ref()
-    parent = self()
-    cancel = LlamaCppEx.NIF.cancel_flag_new()
-
-    gen_pid =
-      spawn_link(fn ->
+    {:ok, gen} =
+      Generator.start(fn {parent, ref, cancel} ->
         LlamaCppEx.NIF.generate_tokens(
           ctx.ref,
           sampler.ref,
@@ -271,27 +322,14 @@ defmodule LlamaCppEx do
         )
       end)
 
-    {ref, gen_pid, cancel}
+    {gen.ref, gen.pid, gen.cancel}
   end
 
-  # Cancels a generator (if still running) and drains its remaining messages.
-  # The flag stops the NIF loop — even mid-prefill via the abort callback —
-  # so the dirty scheduler is freed promptly instead of decoding to
-  # max_tokens for a departed consumer.
   defp stop_generator(ref, gen_pid, cancel) do
-    LlamaCppEx.NIF.request_cancel(cancel)
-    Process.unlink(gen_pid)
-    Process.exit(gen_pid, :kill)
-    flush_stream_messages(ref)
+    Generator.stop(%{ref: ref, pid: gen_pid, cancel: cancel})
   end
 
-  defp flush_stream_messages(ref) do
-    receive do
-      {^ref, _} -> flush_stream_messages(ref)
-    after
-      0 -> :ok
-    end
-  end
+  defp flush_stream_messages(ref), do: Generator.drain(ref)
 
   # OpenAI-style finish_reason. :eog/:done come from the stateless generator
   # protocol; :max_tokens from the Server's completion metadata.
@@ -316,11 +354,17 @@ defmodule LlamaCppEx do
       ], max_tokens: 200)
 
   """
-  @spec chat(Model.t(), [Chat.message()], keyword()) :: {:ok, String.t()} | {:error, String.t()}
+  @spec chat(Model.t(), [Chat.message()], keyword()) :: {:ok, String.t()} | {:error, term()}
   def chat(%Model{} = model, messages, opts \\ []) when is_list(messages) do
-    {chat_opts, gen_opts} = opts |> resolve_grammar_opts() |> split_chat_opts()
-    {:ok, prompt} = Chat.apply_template(model, messages, chat_opts)
-    generate(model, prompt, gen_opts)
+    {chat_opts, gen_opts} =
+      opts
+      |> Options.validate!(@gen_opt_keys, "LlamaCppEx.chat/3")
+      |> resolve_grammar_opts()
+      |> split_chat_opts()
+
+    with {:ok, prompt} <- Chat.apply_template(model, messages, chat_opts) do
+      generate(model, prompt, gen_opts)
+    end
   end
 
   @doc """
@@ -328,12 +372,21 @@ defmodule LlamaCppEx do
 
   Applies the chat template and streams the generated response token by token.
   Accepts same options as `chat/3`.
+
+  Like `stream/3`, a failure is emitted as a final `{:error, reason}` element.
   """
   @spec stream_chat(Model.t(), [Chat.message()], keyword()) :: Enumerable.t()
   def stream_chat(%Model{} = model, messages, opts \\ []) when is_list(messages) do
-    {chat_opts, gen_opts} = opts |> resolve_grammar_opts() |> split_chat_opts()
-    {:ok, prompt} = Chat.apply_template(model, messages, chat_opts)
-    stream(model, prompt, gen_opts)
+    {chat_opts, gen_opts} =
+      opts
+      |> Options.validate!(@gen_opt_keys, "LlamaCppEx.stream_chat/3")
+      |> resolve_grammar_opts()
+      |> split_chat_opts()
+
+    case Chat.apply_template(model, messages, chat_opts) do
+      {:ok, prompt} -> stream(model, prompt, gen_opts)
+      {:error, reason} -> [{:error, reason}]
+    end
   end
 
   @doc """
@@ -356,6 +409,18 @@ defmodule LlamaCppEx do
 
       completion.choices |> hd() |> Map.get(:message) |> Map.get(:content)
 
+  ## Errors
+
+  Returns `{:error, reason}` when templating, tokenization, or generation fails,
+  and `{:error, :timeout}` when generation does not complete within `:timeout`.
+
+  > #### Breaking change in 0.8.40 {: .warning}
+  >
+  > Both cases previously returned `{:ok, %ChatCompletion{}}` — a NIF error was
+  > reported as `finish_reason: "stop"` and a timeout as `"length"`, so a caller
+  > matching only `{:ok, _}` silently used truncated or empty output. The error
+  > branch of this function's `@spec` was unreachable.
+
   ## Server routing
 
   When given a running `LlamaCppEx.Server` (pid or name) instead of a
@@ -369,52 +434,58 @@ defmodule LlamaCppEx do
   def chat_completion(model_or_server, messages, opts \\ [])
 
   def chat_completion(%Model{} = model, messages, opts) when is_list(messages) do
-    {chat_opts, gen_opts} = opts |> resolve_grammar_opts() |> split_chat_opts()
-    cfg = gen_config(gen_opts)
+    {chat_opts, gen_opts} =
+      opts
+      |> Options.validate!(@gen_opt_keys, "LlamaCppEx.chat_completion/3")
+      |> resolve_grammar_opts()
+      |> split_chat_opts()
+
+    cfg = gen_config(gen_opts, :blocking)
 
     with {:ok, prompt} <- Chat.apply_template(model, messages, chat_opts),
-         {:ok, prompt_tokens} <- Tokenizer.encode(model, prompt) do
-      {:ok, ctx, sampler} = create_gen_resources(model, prompt_tokens, cfg)
+         {:ok, prompt_tokens} <- Tokenizer.encode(model, prompt),
+         {:ok, ctx, sampler} <- create_gen_resources(model, prompt_tokens, cfg) do
       {ref, gen_pid, cancel} = spawn_generator(ctx, sampler, prompt_tokens, cfg.max_tokens)
+      outcome = collect_completion_tokens(ref, cfg.timeout)
 
-      {texts, finish_reason, completion_tokens} = collect_completion_tokens(ref, cfg.timeout)
-
-      # On timeout the generator may still be running — cancel it and drain
-      # any stragglers so they don't pollute the caller's mailbox.
+      # Always tear the generator down: on timeout it is still running, and its
+      # stragglers would otherwise pollute the caller's mailbox.
       stop_generator(ref, gen_pid, cancel)
 
-      completion =
-        build_chat_completion(
-          Model.desc(model),
-          length(prompt_tokens),
-          Enum.join(texts),
-          finish_reason,
-          completion_tokens,
-          chat_opts
-        )
-
-      {:ok, completion}
+      with {:ok, texts, finish_reason, completion_tokens} <- outcome do
+        {:ok,
+         build_chat_completion(
+           Model.desc(model),
+           length(prompt_tokens),
+           Enum.join(texts),
+           finish_reason,
+           completion_tokens,
+           chat_opts
+         )}
+      end
     end
   end
 
   def chat_completion(server, messages, opts) when is_list(messages) do
-    {chat_opts, gen_opts} = opts |> resolve_grammar_opts() |> split_chat_opts()
-    model = Server.get_model(server)
+    {chat_opts, gen_opts} =
+      opts
+      |> Options.validate!(@server_opt_keys, "LlamaCppEx.chat_completion/3")
+      |> resolve_grammar_opts()
+      |> split_chat_opts()
 
-    with {:ok, prompt} <- Chat.apply_template(model, messages, chat_opts),
+    with {:ok, model} <- Server.fetch_model(server),
+         {:ok, prompt} <- Chat.apply_template(model, messages, chat_opts),
          {:ok, prompt_tokens} <- Tokenizer.encode(model, prompt),
          {:ok, result} <- Server.complete_tokens(server, prompt_tokens, gen_opts) do
-      completion =
-        build_chat_completion(
-          Model.desc(model),
-          length(prompt_tokens),
-          result.text,
-          finish_reason(result.finish_reason),
-          result.completion_tokens,
-          chat_opts
-        )
-
-      {:ok, completion}
+      {:ok,
+       build_chat_completion(
+         Model.desc(model),
+         length(prompt_tokens),
+         result.text,
+         finish_reason(result.finish_reason),
+         result.completion_tokens,
+         chat_opts
+       )}
     end
   end
 
@@ -471,14 +542,28 @@ defmodule LlamaCppEx do
 
   ## Options
 
-  Accepts same options as `chat_completion/3`.
+  Accepts same options as `chat_completion/3`. `:timeout` bounds the wait for the
+  next chunk rather than the whole generation, so it defaults to
+  `#{LlamaCppEx.Options.stream_timeout()}` ms for both the model- and
+  server-routed forms. It previously flipped between 60s and 30s depending on the
+  type of the first argument.
+
+  ## Errors
+
+  A failure is emitted as a final `{:error, reason}` element, and a chunk timeout
+  as `{:error, :timeout}`, rather than truncating the stream silently. Every other
+  element is a `%ChatCompletionChunk{}`.
 
   ## Examples
 
       model
       |> LlamaCppEx.stream_chat_completion(messages, max_tokens: 200)
-      |> Enum.each(fn chunk ->
-        chunk.choices |> hd() |> get_in([:delta, :content]) |> IO.write()
+      |> Enum.each(fn
+        %LlamaCppEx.ChatCompletionChunk{} = chunk ->
+          chunk.choices |> hd() |> get_in([:delta, :content]) |> IO.write()
+
+        {:error, reason} ->
+          IO.warn("generation failed: \#{inspect(reason)}")
       end)
 
   """
@@ -487,21 +572,32 @@ defmodule LlamaCppEx do
   def stream_chat_completion(model_or_server, messages, opts \\ [])
 
   def stream_chat_completion(%Model{} = model, messages, opts) when is_list(messages) do
-    {chat_opts, gen_opts} = opts |> resolve_grammar_opts() |> split_chat_opts()
-    cfg = gen_config(gen_opts)
+    {chat_opts, gen_opts} =
+      opts
+      |> Options.validate!(@gen_opt_keys, "LlamaCppEx.stream_chat_completion/3")
+      |> resolve_grammar_opts()
+      |> split_chat_opts()
+
+    cfg = gen_config(gen_opts, :stream)
 
     Stream.resource(
       fn ->
-        {:ok, prompt} = Chat.apply_template(model, messages, chat_opts)
-        {:ok, tokens} = Tokenizer.encode(model, prompt)
-        {:ok, ctx, sampler} = create_gen_resources(model, tokens, cfg)
-        {ref, gen_pid, cancel} = spawn_generator(ctx, sampler, tokens, cfg.max_tokens)
+        with {:ok, prompt} <- Chat.apply_template(model, messages, chat_opts),
+             {:ok, tokens} <- Tokenizer.encode(model, prompt),
+             {:ok, ctx, sampler} <- create_gen_resources(model, tokens, cfg) do
+          {ref, gen_pid, cancel} = spawn_generator(ctx, sampler, tokens, cfg.max_tokens)
 
-        chat_chunk_state(ref, cfg.timeout, Model.desc(model), chat_opts)
-        |> Map.put(:gen_pid, gen_pid)
-        |> Map.put(:cancel, cancel)
+          chat_chunk_state(ref, cfg.timeout, Model.desc(model), chat_opts)
+          |> Map.put(:gen_pid, gen_pid)
+          |> Map.put(:cancel, cancel)
+        else
+          {:error, reason} -> %{phase: :setup_failed, reason: reason}
+        end
       end,
       fn
+        %{phase: :setup_failed, reason: reason} = state ->
+          {[{:error, reason}], %{state | phase: :done}}
+
         %{phase: :first} = state ->
           {[chunk(state, %{role: "assistant", content: ""}, nil)], %{state | phase: :streaming}}
 
@@ -518,36 +614,56 @@ defmodule LlamaCppEx do
               {tail, state} = flush_pending_chunks(state)
               {tail ++ [chunk(state, %{}, finish_reason(outcome))], %{state | phase: :done}}
 
-            {^ref, {:error, _reason}} ->
-              {:halt, state}
+            {^ref, {:error, reason}} ->
+              halt_with_error(state, reason)
           after
-            timeout -> {:halt, state}
+            timeout -> halt_with_error(state, :timeout)
           end
 
         %{phase: :done} = state ->
           {:halt, state}
       end,
-      fn %{ref: ref, gen_pid: gen_pid, cancel: cancel} -> stop_generator(ref, gen_pid, cancel) end
+      fn
+        %{phase: :done, gen_pid: gen_pid, ref: ref, cancel: cancel} ->
+          stop_generator(ref, gen_pid, cancel)
+
+        %{ref: ref, gen_pid: gen_pid, cancel: cancel} ->
+          stop_generator(ref, gen_pid, cancel)
+
+        %{} ->
+          # Setup never got as far as spawning a generator.
+          :ok
+      end
     )
   end
 
   # Server-routed streaming: templating/tokenization in the caller, tokens
   # served by the batching server with prefix caching.
   def stream_chat_completion(server, messages, opts) when is_list(messages) do
-    {chat_opts, gen_opts} = opts |> resolve_grammar_opts() |> split_chat_opts()
-    timeout = Keyword.get(gen_opts, :timeout, 30_000)
+    {chat_opts, gen_opts} =
+      opts
+      |> Options.validate!(@server_opt_keys, "LlamaCppEx.stream_chat_completion/3")
+      |> resolve_grammar_opts()
+      |> split_chat_opts()
+
+    timeout = Options.timeout(gen_opts, :stream)
 
     Stream.resource(
       fn ->
-        model = Server.get_model(server)
-        {:ok, prompt} = Chat.apply_template(model, messages, chat_opts)
-        {:ok, tokens} = Tokenizer.encode(model, prompt)
-        ref = make_ref()
-        :ok = Server.subscribe_stream_tokens(server, tokens, ref, gen_opts)
-
-        chat_chunk_state(ref, timeout, Model.desc(model), chat_opts)
+        with {:ok, model} <- Server.fetch_model(server),
+             {:ok, prompt} <- Chat.apply_template(model, messages, chat_opts),
+             {:ok, tokens} <- Tokenizer.encode(model, prompt),
+             ref = make_ref(),
+             :ok <- Server.subscribe_stream_tokens(server, tokens, ref, gen_opts) do
+          chat_chunk_state(ref, timeout, Model.desc(model), chat_opts)
+        else
+          {:error, reason} -> %{phase: :setup_failed, reason: reason}
+        end
       end,
       fn
+        %{phase: :setup_failed, reason: reason} = state ->
+          {[{:error, reason}], %{state | phase: :done}}
+
         %{phase: :first} = state ->
           {[chunk(state, %{role: "assistant", content: ""}, nil)], %{state | phase: :streaming}}
 
@@ -559,21 +675,32 @@ defmodule LlamaCppEx do
             {^ref, {:done, reason}} ->
               {[chunk(state, %{}, finish_reason(reason))], %{state | phase: :done}}
 
-            {^ref, {:error, _reason}} ->
-              {:halt, state}
+            {^ref, {:error, reason}} ->
+              halt_with_error(state, reason)
           after
-            timeout -> {:halt, state}
+            timeout -> halt_with_error(state, :timeout)
           end
 
         %{phase: :done} = state ->
           {:halt, state}
       end,
-      fn %{ref: ref, phase: phase} ->
-        # Halted before the final chunk — cancel server-side generation.
-        if phase != :done, do: Server.cancel(server, ref)
-        flush_stream_messages(ref)
+      fn
+        %{ref: ref, phase: phase} ->
+          # Halted before the final chunk — cancel server-side generation.
+          if phase != :done, do: Server.cancel(server, ref)
+          flush_stream_messages(ref)
+
+        %{} ->
+          :ok
       end
     )
+  end
+
+  # Emits any held-back text, then the error, then halts. Shared by both
+  # streaming clauses so the two cannot drift apart again.
+  defp halt_with_error(state, reason) do
+    {tail, state} = flush_pending_chunks(state)
+    {tail ++ [{:error, reason}], %{state | phase: :done}}
   end
 
   defp flush_pending_chunks(%{utf8_pending: ""} = state), do: {[], state}
@@ -628,6 +755,12 @@ defmodule LlamaCppEx do
     }
   end
 
+  # A failed generation and a timeout are errors, not successes. Reporting them
+  # as finish_reason "stop"/"length" inside {:ok, %ChatCompletion{}} meant a
+  # caller matching only {:ok, _} silently consumed truncated or empty output,
+  # and made this function's error branch unreachable.
+  @spec collect_completion_tokens(reference(), timeout()) ::
+          {:ok, [String.t()], String.t(), non_neg_integer()} | {:error, term()}
   defp collect_completion_tokens(ref, timeout) do
     collect_completion_tokens(ref, timeout, [], 0)
   end
@@ -638,12 +771,12 @@ defmodule LlamaCppEx do
         collect_completion_tokens(ref, timeout, [text | texts], count + 1)
 
       {^ref, outcome} when outcome in [:eog, :done] ->
-        {Enum.reverse(texts), finish_reason(outcome), count}
+        {:ok, Enum.reverse(texts), finish_reason(outcome), count}
 
-      {^ref, {:error, _reason}} ->
-        {Enum.reverse(texts), "stop", count}
+      {^ref, {:error, reason}} ->
+        {:error, reason}
     after
-      timeout -> {Enum.reverse(texts), "length", count}
+      timeout -> {:error, :timeout}
     end
   end
 

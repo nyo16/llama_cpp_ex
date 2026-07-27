@@ -7,9 +7,18 @@ defmodule LlamaCppEx.Sampler do
   """
 
   @enforce_keys [:ref]
-  defstruct [:ref]
+  defstruct [:ref, :model]
 
-  @type t :: %__MODULE__{ref: reference()}
+  @typedoc """
+  A sampler chain.
+
+  `:model` holds the `t:LlamaCppEx.Model.t/0` the chain was built from. It is
+  carried so the model term cannot be garbage-collected while the chain is alive:
+  a grammar stage keeps a raw pointer to the model's vocabulary for its whole
+  lifetime, and dropping the model out from under it made the next `reset/1` or
+  `accept/2` dereference freed memory. `nil` only for hand-constructed structs.
+  """
+  @type t :: %__MODULE__{ref: reference(), model: LlamaCppEx.Model.t() | nil}
 
   @option_keys [
     :seed,
@@ -53,9 +62,17 @@ defmodule LlamaCppEx.Sampler do
     * `:grammar` - GBNF grammar string for constrained generation. Defaults to `""` (none).
     * `:grammar_root` - Root rule name for grammar. Defaults to `"root"`.
 
+  ## Errors
+
+  Returns `{:error, :invalid_grammar}` when `:grammar` does not compile, exceeds
+  1 MiB, or nests `(` groups more than 64 deep. A grammar that fails to compile
+  is **not** silently dropped: a caller who asked for JSON-constrained output
+  would otherwise get unconstrained output and no indication of it.
+
   """
-  @spec create(LlamaCppEx.Model.t(), keyword()) :: {:ok, t()}
-  def create(%LlamaCppEx.Model{ref: model_ref}, opts \\ []) do
+  @spec create(LlamaCppEx.Model.t(), keyword()) ::
+          {:ok, t()} | {:error, :invalid_grammar}
+  def create(%LlamaCppEx.Model{ref: model_ref} = model, opts \\ []) do
     seed = Keyword.get(opts, :seed, :rand.uniform(1_000_000_000))
     temp = Keyword.get(opts, :temp, 0.8)
     top_k = Keyword.get(opts, :top_k, 40)
@@ -67,7 +84,7 @@ defmodule LlamaCppEx.Sampler do
     grammar = Keyword.get(opts, :grammar, "")
     grammar_root = Keyword.get(opts, :grammar_root, "root")
 
-    ref =
+    result =
       LlamaCppEx.NIF.sampler_init(
         model_ref,
         seed,
@@ -82,7 +99,10 @@ defmodule LlamaCppEx.Sampler do
         grammar_root
       )
 
-    {:ok, %__MODULE__{ref: ref}}
+    case result do
+      {:ok, ref} -> {:ok, %__MODULE__{ref: ref, model: model}}
+      {:error, reason} -> {:error, reason}
+    end
   end
 
   @doc "Resets the sampler state."

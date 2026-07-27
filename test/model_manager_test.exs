@@ -285,9 +285,12 @@ defmodule LlamaCppEx.ModelManagerTest do
                )
     end
 
-    test "a per-device budget refuses on the over-budget GPU" do
-      # Requires at least one GPU device (e.g. Metal/CUDA). Skipped on CPU-only.
-      case LlamaCppEx.devices() |> Enum.filter(&(&1.type in [:gpu, :igpu])) do
+    # The `[] -> :ok` arm this used to end in made the whole test vacuous on any
+    # CPU-only host, i.e. on CI. Both arms now assert a refusal: a per-device
+    # budget must name the device it ran out on, and which device that is
+    # depends on whether the host can offload at all.
+    test "a per-device budget refuses and names the over-budget device" do
+      case Enum.filter(LlamaCppEx.devices(), &(&1.type in [:gpu, :igpu])) do
         [%{gpu_index: gi} | _] ->
           start_manager(memory_budget: %{ram: :infinity, vram: %{gi => 5_000}})
 
@@ -302,8 +305,39 @@ defmodule LlamaCppEx.ModelManagerTest do
                    )
 
         [] ->
-          :ok
+          # No GPU to offload to: Budget.distribute/3 charges the whole
+          # footprint to RAM, so the same over-sized load must be refused with
+          # `device: :ram`.
+          start_manager(memory_budget: %{ram: 5_000, vram: :infinity})
+
+          assert {:error, {:insufficient_memory, device: :ram, required: 6_000, available: 5_000}} =
+                   ModelManager.load("big", {:path, "big.gguf"},
+                     mode: :direct,
+                     n_gpu_layers: -1,
+                     split_mode: :none,
+                     fake_bytes: 6_000
+                   )
       end
+    end
+
+    # Host-independent: a per-device RAM limit is enforced whether or not the
+    # machine has a GPU, because `n_gpu_layers: 0` never offloads.
+    test "a per-device budget refuses on RAM" do
+      start_manager(memory_budget: %{ram: 5_000, vram: :infinity})
+
+      assert {:error, {:insufficient_memory, device: :ram, required: 6_000, available: 5_000}} =
+               ModelManager.load("big", {:path, "big.gguf"},
+                 mode: :direct,
+                 n_gpu_layers: 0,
+                 fake_bytes: 6_000
+               )
+
+      assert {:ok, _} =
+               ModelManager.load("small", {:path, "small.gguf"},
+                 mode: :direct,
+                 n_gpu_layers: 0,
+                 fake_bytes: 4_000
+               )
     end
 
     test "infinity budget always fits" do

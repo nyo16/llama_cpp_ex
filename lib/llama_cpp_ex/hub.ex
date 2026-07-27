@@ -31,7 +31,19 @@ defmodule LlamaCppEx.Hub do
 
   Downloaded files are cached in `~/.cache/llama_cpp_ex/models/` by default.
   Override with the `:cache_dir` option or `LLAMA_CACHE_DIR` environment variable.
-  ETag headers are stored alongside cached files to detect upstream changes.
+  The cache directory is created with mode `0o700` and cached files with `0o600`
+  — gated-repository content is credential-adjacent.
+
+  A cached file is returned as-is: `download/3` makes **no** request to the Hub
+  when the file is already present. The upstream ETag is recorded in a
+  `<file>.etag` sidecar, but nothing reads it back yet, so a file that changed
+  upstream is *not* detected — pass `force: true` to refresh it.
+
+  ## Integrity
+
+  A fresh download is verified against the SHA-256 that HuggingFace publishes for
+  the file, and a file whose digest does not match is deleted rather than cached.
+  See `download/3` for the limits of that guarantee.
 
   ## Offline Mode
 
@@ -135,8 +147,20 @@ defmodule LlamaCppEx.Hub do
   @doc """
   Download a GGUF file from HuggingFace Hub, returning the local path.
 
-  Uses ETag-based caching — if the file exists locally and the ETag matches,
-  the cached version is returned without re-downloading.
+  An already-cached file is returned immediately, without contacting the Hub.
+  There is no upstream revalidation — the ETag written to the `<file>.etag`
+  sidecar is never read back — so pass `force: true` to refresh a cached file.
+
+  A fresh download is streamed into a randomly named temporary file opened with
+  `O_EXCL`, verified against the SHA-256 HuggingFace publishes for the file, and
+  only then renamed into place with mode `0o600`.
+
+  > #### Integrity is not authenticity {: .warning}
+  >
+  > The digest comes from the same origin as the bytes, so it detects corruption
+  > or tampering *between* HuggingFace and you — not a malicious file published by
+  > the repository owner. GGUF parsing happens in C++, so for repositories you do
+  > not trust, also pass `check_tensors: true` to `LlamaCppEx.Model.load/2`.
 
   ## Options
 
@@ -145,13 +169,18 @@ defmodule LlamaCppEx.Hub do
     * `:token` - HuggingFace API token. Defaults to `HF_TOKEN` environment variable.
     * `:revision` - Git revision (branch, tag, or commit). Defaults to `"main"`.
     * `:force` - Force re-download even if cached. Defaults to `false`.
+    * `:verify_checksum` - Verify the download against the SHA-256 published by
+      HuggingFace. Defaults to `true`. Setting it to `false` also skips the
+      metadata request, and is logged as a warning.
     * `:proxy`, `:no_proxy` - Proxy overrides. See the "Proxies" section above.
 
+  An unsafe `repo_id` or `filename` — one that would escape the cache directory —
+  returns `{:error, reason}` rather than raising. See `cache_path/3`.
   """
   @spec download(String.t(), String.t(), keyword()) :: {:ok, String.t()} | {:error, String.t()}
   def download(repo_id, filename, opts \\ []) do
-    with :ok <- ensure_req() do
-      dest = cache_path(repo_id, filename, opts)
+    with :ok <- ensure_req(),
+         {:ok, dest} <- safe_cache_path(repo_id, filename, opts) do
       force = Keyword.get(opts, :force, false)
 
       cond do
@@ -167,10 +196,15 @@ defmodule LlamaCppEx.Hub do
           {:ok, dest}
 
         true ->
-          url = build_download_url(repo_id, filename, opts)
-          headers = auth_headers(opts)
-          do_download_to(url, dest, headers, proxy_request_options(url, opts))
+          fetch_and_cache(repo_id, filename, dest, opts)
       end
+    end
+  end
+
+  defp fetch_and_cache(repo_id, filename, dest, opts) do
+    with {:ok, expected_sha256} <- expected_sha256(repo_id, filename, opts) do
+      url = build_download_url(repo_id, filename, opts)
+      do_download_to(url, dest, "#{repo_id}/#{filename}", expected_sha256, opts)
     end
   end
 
@@ -242,8 +276,14 @@ defmodule LlamaCppEx.Hub do
   # Issues a GET with auth headers and proxy options applied.
   defp hf_get(url, opts, extra_req_opts \\ []) do
     req_opts = [headers: auth_headers(opts)] ++ extra_req_opts ++ proxy_request_options(url, opts)
-    Req.get(url, req_opts)
+    http_client(opts).(url, req_opts)
   end
+
+  # Test seam. The HTTP client is a `(url, req_opts) -> {:ok, resp} | {:error, e}`
+  # function, so the test suite can drive the download path with no network
+  # access. `Req.Test` would be the idiomatic stub, but it requires the optional
+  # :plug dependency, which this project does not carry.
+  defp http_client(opts), do: Keyword.get(opts, :http_client) || (&Req.get/2)
 
   # Maps a non-200 HF API response or transport error to an error tuple.
   defp hf_api_error({:ok, %{status: 401}}, _repo_id),
@@ -256,6 +296,11 @@ defmodule LlamaCppEx.Hub do
 
   defp hf_api_error({:ok, %{status: 404}}, repo_id),
     do: {:error, "repository not found: #{repo_id}"}
+
+  defp hf_api_error({:ok, %{status: 200, body: body}}, repo_id),
+    do:
+      {:error,
+       "unexpected HuggingFace API response for #{repo_id}: #{inspect(body, limit: 5, printable_limit: 120)}"}
 
   defp hf_api_error({:ok, %{status: status}}, _repo_id),
     do: {:error, "HuggingFace API returned status #{status}"}
@@ -336,16 +381,74 @@ defmodule LlamaCppEx.Hub do
 
   @doc """
   Build the local cache path for a model file.
+
+  `repo_id` and `filename` become path components beneath the cache directory,
+  so both are validated first: a component that is absolute, empty, `"."`,
+  `".."`, `~`-prefixed, or contains a null byte would escape the cache and is
+  rejected with an `ArgumentError`. `download/3` performs the same validation but
+  surfaces it as `{:error, reason}`.
   """
   @spec cache_path(String.t(), String.t(), keyword()) :: String.t()
   def cache_path(repo_id, filename, opts \\ []) do
+    case safe_cache_path(repo_id, filename, opts) do
+      {:ok, path} -> path
+      {:error, reason} -> raise ArgumentError, reason
+    end
+  end
+
+  # --- Cache path validation ---
+
+  # `cache_path/3` without the raise, so `download/3` keeps its
+  # `{:error, String.t()}` contract.
+  defp safe_cache_path(repo_id, filename, opts) do
     cache_dir =
       Keyword.get(opts, :cache_dir) ||
         System.get_env("LLAMA_CACHE_DIR") ||
         @default_cache_dir
 
-    Path.join([cache_dir, repo_id, filename])
+    with :ok <- validate_path_fragment(repo_id, "repository id"),
+         :ok <- validate_path_fragment(filename, "filename") do
+      {:ok, Path.join([cache_dir, repo_id, filename])}
+    end
   end
+
+  # Both fragments are caller-supplied and end up in a `Path.join/1`, so anything
+  # that resolves outside the cache directory has to be refused rather than
+  # sanitized: a rewritten repo id would silently cache one repo's file under
+  # another's name. `\` counts as a separator too — harmless on Unix, a real
+  # escape on Windows.
+  defp validate_path_fragment(value, label) when is_binary(value) do
+    cond do
+      value == "" ->
+        {:error, "invalid #{label}: must not be empty"}
+
+      String.contains?(value, <<0>>) ->
+        {:error, "invalid #{label} #{inspect(value)}: must not contain a null byte"}
+
+      absolute_fragment?(value) ->
+        {:error, "invalid #{label} #{inspect(value)}: must be a relative path"}
+
+      Enum.any?(String.split(value, ["/", "\\"]), &unsafe_component?/1) ->
+        {:error,
+         "invalid #{label} #{inspect(value)}: path components must not be empty, " <>
+           "\".\", \"..\", or start with \"~\""}
+
+      true ->
+        :ok
+    end
+  end
+
+  defp validate_path_fragment(value, label),
+    do: {:error, "invalid #{label}: expected a string, got #{inspect(value)}"}
+
+  defp absolute_fragment?(value),
+    do: String.starts_with?(value, ["/", "\\"]) or Regex.match?(~r/\A[a-zA-Z]:/, value)
+
+  defp unsafe_component?(""), do: true
+  defp unsafe_component?("."), do: true
+  defp unsafe_component?(".."), do: true
+  defp unsafe_component?("~" <> _rest), do: true
+  defp unsafe_component?(_component), do: false
 
   # --- Private ---
 
@@ -473,45 +576,213 @@ defmodule LlamaCppEx.Hub do
     end
   end
 
-  defp do_download_to(url, dest, headers, proxy_opts) do
-    Logger.info("Downloading to #{dest}")
-    File.mkdir_p!(Path.dirname(dest))
+  # --- Integrity ---
 
-    tmp_dest = dest <> ".download"
+  # Resolves the SHA-256 HuggingFace publishes for the file. `:unverified` means
+  # the caller opted out; `nil` means the repo lists the file but publishes no
+  # digest for it (a small, non-LFS blob), so there is nothing to compare against.
+  defp expected_sha256(repo_id, filename, opts) do
+    if Keyword.get(opts, :verify_checksum, true) do
+      fetch_expected_sha256(repo_id, filename, opts)
+    else
+      Logger.warning(
+        "integrity verification disabled for #{repo_id}/#{filename} — the downloaded " <>
+          "bytes will not be checked against HuggingFace's SHA-256"
+      )
 
-    try do
-      case do_stream_download(url, tmp_dest, headers, proxy_opts) do
-        {:ok, etag} ->
-          File.rename!(tmp_dest, dest)
-
-          if etag do
-            File.write!(dest <> ".etag", etag)
-          end
-
-          Logger.info("Download complete: #{dest}")
-          {:ok, dest}
-
-        {:error, reason} ->
-          File.rm(tmp_dest)
-          {:error, reason}
-      end
-    rescue
-      # File.Error from rename!/write!/the File.stream! sink, ErlangError from
-      # lower-level IO — programming errors (KeyError, MatchError, …) propagate.
-      e in [File.Error, ErlangError] ->
-        File.rm(tmp_dest)
-        {:error, "download failed: #{Exception.message(e)}"}
+      {:ok, :unverified}
     end
   end
 
-  defp do_stream_download(url, dest, headers, proxy_opts) do
-    # Use Req with output to file — handles redirects correctly
-    req_opts = [headers: headers, max_redirects: 10, into: File.stream!(dest)] ++ proxy_opts
+  # `siblings[].lfs.sha256` from the revision API is the file's real SHA-256 (the
+  # same value the resolve URL returns as `x-linked-etag`); the plain `etag` on
+  # the download response is the CDN's, which is a different hash entirely.
+  defp fetch_expected_sha256(repo_id, filename, opts) do
+    revision = Keyword.get(opts, :revision, "main")
 
-    case Req.get(url, req_opts) do
+    case hf_get("#{@hf_api_url}/#{repo_id}/revision/#{revision}", opts, params: [blobs: true]) do
+      {:ok, %{status: 200, body: %{"siblings" => siblings}}} when is_list(siblings) ->
+        sibling_sha256(siblings, repo_id, filename, revision)
+
+      other ->
+        {:error, reason} = hf_api_error(other, repo_id)
+
+        {:error,
+         "cannot verify #{repo_id}/#{filename}: #{reason} — pass " <>
+           "`verify_checksum: false` to download without integrity checking"}
+    end
+  end
+
+  defp sibling_sha256(siblings, repo_id, filename, revision) do
+    case Enum.find(siblings, &(&1["rfilename"] == filename)) do
+      nil -> {:error, "file not found in #{repo_id}@#{revision}: #{filename}"}
+      %{"lfs" => %{"sha256" => sha}} when is_binary(sha) -> {:ok, String.downcase(sha)}
+      %{} -> {:ok, nil}
+    end
+  end
+
+  defp verify_integrity(_path, :unverified, _label), do: :ok
+
+  defp verify_integrity(_path, nil, label) do
+    Logger.warning(
+      "#{label} is not LFS-backed and HuggingFace publishes no SHA-256 for it; the " <>
+        "downloaded bytes could not be integrity-checked"
+    )
+
+    :ok
+  end
+
+  defp verify_integrity(path, expected, label) do
+    actual = sha256_file(path)
+
+    if actual == expected do
+      :ok
+    else
+      {:error,
+       "checksum mismatch for #{label}: expected SHA-256 #{expected}, got #{actual} — " <>
+         "the downloaded file was discarded"}
+    end
+  end
+
+  # Hashes what actually landed on disk rather than the byte stream, so a
+  # truncated or partially written file fails too.
+  defp sha256_file(path) do
+    path
+    |> File.stream!(1024 * 1024)
+    |> Enum.reduce(:crypto.hash_init(:sha256), &:crypto.hash_update(&2, &1))
+    |> :crypto.hash_final()
+    |> Base.encode16(case: :lower)
+  end
+
+  # --- Download ---
+
+  defp do_download_to(url, dest, label, expected_sha256, opts) do
+    Logger.info("Downloading to #{dest}")
+    tmp_dest = tmp_download_path(dest)
+
+    try do
+      stage_download(url, dest, tmp_dest, label, expected_sha256, opts)
+    rescue
+      # File.Error from mkdir/chmod/rename/the File.stream! sink, ErlangError from
+      # lower-level IO — programming errors (KeyError, MatchError, …) propagate.
+      e in [File.Error, ErlangError] ->
+        {:error, abort_download(e, tmp_dest)}
+    end
+  end
+
+  defp stage_download(url, dest, tmp_dest, label, expected_sha256, opts) do
+    mkdir_private!(Path.dirname(dest))
+
+    with {:ok, etag} <- do_stream_download(url, tmp_dest, opts),
+         :ok <- verify_integrity(tmp_dest, expected_sha256, label) do
+      # chmod before the rename, so the file is never visible at the final path
+      # with a umask-derived mode.
+      File.chmod!(tmp_dest, 0o600)
+      File.rename!(tmp_dest, dest)
+      write_etag(dest, etag)
+      Logger.info("Download complete: #{dest}")
+      {:ok, dest}
+    else
+      {:error, reason} ->
+        File.rm(tmp_dest)
+        {:error, reason}
+    end
+  end
+
+  # Unpredictable name: a fixed `<dest>.part` can be pre-created as a symlink to
+  # redirect the write, and two concurrent downloads of the same file would share
+  # it and corrupt each other.
+  defp tmp_download_path(dest) do
+    suffix = 12 |> :crypto.strong_rand_bytes() |> Base.url_encode64(padding: false)
+    dest <> "." <> suffix <> ".part"
+  end
+
+  # Cleans up after a failed download and returns the user-facing reason.
+  # `:eexist` means the exclusive create lost the temporary name to something
+  # already there — most likely a planted symlink — so that entry is left alone
+  # rather than deleted.
+  defp abort_download(%File.Error{reason: :eexist, path: path}, _tmp_dest) do
+    "download aborted: #{path} already exists — refusing to write through it " <>
+      "(possible symlink attack or concurrent download)"
+  end
+
+  defp abort_download(exception, tmp_dest) do
+    File.rm(tmp_dest)
+    "download failed: #{Exception.message(exception)}"
+  end
+
+  # Creates the directory and any missing parents with mode 0o700. Only
+  # directories this call creates are chmodded; an existing cache directory keeps
+  # whatever the user chose.
+  defp mkdir_private!(dir) do
+    [first | rest] = Path.split(dir)
+
+    Enum.reduce(rest, mkdir_private_component!(first), fn component, parent ->
+      mkdir_private_component!(Path.join(parent, component))
+    end)
+    |> then(fn _deepest -> :ok end)
+  end
+
+  defp mkdir_private_component!(path) do
+    if File.dir?(path) do
+      path
+    else
+      File.mkdir_p!(path)
+      File.chmod!(path, 0o700)
+      path
+    end
+  end
+
+  defp write_etag(_dest, nil), do: :ok
+
+  defp write_etag(dest, etag) do
+    path = dest <> ".etag"
+    File.write!(path, etag)
+    File.chmod!(path, 0o600)
+  end
+
+  defp do_stream_download(url, tmp_dest, opts) do
+    # O_EXCL: an entry already at `tmp_dest` — a symlink planted by another user
+    # on a shared cache dir, say — fails the open instead of being written
+    # through. `File.stream!/2` cannot express this: its mode argument is
+    # `stream_mode()`, which has no `:write`, `:binary` or `:exclusive`, so the
+    # device is opened here and fed by Req's `into:` callback instead. (Dialyzer
+    # caught the earlier `File.stream!(path, [:write, :binary, :exclusive])`: the
+    # call could never succeed, so the protection was not actually in place.)
+    case File.open(tmp_dest, [:write, :binary, :exclusive]) do
+      {:ok, device} ->
+        try do
+          stream_into_device(url, device, opts)
+        after
+          File.close(device)
+        end
+
+      {:error, :eexist} ->
+        {:error, "temp file already exists: #{tmp_dest}"}
+
+      {:error, posix} ->
+        {:error, "cannot open #{tmp_dest}: #{:file.format_error(posix)}"}
+    end
+  end
+
+  defp stream_into_device(url, device, opts) do
+    req_opts =
+      [
+        headers: auth_headers(opts),
+        max_redirects: 10,
+        # Unlike the Collectable form, a function `into:` is invoked for every
+        # status, so the body of a 404 or a gated-model 403 would otherwise land
+        # in the temp file. Only 200 bodies are written; the caller deletes the
+        # temp file on any error either way.
+        into: fn {:data, data}, {req, resp} ->
+          if resp.status == 200, do: IO.binwrite(device, data)
+          {:cont, {req, resp}}
+        end
+      ] ++ proxy_request_options(url, opts)
+
+    case http_client(opts).(url, req_opts) do
       {:ok, %{status: 200} = resp} ->
-        etag = get_header(resp, "etag")
-        {:ok, etag}
+        {:ok, get_header(resp, "etag")}
 
       {:ok, %{status: 401}} ->
         {:error, "authentication required — set HF_TOKEN or pass :token option"}
@@ -532,8 +803,8 @@ defmodule LlamaCppEx.Hub do
 
   defp get_header(%{headers: headers}, key) do
     case Map.get(headers, key) do
-      [value | _] -> value
-      _ -> nil
+      [value | _rest] -> value
+      _missing -> nil
     end
   end
 end

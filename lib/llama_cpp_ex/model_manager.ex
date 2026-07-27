@@ -136,15 +136,26 @@ defmodule LlamaCppEx.ModelManager do
 
   # --- Client API: reads (bypass the GenServer, hit ETS directly) ---
 
-  @doc "Lists resident models as sanitized maps (no raw refs)."
-  @spec list() :: [map()]
+  @doc """
+  Lists resident models as sanitized maps (no raw refs).
+
+  Returns `{:error, :not_started}` rather than `[]` when the manager is not
+  running — the two used to be indistinguishable, so a missing
+  `LlamaCppEx.ModelSupervisor` in the supervision tree looked exactly like an
+  empty registry.
+  """
+  @spec list() :: [map()] | {:error, :not_started}
   def list do
-    @table
-    |> safe_tab2list()
-    |> Enum.flat_map(fn
-      {_id, %Entry{} = e} -> [Entry.to_public(%{e | last_used: last_used(e.id)})]
-      _ -> []
-    end)
+    case table_to_list(@table) do
+      :not_started ->
+        {:error, :not_started}
+
+      {:ok, rows} ->
+        Enum.flat_map(rows, fn
+          {_id, %Entry{} = e} -> [Entry.to_public(%{e | last_used: last_used(e.id)})]
+          _ -> []
+        end)
+    end
   end
 
   @doc "Returns a sanitized view of one model, or `{:error, :not_loaded}`."
@@ -177,12 +188,16 @@ defmodule LlamaCppEx.ModelManager do
     end
   end
 
-  @doc "Returns the current default model id, or `nil`."
-  @spec default() :: id() | nil
+  @doc """
+  Returns the current default model id, `nil` if none is set, or
+  `{:error, :not_started}` when the manager is not running.
+  """
+  @spec default() :: id() | nil | {:error, :not_started}
   def default do
-    case safe_lookup(@table, @default_key) do
-      [{@default_key, id}] -> id
-      _ -> nil
+    case table_lookup(@table, @default_key) do
+      :not_started -> {:error, :not_started}
+      {:ok, [{@default_key, id}]} -> id
+      {:ok, _} -> nil
     end
   end
 
@@ -498,9 +513,21 @@ defmodule LlamaCppEx.ModelManager do
         {:noreply, state}
 
       {id, monitors} ->
+        # The entry is marked :error and stays that way: every route to it then
+        # returns {:error, {:not_ready, :error}}. That is deliberate — the server
+        # is started `restart: :temporary` (ModelManager.ModelIO.start_server/3)
+        # precisely so the DynamicSupervisor does not resurrect a server this
+        # manager has disowned, which would leave an unowned process holding
+        # VRAM. The cost is that the entry never heals on its own.
+        #
+        # Recovery is `unload/1` then `load/3`, which is what the log line tells
+        # the operator to do. `unload/1` accepts an :error entry (there is no
+        # server pid left to stop) and removes it, so the reload starts clean.
         Logger.warning(
           "ModelManager: backing server for #{inspect(id)} (#{inspect(pid)}) went down: " <>
-            "#{inspect(reason)}; marking :error"
+            "#{inspect(reason)}; marking :error. This entry will keep returning " <>
+            "{:error, {:not_ready, :error}} until it is explicitly recycled: " <>
+            "LlamaCppEx.ModelManager.unload(#{inspect(id)}) then load/3 again."
         )
 
         case lookup_entry(id) do
@@ -707,7 +734,11 @@ defmodule LlamaCppEx.ModelManager do
 
   defp used_placement(_state) do
     @table
-    |> safe_tab2list()
+    |> table_to_list()
+    |> case do
+      :not_started -> []
+      {:ok, rows} -> rows
+    end
     |> Enum.reduce(Budget.empty_usage(), fn
       {_id, %Entry{status: status, placement: placement}}, acc
       when status in [:ready, :loading] ->
@@ -716,15 +747,6 @@ defmodule LlamaCppEx.ModelManager do
       _, acc ->
         acc
     end)
-  end
-
-  defp gpu_devices do
-    LlamaCppEx.devices()
-    |> Enum.filter(&(&1.type in [:gpu, :igpu]))
-  rescue
-    # The device NIF isn't loaded (test env / unsupported platform): degrade to
-    # "no GPUs" so budgeting treats everything as RAM. Other errors propagate.
-    _ in [ErlangError, UndefinedFunctionError] -> []
   end
 
   # Reclaim backing servers left under the (process-independent) DynamicSupervisor
@@ -746,15 +768,24 @@ defmodule LlamaCppEx.ModelManager do
   defp normalize_spec({id, source, opts}), do: {id, source, opts}
   defp normalize_spec({id, source}), do: {id, source, []}
 
-  defp resolve_id(:default), do: default()
+  # `:default` is only meaningful once the manager is running; when it is not,
+  # `default/0` reports {:error, :not_started} and there is nothing to route to.
+  defp resolve_id(:default) do
+    case default() do
+      {:error, :not_started} -> nil
+      id -> id
+    end
+  end
+
   defp resolve_id(id), do: id
 
   defp lookup_entry(nil), do: {:error, :not_loaded}
 
   defp lookup_entry(id) do
-    case safe_lookup(@table, id) do
-      [{^id, %Entry{} = e}] -> {:ok, e}
-      _ -> {:error, :not_loaded}
+    case table_lookup(@table, id) do
+      {:ok, [{^id, %Entry{} = e}]} -> {:ok, e}
+      {:ok, _} -> {:error, :not_loaded}
+      :not_started -> {:error, :not_started}
     end
   end
 
@@ -764,28 +795,65 @@ defmodule LlamaCppEx.ModelManager do
   defp touch(id), do: :ets.insert(@lru, {id, System.monotonic_time(:millisecond)})
 
   defp last_used(id) do
-    case safe_lookup(@lru, id) do
-      [{^id, ts}] -> ts
+    case table_lookup(@lru, id) do
+      {:ok, [{^id, ts}]} -> ts
       _ -> 0
     end
   end
 
-  defp safe_lookup(table, key) do
-    :ets.lookup(table, key)
-  rescue
-    ArgumentError -> []
+  # `:ets.lookup/2` on a table that does not exist raises ArgumentError, which is
+  # indistinguishable from "the key is absent" once you rescue it. Ask about the
+  # table instead: `started?/0` is the honest answer to "is the manager running",
+  # and the read helpers can then report `{:error, :not_started}` rather than
+  # claiming there are no models.
+  @doc """
+  Whether the manager is running and its table is available.
+
+  `list/0` returning `[]` used to mean either "no models are loaded" or "the
+  manager was never started" — the same answer for a normal empty state and a
+  supervision-tree misconfiguration.
+  """
+  @spec started?() :: boolean()
+  def started?, do: :ets.whereis(@table) != :undefined
+
+  defp table_lookup(table, key) do
+    if :ets.whereis(table) == :undefined do
+      :not_started
+    else
+      {:ok, :ets.lookup(table, key)}
+    end
   end
 
-  defp safe_tab2list(table) do
-    :ets.tab2list(table)
-  rescue
-    ArgumentError -> []
+  defp table_to_list(table) do
+    if :ets.whereis(table) == :undefined do
+      :not_started
+    else
+      {:ok, :ets.tab2list(table)}
+    end
   end
 
-  # Best-effort: the NIF may be missing entirely (test env / unsupported
-  # platform) — degrade to :ok like gpu_devices/0, but log what was skipped.
-  # init/0 is a thin NIF call, so only these two exceptions can occur;
-  # anything else propagates.
+  # The `devices/0` NIF is genuinely absent in some environments (no NIF loaded
+  # in a pure-Elixir test run, unsupported platform), and there is no way to ask
+  # ahead of time — `Code.ensure_loaded?/1` says nothing about whether the .so
+  # loaded. So this one keeps a rescue, but narrowed to the two exceptions a
+  # missing NIF actually raises, and it logs instead of swallowing: a real
+  # backend failure used to be reported as "this machine has no GPUs", which
+  # silently turns every VRAM budget into a RAM budget.
+  defp gpu_devices do
+    LlamaCppEx.devices()
+    |> Enum.filter(&(&1.type in [:gpu, :igpu]))
+  rescue
+    e in [ErlangError, UndefinedFunctionError] ->
+      Logger.warning(
+        "LlamaCppEx.ModelManager: device enumeration unavailable " <>
+          "(#{Exception.message(e)}); budgeting everything as RAM"
+      )
+
+      []
+  end
+
+  # Same shape, same reasoning: init/0 is a thin NIF call, so a missing NIF is
+  # the only thing these two exceptions can mean here. Anything else propagates.
   defp safe_backend_init do
     LlamaCppEx.init()
   rescue

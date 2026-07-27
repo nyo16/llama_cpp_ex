@@ -3,14 +3,48 @@ on:
   push:
     tags: ['v*']
 
+# Every `uses:` below is pinned to a full commit SHA rather than a moving tag.
+# This is the workflow that holds HEX_API_KEY, so a retagged action would be a
+# supply-chain takeover of the published package. Pinned releases:
+#   actions/checkout   v6.1.0  -> d23441a48e516b6c34aea4fa41551a30e30af803
+#   erlef/setup-beam   v1.24.1 -> 54075bcc5e249e4758d363f27d099f55d843f124
+# Re-resolve with `git ls-remote https://github.com/<owner>/<repo> 'refs/tags/v*'`
+# and take the dereferenced (`^{}`) line when the tag is annotated.
+
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
   ELIXIR_VERSION: "1.18"
   OTP_VERSION: "27.0"
 
 jobs:
+  # Create the GitHub Release up front, as a draft. The matrix below uploads into
+  # it, so users never see a release carrying a partial set of assets: the draft
+  # is only flipped off by the `checksum` job, after every declared artifact has
+  # been confirmed present.
+  prepare_release:
+    name: Create draft release
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+    steps:
+      - name: Create or reuse the draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG_NAME: ${{ github.ref_name }}
+        run: |
+          if gh release view "$TAG_NAME" >/dev/null 2>&1; then
+            echo "release $TAG_NAME already exists; reusing it"
+          else
+            gh release create "$TAG_NAME" --draft --verify-tag --generate-notes
+          fi
+
   precompile:
+    needs: [prepare_release]
     strategy:
+      # Report every leg. Failing fast would hide a second broken target, and the
+      # release stays a draft either way until all four artifacts are present.
+      fail-fast: false
       matrix:
         include:
           - os: macos-14
@@ -18,8 +52,11 @@ jobs:
             otp: '27.0'
             elixir: '1.18'
             backend: metal
-          # OTP 29 is the first release to report NIF 2.18; OTP 27/28 both
-          # report 2.17, so building on 28 would just overwrite the 27 artifact.
+          # OTP 25 reports NIF 2.16, OTP 26/27/28 all report 2.17, and OTP 29 is
+          # the first release to report 2.18 (verified against
+          # erts/emulator/beam/erl_nif.h in the OTP source). So OTP 27 and OTP 29
+          # are the two builds that produce distinct artifacts; adding 28 would
+          # just overwrite the 27 one.
           - os: macos-14
             target: aarch64-apple-darwin
             otp: '29.0'
@@ -40,10 +77,10 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           submodules: recursive
-      - uses: erlef/setup-beam@v1
+      - uses: erlef/setup-beam@54075bcc5e249e4758d363f27d099f55d843f124 # v1
         with:
           otp-version: ${{ matrix.otp }}
           elixir-version: ${{ matrix.elixir }}
@@ -53,6 +90,22 @@ jobs:
       - name: Set version from tag
         run: |
           TAG_VERSION="${GITHUB_REF#refs/tags/v}"
+          # GITHUB_REF is attacker-influenceable — anyone who can push a tag
+          # controls it — and it is interpolated into the sed script below, where
+          # GNU sed's `e` flag turns a crafted value into command execution. It
+          # also lands in $GITHUB_ENV. Accept strict semver and nothing else.
+          case "$TAG_VERSION" in
+            ''|*[!0-9A-Za-z.+-]*)
+              echo "::error::refusing to release '${GITHUB_REF}': version '${TAG_VERSION}' has characters outside [0-9A-Za-z.+-]"
+              exit 1
+              ;;
+          esac
+          if ! printf '%s' "$TAG_VERSION" |
+            grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?$'; then
+            echo "::error::refusing to release '${GITHUB_REF}': version '${TAG_VERSION}' is not semver"
+            exit 1
+          fi
+          echo "TAG_VERSION=${TAG_VERSION}" >> "$GITHUB_ENV"
           sed -i'' -e "s/@version \".*\"/@version \"${TAG_VERSION}\"/" mix.exs
           grep '@version' mix.exs
       - run: mix deps.get
@@ -63,34 +116,135 @@ jobs:
           mix elixir_make.precompile
         env:
           LLAMA_BACKEND: ${{ matrix.backend }}
-      - name: Upload release assets
+          # Drop -march=native. ggml enables it by default, which would tune this
+          # artifact to whatever CPU the runner happened to have and hand users a
+          # SIGILL on older hardware.
+          LLAMA_PORTABLE: '1'
+      - name: Upload artifacts to the draft release
         env:
           GH_TOKEN: ${{ github.token }}
           TAG_NAME: ${{ github.ref_name }}
         run: |
-          gh release create "$TAG_NAME" --generate-notes cache/*.tar.gz || \
+          # Only the tarballs. The .sha256 sidecars elixir_make writes alongside
+          # them stay local on purpose: the checksum job then hashes the bytes it
+          # actually downloads instead of trusting a checksum uploaded by this job.
           gh release upload "$TAG_NAME" cache/*.tar.gz --clobber
 
   checksum:
-    needs: precompile
+    name: Checksum and publish the release
+    needs: [precompile]
     runs-on: ubuntu-22.04
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v6
+      # master, not the tag: this job pushes the generated checksum.exs to master.
+      # The `publish` job below deliberately does the opposite and builds the Hex
+      # package from the tag, so the published source matches the binaries.
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           ref: master
-      - uses: erlef/setup-beam@v1
+      - uses: erlef/setup-beam@54075bcc5e249e4758d363f27d099f55d843f124 # v1
         with:
           otp-version: ${{ env.OTP_VERSION }}
           elixir-version: ${{ env.ELIXIR_VERSION }}
       - name: Set version from tag
         run: |
           TAG_VERSION="${GITHUB_REF#refs/tags/v}"
-          sed -i "s/@version \".*\"/@version \"${TAG_VERSION}\"/" mix.exs
+          # See the matching step in `precompile`: GITHUB_REF reaches sed, and
+          # GNU sed's `e` flag would execute it.
+          case "$TAG_VERSION" in
+            ''|*[!0-9A-Za-z.+-]*)
+              echo "::error::refusing to release '${GITHUB_REF}': version '${TAG_VERSION}' has characters outside [0-9A-Za-z.+-]"
+              exit 1
+              ;;
+          esac
+          if ! printf '%s' "$TAG_VERSION" |
+            grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?$'; then
+            echo "::error::refusing to release '${GITHUB_REF}': version '${TAG_VERSION}' is not semver"
+            exit 1
+          fi
+          echo "TAG_VERSION=${TAG_VERSION}" >> "$GITHUB_ENV"
+          sed -i'' -e "s/@version \".*\"/@version \"${TAG_VERSION}\"/" mix.exs
           grep '@version' mix.exs
       - run: mix deps.get
-      - run: mix elixir_make.checksum --all --ignore-unavailable
+      - name: List the artifacts mix.exs declares
+        run: |
+          # Derived from mix.exs, never hardcoded here, so the gates below cannot
+          # drift from `all_supported_targets/1` and `make_precompiler_nif_versions`.
+          cat > /tmp/expected_artifacts.exs <<'SCRIPT'
+          Mix.start()
+          Code.put_compiler_option(:no_warn_undefined, :all)
+          Code.compile_file("mix.exs")
+          config = LlamaCppEx.MixProject.project()
+          {:nif, precompiler} = config[:make_precompiler]
+
+          for target <- precompiler.all_supported_targets(:fetch),
+              nif <- config[:make_precompiler_nif_versions][:versions] do
+            IO.puts("#{config[:app]}-nif-#{nif}-#{target}-#{config[:version]}.tar.gz")
+          end
+          SCRIPT
+          elixir /tmp/expected_artifacts.exs | tee /tmp/expected_artifacts.txt
+          test -s /tmp/expected_artifacts.txt
+      - name: Verify every declared artifact reached the draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG_NAME: ${{ github.ref_name }}
+        run: |
+          # `gh release view/upload/edit <tag>` all resolve a draft by its pending
+          # tag name (gh's shared.FetchRelease does a draft lookup alongside the
+          # published one), so the release is addressable before it goes live.
+          gh release view "$TAG_NAME" --json assets --jq '.assets[].name' > /tmp/uploaded.txt
+          cat /tmp/uploaded.txt
+          missing=0
+          while read -r name; do
+            if ! grep -Fxq "$name" /tmp/uploaded.txt; then
+              echo "::error::release ${TAG_NAME} is missing declared artifact ${name}"
+              missing=1
+            fi
+          done < /tmp/expected_artifacts.txt
+          test "$missing" -eq 0
+      - name: Publish the GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG_NAME: ${{ github.ref_name }}
+        run: gh release edit "$TAG_NAME" --draft=false
+      - name: Wait for the release assets to become publicly downloadable
+        env:
+          REPO: ${{ github.repository }}
+          TAG_NAME: ${{ github.ref_name }}
+        run: |
+          # mix elixir_make.checksum fetches the plain public download URLs, which
+          # only start serving once the release is out of draft.
+          first="$(head -n 1 /tmp/expected_artifacts.txt)"
+          url="https://github.com/${REPO}/releases/download/${TAG_NAME}/${first}"
+          for attempt in $(seq 1 30); do
+            if curl -fsSL -o /dev/null "$url"; then
+              echo "release assets are public"
+              exit 0
+            fi
+            echo "not downloadable yet (attempt ${attempt}); retrying in 5s"
+            sleep 5
+          done
+          echo "::error::release assets for ${TAG_NAME} never became downloadable"
+          exit 1
+      # No --ignore-unavailable: a skipped target means users download a binary
+      # nothing vouches for.
+      - run: mix elixir_make.checksum --all
+      - name: Verify checksum.exs covers every declared artifact
+        run: |
+          # This gate is not redundant with dropping --ignore-unavailable. On a
+          # failed download elixir_make prints an error and still returns [] for
+          # that artifact (deps/elixir_make/lib/mix/tasks/elixir_make.checksum.ex),
+          # so the task exits 0 with an incomplete checksum.exs either way.
+          cat checksum.exs
+          missing=0
+          while read -r name; do
+            if ! grep -Fq "\"${name}\"" checksum.exs; then
+              echo "::error::checksum.exs has no entry for ${name}"
+              missing=1
+            fi
+          done < /tmp/expected_artifacts.txt
+          test "$missing" -eq 0
       - name: Commit checksum.exs
         env:
           TAG_NAME: ${{ github.ref_name }}
@@ -121,11 +275,24 @@ jobs:
     permissions:
       contents: read
     steps:
-      - uses: actions/checkout@v6
+      # The tag, not master. The checksum job just pushed to master and its
+      # 5-attempt rebase loop exists because concurrent commits land there, so
+      # master can already differ from the source the precompiled binaries in
+      # checksum.exs were built from.
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
-          ref: master
+          ref: ${{ github.ref }}
 
-      - uses: erlef/setup-beam@v1
+      - name: Take the generated checksum.exs from master
+        run: |
+          # The one file that legitimately comes from master: the checksum job
+          # generated it from the artifacts that are now on the release and
+          # pushed it there. Everything else in the package is the tag's tree.
+          git fetch --no-tags --depth 1 origin master
+          git checkout FETCH_HEAD -- checksum.exs
+          cat checksum.exs
+
+      - uses: erlef/setup-beam@54075bcc5e249e4758d363f27d099f55d843f124 # v1
         with:
           otp-version: ${{ env.OTP_VERSION }}
           elixir-version: ${{ env.ELIXIR_VERSION }}
@@ -133,12 +300,77 @@ jobs:
       - name: Set version from tag
         run: |
           TAG_VERSION="${GITHUB_REF#refs/tags/v}"
-          sed -i "s/@version \".*\"/@version \"${TAG_VERSION}\"/" mix.exs
+          # See the matching step in `precompile`: GITHUB_REF reaches sed, and
+          # GNU sed's `e` flag would execute it. The tag's mix.exs should already
+          # carry this version; the rewrite makes the tag authoritative.
+          case "$TAG_VERSION" in
+            ''|*[!0-9A-Za-z.+-]*)
+              echo "::error::refusing to release '${GITHUB_REF}': version '${TAG_VERSION}' has characters outside [0-9A-Za-z.+-]"
+              exit 1
+              ;;
+          esac
+          if ! printf '%s' "$TAG_VERSION" |
+            grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?$'; then
+            echo "::error::refusing to release '${GITHUB_REF}': version '${TAG_VERSION}' is not semver"
+            exit 1
+          fi
+          echo "TAG_VERSION=${TAG_VERSION}" >> "$GITHUB_ENV"
+          sed -i'' -e "s/@version \".*\"/@version \"${TAG_VERSION}\"/" mix.exs
           grep '@version' mix.exs
 
       - run: mix deps.get
         env:
           MIX_ENV: dev
+
+      - name: Verify every published artifact matches the checksum.exs being shipped
+        env:
+          REPO: ${{ github.repository }}
+          TAG_NAME: ${{ github.ref_name }}
+        run: |
+          # Download the bytes users will actually get and compare them against the
+          # checksum.exs about to be published. `mix compile` is not a substitute:
+          # on a checksum mismatch elixir_make prints an error and recovers with a
+          # source build, so it goes green on precisely the failure that matters.
+          cat > /tmp/expected_artifacts.exs <<'SCRIPT'
+          Mix.start()
+          Code.put_compiler_option(:no_warn_undefined, :all)
+          Code.compile_file("mix.exs")
+          config = LlamaCppEx.MixProject.project()
+          {:nif, precompiler} = config[:make_precompiler]
+
+          for target <- precompiler.all_supported_targets(:fetch),
+              nif <- config[:make_precompiler_nif_versions][:versions] do
+            IO.puts("#{config[:app]}-nif-#{nif}-#{target}-#{config[:version]}.tar.gz")
+          end
+          SCRIPT
+          elixir /tmp/expected_artifacts.exs > /tmp/expected_artifacts.txt
+          fail=0
+          while read -r name; do
+            expected="$(sed -n "s/.*\"${name}\" *=> *\"sha256:\([0-9a-f]*\)\".*/\1/p" checksum.exs)"
+            if [ -z "$expected" ]; then
+              echo "::error::checksum.exs has no entry for ${name}"
+              fail=1
+              continue
+            fi
+            url="https://github.com/${REPO}/releases/download/${TAG_NAME}/${name}"
+            if ! curl -fsSL -o /tmp/artifact.tar.gz "$url"; then
+              echo "::error::cannot download ${name} from the release"
+              fail=1
+              continue
+            fi
+            actual="$(sha256sum /tmp/artifact.tar.gz | cut -d ' ' -f 1)"
+            if [ "$actual" != "$expected" ]; then
+              echo "::error::${name}: published sha256 ${actual} does not match checksum.exs ${expected}"
+              fail=1
+            else
+              echo "ok ${name} ${actual}"
+            fi
+          done < /tmp/expected_artifacts.txt
+          test "$fail" -eq 0
+
+      # Build smoke test: downloads this runner's artifact through the normal
+      # install path and compiles the Elixir side. The checksums were already
+      # verified above; this catches a broken package rather than a bad binary.
       - run: mix compile
         env:
           MIX_ENV: dev
