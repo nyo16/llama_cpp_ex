@@ -27,3 +27,6 @@ llama_cpp_ex-*.tar
 /priv/*.dylib
 /priv/*.dll
 models/
+
+# Dialyzer PLTs (see :dialyzer plt_local_path in mix.exs).
+/priv/plts/

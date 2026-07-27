@@ -56,7 +56,8 @@ defmodule LlamaCppEx.Model do
     * `:use_direct_io` - Bypass page cache when loading (takes precedence over mmap).
       Defaults to `false`.
     * `:vocab_only` - Load vocabulary and metadata only, skip weights. Defaults to `false`.
-    * `:check_tensors` - Validate model tensor data on load. Defaults to `false`.
+    * `:check_tensors` - Validate model tensor data on load. Defaults to `false`,
+      because the check walks every tensor and costs real time on a large model.
 
   > #### Load mode {: .info}
   >
@@ -66,6 +67,16 @@ defmodule LlamaCppEx.Model do
   > all are false. Because `mlock` now implies mmap upstream, passing
   > `use_mlock: true, use_mmap: false` memory-maps the file rather than reading
   > it into anonymous memory.
+
+  > #### Untrusted models {: .warning}
+  >
+  > GGUF parsing happens in llama.cpp's C++ loader, and `:check_tensors` defaults
+  > to `false` for every source — including files fetched by
+  > `LlamaCppEx.Hub.download/3`, which verifies a download against the SHA-256
+  > HuggingFace publishes but cannot vouch for what the repository owner uploaded.
+  > `load/2` receives a bare path and has no notion of provenance, so it cannot
+  > raise that default on its own: pass `check_tensors: true` explicitly for any
+  > model whose publisher you do not trust.
 
   ## Examples
 

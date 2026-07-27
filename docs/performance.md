@@ -10,9 +10,10 @@ The `LlamaCppEx.Server` manages a pool of concurrent inference slots with contin
 |---|---|---|
 | `n_parallel` | 4 | Number of concurrent inference slots |
 | `n_ctx` | 8192 | Total KV cache size shared across all slots |
-| `n_batch` | n_ctx | Maximum tokens per forward pass |
+| `n_batch` | `min(n_ctx, 2048)` | Maximum tokens per forward pass |
 | `chunk_size` | 512 | Maximum prefill tokens per slot per tick |
-| `cache_prompt` | false | Enable same-slot KV cache reuse |
+| `cache_prompt` | true | Enable same-slot KV cache reuse |
+| `max_queue` | 64 | Requests allowed to queue for a slot before `{:error, :queue_full}` (`0` = unlimited) |
 | `batch_strategy` | DecodeMaximal | Batch building strategy module |
 | `type_k` | `:f16` | KV cache K quantization type |
 | `type_v` | `:f16` | KV cache V quantization type |
@@ -30,7 +31,7 @@ The KV cache is shared across all active slots. As a rule of thumb:
 effective_per_slot = n_ctx / n_parallel
 ```
 
-Each slot needs enough room for its prompt tokens plus generated tokens. If a slot's total tokens exceed the per-slot budget, `batch_eval` will fail and the request will receive an error.
+Each slot needs enough room for its prompt tokens plus generated tokens. A slot that cannot fit one more token — after the server has purged idle caches and split the batch — fails that one request with `{:error, :context_full}`; the other slots keep generating.
 
 For multi-turn chat with long conversation histories, increase `n_ctx` accordingly:
 
@@ -121,7 +122,8 @@ We tested Q8_0 against F16 with 10 deterministic prompts (temp: 0.0) covering ar
 Run the regression tests yourself:
 
 ```bash
-LLAMA_MODEL_PATH=model.gguf mix test test/kv_quantization_test.exs --include slow
+GGML_METAL_NO_RESIDENCY=1 LLAMA_SMOKE_GEN_MODEL=model.gguf \
+  mix test test/kv_quantization_test.exs --include slow
 ```
 
 ### When to Use Each Type
@@ -421,19 +423,47 @@ end
 
 ## Pre-Tokenized API
 
-For high-throughput scenarios, tokenize prompts outside the GenServer to reduce mailbox contention:
+`LlamaCppEx.Server.generate/3` and `stream/3` already tokenize in the *calling*
+process — the encode happens before the `GenServer.call`, never inside
+`handle_call`. That is deliberate, and worth understanding before reaching for
+`generate_tokens/3`, because the reasons have nothing to do with tokenization
+being cheap. It is not cheap.
+
+**It parallelizes.** Tokenizing in the server would serialize every caller's
+encode behind every other caller's. Done in the callers, N clients tokenize on N
+schedulers at once.
+
+**It keeps work off the hottest process.** The server process runs every forward
+pass. Anything it does between ticks delays decode for *every* slot currently
+generating, not just the request that caused the work.
+
+**It is safe to do from many processes at once.** `tokenize`, `detokenize`,
+`sampler_init` and `sampler_reset` are declared `ERL_NIF_DIRTY_JOB_CPU_BOUND`,
+so a long tokenization occupies a dirty CPU scheduler thread instead of blocking
+a normal one. This is load-bearing, not incidental: tokenizing a 10k-token
+prompt measures ~8.6 ms, over 8x the ~1 ms a NIF may hold a normal scheduler.
+Until those four moved to a dirty scheduler, spreading this call across every
+caller spread a multi-millisecond scheduler stall with it.
+
+So `generate_tokens/3` is not a way to move tokenization off the server; that
+already happened. It is for when you already hold the tokens — reusing one
+encode across many requests, or building the list yourself:
 
 ```elixir
+# Raises if the server is still loading; fetch_model/1 returns
+# {:error, :not_ready} instead of raising.
 model = LlamaCppEx.Server.get_model(server)
 
-# Tokenize in the caller process (parallel-safe)
 {:ok, tokens} = LlamaCppEx.Tokenizer.encode(model, prompt)
 
-# Send pre-tokenized — skips tokenization in the GenServer
-{:ok, text} = LlamaCppEx.Server.generate_tokens(server, tokens, max_tokens: 256)
+for _ <- 1..n do
+  {:ok, text} = LlamaCppEx.Server.generate_tokens(server, tokens, max_tokens: 256)
+end
 ```
 
-This matters under concurrent load where multiple callers serialize on the GenServer mailbox. Each tokenization call saved is one fewer blocking operation in the critical path.
+It is not free. The token list is copied into the server's mailbox either way,
+and on a short prompt that copy costs roughly what one encode saved. The win
+scales with prompt length and with how often you reuse the same tokens.
 
 ## Optimization Patterns
 
@@ -480,11 +510,23 @@ results =
   |> Enum.to_list()
 ```
 
+`Task.async_stream/3`'s `:timeout` is not the request's timeout. Every blocking
+call — `LlamaCppEx.generate/3`, `chat_completion/3`, `Server.generate/3`,
+`Server.generate_tokens/3` — defaults to `LlamaCppEx.Options.blocking_timeout/0`
+(60_000 ms), and streaming calls bound the wait for the *next chunk* with
+`LlamaCppEx.Options.stream_timeout/0` (30_000 ms). Setting the two to the same
+value, as above, is a race: raise the `Task` timeout above the call's, or lower
+the call's with `timeout:`, so you can tell an overloaded server from an
+abandoned task.
+
 ## Running Benchmarks
 
 The project includes Benchee benchmarks in `bench/`:
 
 ```bash
+# Slot selection and prefix matching, old vs new — pure Elixir, no model needed
+MIX_ENV=bench mix run bench/slots.exs
+
 # Prefix cache comparison
 MIX_ENV=bench LLAMA_MODEL_PATH=model.gguf mix run bench/prefix_cache.exs
 
@@ -497,4 +539,14 @@ MIX_ENV=bench LLAMA_MODEL_PATH=model.gguf mix run bench/tokenize_overhead.exs
 # Existing benchmarks
 MIX_ENV=bench LLAMA_MODEL_PATH=model.gguf mix run bench/single_generate.exs
 MIX_ENV=bench LLAMA_MODEL_PATH=model.gguf mix run bench/server_concurrent.exs
+
+# The >1k-token regime: 220-token suite plus exact 1k / 8k / 32k prompts.
+# Needs a 40960-token context, so run it against a small model.
+MIX_ENV=bench LLAMA_MODEL_PATH=model.gguf mix run bench/server_generate.exs
 ```
+
+`bench/helpers.exs` builds the prompts. `prompts/0` is the short suite (~6, ~110
+and ~220 tokens) and is frozen so results stay comparable with the numbers under
+`bench/results/`; `long_prompts/1` builds 1k / 8k / 32k prompts that tokenize to
+*exactly* that many tokens under the model's own vocab, because every per-token
+cost in the server is invisible below a few hundred tokens.

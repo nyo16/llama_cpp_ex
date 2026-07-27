@@ -6,11 +6,25 @@ on:
   pull_request:
     branches: [master]
 
+# Least privilege: every job here only reads the repo. Without this block the
+# workflow inherits the repository default, which may be read-write.
+permissions:
+  contents: read
+
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
   MIX_ENV: test
   ELIXIR_VERSION: "1.18"
   OTP_VERSION: "27.0"
+  # Revision-pinned GGUF models for the inference job. SmolLM2-135M-Instruct
+  # (145 MB) carries a real chat template and tokenizer; bge-small (36 MB) is an
+  # embedding model. Bump the revs deliberately, never floating on `main`.
+  GEN_MODEL_REPO: unsloth/SmolLM2-135M-Instruct-GGUF
+  GEN_MODEL_REV: 9e6855bc4be717fca1ef21360a1db4b29d5c559a
+  GEN_MODEL_FILE: SmolLM2-135M-Instruct-Q8_0.gguf
+  EMB_MODEL_REPO: ggml-org/bge-small-en-v1.5-Q8_0-GGUF
+  EMB_MODEL_REV: f2068edd9b54f2a369549ccc71f70ed273a2a801
+  EMB_MODEL_FILE: bge-small-en-v1.5-q8_0.gguf
 
 jobs:
   setup:
@@ -18,6 +32,7 @@ jobs:
     runs-on: ubuntu-22.04
     outputs:
       cache-key: ${{ steps.key.outputs.value }}
+      cache-restore-key: ${{ steps.key.outputs.restore }}
       plt-key: ${{ steps.key.outputs.plt }}
     steps:
       - uses: actions/checkout@v6
@@ -35,12 +50,19 @@ jobs:
       - name: Compute cache keys
         id: key
         env:
-          SRC_HASH: ${{ hashFiles('mix.lock', 'c_src/**', 'Makefile') }}
+          NATIVE_HASH: ${{ hashFiles('mix.lock', 'c_src/**', 'Makefile') }}
+          LIB_HASH: ${{ hashFiles('lib/**') }}
           LOCK_HASH: ${{ hashFiles('mix.lock') }}
           RUNNER_OS: ${{ runner.os }}
         run: |
           SUB_SHA=$(git -C vendor/llama.cpp rev-parse HEAD)
-          echo "value=${RUNNER_OS}-mix-${ELIXIR_VERSION}-${OTP_VERSION}-test-${SRC_HASH}-${SUB_SHA}" >> "$GITHUB_OUTPUT"
+          # The native build (llama.cpp + the NIF) is the expensive part and only
+          # depends on NATIVE_HASH + the submodule SHA, so that is the restore
+          # prefix. LIB_HASH is appended so any Elixir change rotates the exact
+          # key: a stale `_build` must never let the warnings gate be skipped.
+          PREFIX="${RUNNER_OS}-mix-${ELIXIR_VERSION}-${OTP_VERSION}-test-${NATIVE_HASH}-${SUB_SHA}-"
+          echo "restore=${PREFIX}" >> "$GITHUB_OUTPUT"
+          echo "value=${PREFIX}${LIB_HASH}" >> "$GITHUB_OUTPUT"
           echo "plt=${RUNNER_OS}-plt-${ELIXIR_VERSION}-${OTP_VERSION}-${LOCK_HASH}" >> "$GITHUB_OUTPUT"
 
       - name: Cache deps & build
@@ -51,12 +73,14 @@ jobs:
             deps
             _build/test
           key: ${{ steps.key.outputs.value }}
+          restore-keys: ${{ steps.key.outputs.restore }}
 
       - run: mix deps.get
-        if: steps.cache.outputs.cache-hit != 'true'
 
+      # Runs unconditionally. Guarding this on a cache miss made the sole
+      # --warnings-as-errors gate dead for Elixir-only PRs, which are exactly
+      # the changes most likely to introduce warnings.
       - run: mix compile --warnings-as-errors
-        if: steps.cache.outputs.cache-hit != 'true'
         env:
           LLAMA_BACKEND: cpu
 
@@ -81,6 +105,28 @@ jobs:
           fail-on-cache-miss: true
 
       - run: mix format --check-formatted
+
+  credo:
+    name: Credo
+    runs-on: ubuntu-22.04
+    needs: [setup]
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: erlef/setup-beam@v1
+        with:
+          otp-version: ${{ env.OTP_VERSION }}
+          elixir-version: ${{ env.ELIXIR_VERSION }}
+
+      - uses: actions/cache/restore@v5
+        with:
+          path: |
+            deps
+            _build/test
+          key: ${{ needs.setup.outputs.cache-key }}
+          fail-on-cache-miss: true
+
+      - run: mix credo --strict
 
   test:
     name: Tests
@@ -107,7 +153,7 @@ jobs:
           key: ${{ needs.setup.outputs.cache-key }}
           fail-on-cache-miss: true
 
-      - run: mix test
+      - run: mix test --cover
         env:
           LLAMA_BACKEND: cpu
 
@@ -145,3 +191,80 @@ jobs:
             ${{ runner.os }}-plt-${{ env.ELIXIR_VERSION }}-${{ env.OTP_VERSION }}-
 
       - run: mix dialyzer
+
+  inference:
+    name: Inference smoke
+    runs-on: ubuntu-22.04
+    needs: [setup]
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          submodules: recursive
+
+      - uses: erlef/setup-beam@v1
+        with:
+          otp-version: ${{ env.OTP_VERSION }}
+          elixir-version: ${{ env.ELIXIR_VERSION }}
+
+      - name: Install runtime dependencies
+        run: sudo apt-get update && sudo apt-get install -y libgomp1
+
+      - uses: actions/cache/restore@v5
+        with:
+          path: |
+            deps
+            _build/test
+          key: ${{ needs.setup.outputs.cache-key }}
+          fail-on-cache-miss: true
+
+      # Both URLs are revision-pinned so a repo re-upload cannot silently change
+      # what CI runs. Total ~181 MB, cached on the pin.
+      - name: Cache GGUF models
+        id: models
+        uses: actions/cache@v5
+        with:
+          path: models
+          key: gguf-${{ env.GEN_MODEL_REV }}-${{ env.EMB_MODEL_REV }}
+
+      - name: Download GGUF models
+        if: steps.models.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p models
+          curl -fsSL --retry 3 -o "models/${GEN_MODEL_FILE}" \
+            "https://huggingface.co/${GEN_MODEL_REPO}/resolve/${GEN_MODEL_REV}/${GEN_MODEL_FILE}"
+          curl -fsSL --retry 3 -o "models/${EMB_MODEL_FILE}" \
+            "https://huggingface.co/${EMB_MODEL_REPO}/resolve/${EMB_MODEL_REV}/${EMB_MODEL_FILE}"
+
+      # This is the job the audit says the repo was missing: CI compiled the
+      # 2100-line NIF but never ran a single forward pass, while 61 of 223
+      # commits bumped vendor/llama.cpp. The :smoke suite covers greedy
+      # generate, grammar-constrained generate and the Server; :embeddings
+      # covers embed/2 and embed_batch/2; :slow covers the F16-vs-Q8_0 KV
+      # quantization matrix, whose 10 cases had never executed anywhere — the
+      # tag was excluded by default and included by nothing, even though the
+      # generation model it needs is already cached above.
+      - name: Run inference tests
+        run: mix test --include smoke --include embeddings --include slow
+        env:
+          LLAMA_BACKEND: cpu
+          LLAMA_SMOKE_GEN_MODEL: models/SmolLM2-135M-Instruct-Q8_0.gguf
+          LLAMA_SMOKE_EMB_MODEL: models/bge-small-en-v1.5-q8_0.gguf
+
+      # The taxonomy's invariant, checked rather than trusted: each gate tag must
+      # stand alone, because `--include` beats `--exclude` and a test carrying two
+      # of them runs whenever *either* is included — needing a model the runner
+      # was never told about. Two tests violated this and CI masked it by
+      # happening to pass both flags together.
+      - name: Each gate tag runs alone
+        run: |
+          mix test --include smoke
+          mix test --include slow
+        env:
+          LLAMA_BACKEND: cpu
+          LLAMA_SMOKE_GEN_MODEL: models/SmolLM2-135M-Instruct-Q8_0.gguf
+
+      - name: Embeddings tag runs alone
+        run: mix test --include embeddings
+        env:
+          LLAMA_BACKEND: cpu
+          LLAMA_SMOKE_EMB_MODEL: models/bge-small-en-v1.5-q8_0.gguf

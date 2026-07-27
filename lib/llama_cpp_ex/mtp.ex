@@ -148,48 +148,27 @@ defmodule LlamaCppEx.MTP do
   def stream_events(%__MODULE__{} = mtp, prompt, opts \\ []) when is_binary(prompt) do
     max_tokens = Keyword.get(opts, :max_tokens, 256)
     emit_stats_every = Keyword.get(opts, :emit_stats_every, 0)
-    timeout = Keyword.get(opts, :timeout, 60_000)
+    timeout = LlamaCppEx.Options.timeout(opts, :blocking)
 
     sampler_opts = Keyword.take(opts, Sampler.option_keys())
 
     Stream.resource(
       fn ->
-        {:ok, tokens} = Tokenizer.encode(mtp.main_ctx.model, prompt)
-        {:ok, sampler} = Sampler.create(mtp.main_ctx.model, sampler_opts)
-
-        ref = make_ref()
-        parent = self()
-        cancel = LlamaCppEx.NIF.cancel_flag_new()
-
-        gen_pid =
-          spawn_link(fn ->
-            LlamaCppEx.NIF.generate_mtp_tokens(
-              mtp.spec_ref,
-              sampler.ref,
-              tokens,
-              max_tokens,
-              emit_stats_every,
-              parent,
-              ref,
-              cancel
-            )
-          end)
-
-        # Keep `sampler` alive for the duration of the stream so it doesn't
-        # get GC'd while the NIF is still using it. `done?` records that a
-        # terminal event was already emitted, so we halt on the next pull.
-        %{
-          ref: ref,
-          gen_pid: gen_pid,
-          sampler: sampler,
-          cancel: cancel,
-          timeout: timeout,
-          done?: false
-        }
+        start_mtp_stream(mtp, prompt, sampler_opts, max_tokens, emit_stats_every, timeout)
       end,
       fn
+        # The halt clause MUST come first. `start_mtp_stream/6` reports failure by
+        # adding a `:setup_error` key rather than by flipping the `:done?`
+        # discriminant, so `%{state | done?: true}` still matches the
+        # `%{setup_error: _}` pattern — with the clauses the other way round this
+        # stream emitted the same `{:error, reason}` element forever. `generate/3`
+        # drives it with `Enum.to_list/1`, so the caller hung with a growing heap.
+        # Reachable from `grammar: "not gbnf"` or any `Tokenizer.encode/2` failure.
         %{done?: true} = state ->
           {:halt, state}
+
+        %{setup_error: reason} = state ->
+          {[{:error, reason}], %{state | done?: true}}
 
         %{ref: ref, timeout: timeout} = state ->
           receive do
@@ -199,17 +178,46 @@ defmodule LlamaCppEx.MTP do
             {^ref, :eog} -> {[{:eog, nil}], %{state | done?: true}}
             {^ref, {:error, reason}} -> {[{:error, reason}], %{state | done?: true}}
           after
-            timeout -> {:halt, state}
+            timeout -> {[{:error, :timeout}], %{state | done?: true}}
           end
       end,
-      fn %{ref: ref, gen_pid: gen_pid, cancel: cancel} ->
-        # The flag stops the NIF loop cooperatively — killing the process
-        # alone cannot interrupt a running NIF.
-        LlamaCppEx.NIF.request_cancel(cancel)
-        Process.unlink(gen_pid)
-        Process.exit(gen_pid, :kill)
-        flush(ref)
+      fn
+        %{gen: gen} -> LlamaCppEx.Generator.stop(gen)
+        %{} -> :ok
       end
+    )
+  end
+
+  # Extracted from the Stream.resource start-function so the `with` and the
+  # Generator.start closure are not nested three deep inside a `fn` inside a
+  # call.
+  defp start_mtp_stream(mtp, prompt, sampler_opts, max_tokens, emit_stats_every, timeout) do
+    with {:ok, tokens} <- Tokenizer.encode(mtp.main_ctx.model, prompt),
+         {:ok, sampler} <- Sampler.create(mtp.main_ctx.model, sampler_opts) do
+      {:ok, gen} =
+        LlamaCppEx.Generator.start(
+          &spec_generate(&1, mtp, sampler, tokens, max_tokens, emit_stats_every)
+        )
+
+      # Keep `sampler` alive for the duration of the stream so it doesn't get
+      # GC'd while the NIF is still using it. `done?` records that a terminal
+      # event was already emitted, so we halt on the next pull.
+      %{gen: gen, ref: gen.ref, sampler: sampler, timeout: timeout, done?: false}
+    else
+      {:error, reason} -> %{setup_error: reason, done?: false}
+    end
+  end
+
+  defp spec_generate({parent, ref, cancel}, mtp, sampler, tokens, max_tokens, emit_stats_every) do
+    LlamaCppEx.NIF.generate_mtp_tokens(
+      mtp.spec_ref,
+      sampler.ref,
+      tokens,
+      max_tokens,
+      emit_stats_every,
+      parent,
+      ref,
+      cancel
     )
   end
 
@@ -280,13 +288,5 @@ defmodule LlamaCppEx.MTP do
   def print_stats(%__MODULE__{spec_ref: ref}) do
     LlamaCppEx.NIF.speculative_print_stats(ref)
     :ok
-  end
-
-  defp flush(ref) do
-    receive do
-      {^ref, _} -> flush(ref)
-    after
-      0 -> :ok
-    end
   end
 end

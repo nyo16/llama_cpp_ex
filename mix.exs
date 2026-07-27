@@ -37,7 +37,7 @@ end
 defmodule LlamaCppEx.MixProject do
   use Mix.Project
 
-  @version "0.8.39"
+  @version "0.8.40"
   @source_url "https://github.com/nyo16/llama_cpp_ex"
 
   def project do
@@ -55,6 +55,14 @@ defmodule LlamaCppEx.MixProject do
         "https://github.com/nyo16/llama_cpp_ex/releases/download/v#{@version}/@{artefact_filename}",
       make_precompiler_filename: "llama_cpp_ex_nif",
       make_precompiler_priv_paths: ["llama_cpp_ex_nif.so"],
+      # Verified against erts/emulator/beam/erl_nif.h in the OTP source: OTP 25
+      # reports NIF 2.16, OTP 26/27/28 report 2.17, and OTP 29 reports 2.18.
+      # Only 2.17 and 2.18 artifacts are built, so the precompiled floor is
+      # OTP 26. Declaring a "2.16" entry would be worse than omitting it: no
+      # such artifact exists, so `mix elixir_make.checksum --all` could not
+      # vouch for it. On OTP 25 elixir_make finds no matching artifact and
+      # recovers with a source build (see compile.elixir_make.ex), which the
+      # Makefile's llama.cpp clone fallback now makes possible.
       make_precompiler_nif_versions: [versions: ["2.17", "2.18"]],
       make_force_build: System.get_env("LLAMA_BACKEND") != nil,
       description: description(),
@@ -62,12 +70,23 @@ defmodule LlamaCppEx.MixProject do
       name: "LlamaCppEx",
       source_url: @source_url,
       homepage_url: @source_url,
-      docs: docs()
+      docs: docs(),
+      # Keep the PLT where CI caches it (priv/plts). Without this dialyxir
+      # writes under _build and the cache never hits.
+      dialyzer: [
+        plt_local_path: "priv/plts",
+        plt_core_path: "priv/plts"
+      ],
+      test_coverage: [summary: [threshold: 0]],
+      # test/support/test_models.exs is a helper module that test_helper.exs
+      # loads with Code.require_file/2, not a test file. Elixir 1.20 warns about
+      # unmatched files under test/ unless they are filtered out here.
+      test_ignore_filters: [~r{^test/support/}]
     ]
   end
 
   def application do
-    [extra_applications: [:logger]]
+    [extra_applications: [:logger], mod: {LlamaCppEx.Application, []}]
   end
 
   defp deps do
@@ -76,7 +95,7 @@ defmodule LlamaCppEx.MixProject do
       {:fine, "~> 0.1", runtime: false},
       {:telemetry, "~> 1.0"},
       {:ecto, "~> 3.0", optional: true},
-      {:req, "~> 0.5", optional: true},
+      {:req, "~> 0.5 or ~> 0.6", optional: true},
       {:ex_doc, "~> 0.34", only: :dev, runtime: false},
       {:credo, "~> 1.7", only: [:dev, :test], runtime: false},
       {:dialyxir, "~> 1.4", only: [:dev, :test], runtime: false},
@@ -98,9 +117,13 @@ defmodule LlamaCppEx.MixProject do
         "Changelog" => "https://hexdocs.pm/llama_cpp_ex/changelog.html",
         "llama.cpp" => "https://github.com/ggml-org/llama.cpp"
       },
+      # vendor/llama.cpp is deliberately not shipped: it would add hundreds of
+      # megabytes to every release. .gitmodules is shipped instead so the
+      # Makefile can read the upstream URL and clone the pinned commit when a
+      # source build needs it.
       files: ~w(
         lib c_src Makefile mix.exs README.md CHANGELOG.md LICENSE .formatter.exs
-        checksum.exs
+        checksum.exs .gitmodules
       )
     ]
   end
@@ -154,18 +177,23 @@ defmodule LlamaCppEx.MixProject do
     ]
   end
 
+  # Environment variables forwarded to the Makefile. System.cmd merges :env into
+  # the inherited environment anyway, but listing them keeps the build's input
+  # contract in one place:
+  #
+  #   LLAMA_BACKEND    auto | metal | cuda | vulkan | cpu
+  #   LLAMA_CMAKE_ARGS extra flags appended to the llama.cpp cmake invocation
+  #   LLAMA_PORTABLE   1 to drop -march=native, set by the precompile workflow
+  @make_env_passthrough ["LLAMA_BACKEND", "LLAMA_CMAKE_ARGS", "LLAMA_PORTABLE"]
+
   defp make_env do
-    env = %{"FINE_INCLUDE_DIR" => Fine.include_dir()}
+    base = %{"FINE_INCLUDE_DIR" => Fine.include_dir()}
 
-    env =
-      case System.get_env("LLAMA_BACKEND") do
+    Enum.reduce(@make_env_passthrough, base, fn key, env ->
+      case System.get_env(key) do
         nil -> env
-        backend -> Map.put(env, "LLAMA_BACKEND", backend)
+        value -> Map.put(env, key, value)
       end
-
-    case System.get_env("LLAMA_CMAKE_ARGS") do
-      nil -> env
-      args -> Map.put(env, "LLAMA_CMAKE_ARGS", args)
-    end
+    end)
   end
 end

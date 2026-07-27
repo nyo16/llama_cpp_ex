@@ -1,5 +1,376 @@
 # Changelog
 
+## v0.8.40
+
+Audit-remediation release. Closes 72 of the 106 findings from the
+2026-07-27 project health audit (`.claude/audit/`), across VM safety at the NIF
+boundary, public-API error contracts, the release pipeline, HuggingFace Hub
+hardening, OTP hygiene, test integrity and the CI verification gate. The 34
+remaining findings are all Low severity and explicitly deferred.
+
+**Read the Breaking section before upgrading.** Two contracts changed, both
+deliberately: `chat_completion/3` now reports failures as failures, and the
+facade's streams emit errors instead of truncating silently.
+
+### Breaking
+
+- **`LlamaCppEx.chat_completion/3` returns `{:error, reason}` on a failed
+  generation and `{:error, :timeout}` on a timeout.** It previously returned
+  `{:ok, %ChatCompletion{finish_reason: "stop"}}` for a NIF error and
+  `finish_reason: "length"` for a timeout, so a caller matching only `{:ok, _}`
+  silently consumed truncated or empty output, and the error branch of the
+  function's own `@spec` was unreachable. Callers that pattern-match `{:ok, _}`
+  will now crash where they previously proceeded on bad data — that is the point.
+  Match both branches.
+- **`LlamaCppEx.stream/3`, `stream_chat/3` and `stream_chat_completion/3` emit a
+  final `{:error, reason}` element** (and `{:error, :timeout}` on a chunk
+  timeout) instead of halting silently. `LlamaCppEx.Server.stream/3` already
+  behaved this way; the four facade streams did not, so the library shipped two
+  opposite error conventions for the same operation. `Enum.join/1` on a stream
+  that may fail is no longer safe — match on the element shape.
+- **Unknown options now raise.** Every public entry point validates its option
+  keys and raises `ArgumentError`, with a "did you mean" hint for near misses.
+  Because `Keyword.take/2` is the routing mechanism in this library, an unknown
+  key was structurally indistinguishable from another module's key: `generate(model,
+  prompt, temperature: 0.1)` silently ran at the default temperature and
+  `n_paralell: 8` silently ran 4 slots. Typos that were previously ignored will
+  now fail loudly.
+- **`LlamaCppEx.Server.get_model/1` raises `ArgumentError`** instead of exiting
+  with `{:noproc, …}` on a dead or still-loading server. Its `@spec` claimed a
+  total function. New `Server.fetch_model/1` returns
+  `{:ok, model} | {:error, :noproc | :not_ready}` for callers that want to handle it.
+- **`LlamaCppEx.Server` `:max_queue` defaults to `64`, not `0`.** At `0` the
+  reject branch was dead code, the documented `:queue_full` error could never
+  fire, and the queue was unbounded while each entry held a full token list.
+  Pass `max_queue: 0` to restore the old unbounded behaviour.
+- **`LlamaCppEx.ModelManager.list/0` and `default/0` return
+  `{:error, :not_started}`** when the manager is not running, instead of `[]` and
+  `nil`. A missing `LlamaCppEx.ModelSupervisor` in the supervision tree used to
+  be indistinguishable from an empty registry.
+- **`%LlamaCppEx.Sampler{}` gained a `:model` field** and
+  `Sampler.create/2` can return `{:error, :invalid_grammar}`. `@enforce_keys` is
+  still `[:ref]`, so pattern matches keep working; only hand-construction of the
+  struct is affected.
+- **The library now starts a supervision tree** (`LlamaCppEx.Application`, one
+  `Registry` child). Host applications need no change.
+- **Test env vars renamed** to one family: `LLAMA_SMOKE_GEN_MODEL`,
+  `LLAMA_SMOKE_EMB_MODEL`, `LLAMA_SMOKE_MTP_MODEL`. The old
+  `LLAMA_MODEL_PATH` / `LLAMA_EMBEDDING_MODEL_PATH` / `LLAMA_MTP_MODEL_PATH` are gone.
+- **`LlamaCppEx.Hub` caches under `<repo_id>/<revision>/<filename>`.** `revision`
+  was absent from the cache key, so pinning `revision: "<sha>"` returned the
+  cached `main` copy once `main` had been fetched — the pin bought nothing, and
+  said nothing about it. **Migration:** existing caches are laid out without the
+  revision component and will be treated as misses, so the next `download/3` for
+  each file re-downloads once. Delete the old tree or leave it; nothing reads it.
+- **A download whose file has no published SHA-256 now fails.** `:verify_checksum`
+  takes `true` (default, fail closed), `:best_effort` (warn and proceed when
+  HuggingFace publishes no digest), or `false` (skip the check and the metadata
+  request). Verification used to fall back to a warning whenever
+  `siblings[].lfs.sha256` was absent, which made it downgradable by the *metadata*
+  response: a MITM with a trusted cert — or the TLS-terminating corporate proxy
+  this module explicitly supports — strips one JSON key and the bytes are cached
+  unverified. Any other value for `:verify_checksum` is now rejected rather than
+  treated as truthy.
+- **`LlamaCppEx.Server.stream/3` and `stream_tokens/3` emit `{:error, :timeout}`**
+  on a per-token timeout instead of truncating silently, and cancel the request
+  server-side. They were the last two streams in the library that ended a failed
+  generation indistinguishably from a successful one, contradicting their own
+  `@doc`.
+- **The undocumented-but-documented `:template` option is gone.** `chat/3` and
+  `chat_completion/3` advertised "Custom chat template string" and accepted the
+  key; nothing ever read it — `Chat.apply_template/3` goes through
+  `chat_apply_template_jinja`, which uses the model's embedded template. Passing
+  it now raises an unknown-option `ArgumentError` instead of being ignored.
+- **`LlamaCppEx.Server` request options are validated on the streaming path too,
+  and the server-routed facade rejects start-time options.**
+  `chat_completion/3`/`stream_chat_completion/3` against a server used to accept
+  `:n_ctx` and every `Context.tuning_option_keys()` entry — 21 keys a running
+  server cannot honour — and then raised an `ArgumentError` naming
+  `LlamaCppEx.Server.complete_tokens/3`, a function the caller never called. They
+  are now rejected up front, naming the function the caller did call.
+
+### Security
+
+- **Use-after-free in `%Sampler{}` (Critical).** `sampler_init` captured the raw
+  `const llama_vocab*` from `model->vocab()` with no ownership link, so dropping
+  the model term in Elixir freed the vocabulary under a live sampler and the next
+  `Sampler.reset/1` or `accept/2` dereferenced freed heap. `LlamaSampler` now holds
+  a `fine::ResourcePtr<LlamaModel>`, matching what `LlamaContext` and
+  `LlamaSpeculative` already did.
+- **Every value crossing the NIF boundary is now range-checked.**
+  `GGML_ASSERT` is never `NDEBUG`-gated, so it calls `ggml_abort()` → `abort()`: a
+  bad integer from Elixir took down the entire BEAM with no exception, no
+  supervisor and no crash report. Verified by removing each guard in turn,
+  rebuilding, and watching the VM abort with `NDEBUG` active — `embed_decode/3`
+  with an out-of-range `seq_id` exits the OS process with `SIGABRT`.
+
+  - `seq_id` is validated against `llama_n_seq_max/1` in every NIF that can reach
+    a `llama_memory_*` or `llama_state_seq_*` call outside a batch:
+    `memory_seq_rm/4`, `memory_seq_cp/5`, `memory_seq_keep/2`,
+    `memory_seq_pos_max/2`, `state_seq_get_size/2`, `state_seq_get_data/2`,
+    `state_seq_set_data/3`, `embed_decode/3`, `embed_batch_decode/2` and
+    `batch_eval_sample/4`'s `purgeable_seq_ids`.
+  - Sequence ids carried *inside* a `llama_batch` are bounded by upstream's
+    `llama_batch_allocr::init`, which returns `false` rather than asserting, so
+    `llama_decode` returns non-zero and the NIF returns `{:error, _}`. That is why
+    `prefill/3`, `decode_batch/3`, `decode_token/4`, `batch_eval/2` and
+    `batch_eval_sample/4`'s entries need no local guard — a distinction now
+    recorded in code and enumerated in `test/nif_guards_test.exs`, whose
+    `@seq_id_surface` table is checked against `LlamaCppEx.NIF`'s own source so a
+    new `seq_id`-taking NIF fails the suite until it is classified.
+  - The logits index in `sampler_sample/2` and `sampler_sample_at/3` is validated
+    against the shape of the last successful decode, reproducing all three cases
+    upstream's `output_resolve_row` rejects. `llama_get_logits_ith` only degrades
+    to `nullptr` when llama.cpp itself was built with `NDEBUG`, and the following
+    `GGML_ASSERT(logits != nullptr)` aborts regardless, so the bound has to be
+    kept here.
+  - `memory_seq_cp/5` refuses a *partial* cross-sequence copy on a split KV cache,
+    which reaches `GGML_ASSERT(is_full)` in `llama-kv-cache.cpp` and aborts the
+    process image. `Server` guarded this with its `cross_slot_sharing` flag, but
+    that is an Elixir-side convention and the NIF is callable directly.
+  - Grammar and JSON-schema text are bounded at 1 MiB and 64 nesting levels.
+    Both parsers are recursive descent over the input, so text nesting depth is C
+    stack depth and unbounded nesting is a `SIGSEGV` no `try/catch` recovers from.
+  - `state_seq_set_data/3` rejects a blob too short to hold upstream's header and
+    treats a `0` return as an error instead of proceeding as if the restore worked.
+- **A malformed grammar is no longer silently dropped.** `sampler_init` did
+  `if (grammar) chain_add(...)`, so a GBNF parse failure disabled the constraint
+  and a caller who asked for JSON got unconstrained output with no indication.
+  Now `{:error, :invalid_grammar}`. This was a validation bypass, not a cosmetic
+  issue.
+- **Path traversal to arbitrary file write in `Hub.cache_path/3`.** A `repo` or
+  `filename` containing `..` or an absolute component escaped the cache directory.
+  Both are now validated before joining; `cache_path/3` raises on unsafe input and
+  `download/3` errors before any HTTP request.
+- **Downloaded models are integrity-checked.** `Hub.download/3` fetches the
+  published SHA-256 from the HuggingFace revision API and verifies the bytes that
+  landed on disk, failing the download on mismatch. Opt out with
+  `verify_checksum: false`.
+- **The download temp file is randomized and opened `O_EXCL`**, so a symlink
+  planted at the target fails the open instead of being written through, and two
+  concurrent downloads cannot corrupt each other. Cache directories are `0o700`
+  and cached files `0o600`.
+- **New `:cache_scope` request option scopes KV prefix reuse to a trust
+  boundary.** Prefix reuse — from the slot's own cache, from another slot, or from
+  the RAM prompt cache — is a KV read, so two tenants sharing a system prompt
+  could otherwise inherit each other's cache. Defaults to `nil`, a single shared
+  pool, which is only safe when every caller is in one trust domain.
+- **Release-pipeline hardening.** Every GitHub Action in the workflow holding
+  `HEX_API_KEY` is SHA-pinned; `ci.yml` gained an explicit least-privilege
+  `permissions:` block; the `sed` script built from `GITHUB_REF` is validated
+  against a semver regex first (GNU sed `e`-flag injection); `mix
+  elixir_make.checksum --ignore-unavailable` no longer allows a `checksum.exs`
+  that vouches for fewer targets than were published.
+- **`ErlNifEnv` and `llama_batch` leaks** in the three streaming NIFs are fixed
+  with RAII guards, so a C++ exception unwinding out of a generation loop no
+  longer leaks.
+- **Session affinity is keyed by `{cache_scope, session}`, not by `:session`
+  alone.** `:session` was a global keyspace: affinity routed on the session id
+  while only prefix *reuse* checked `:cache_scope`, so a guessed session id let one
+  scope claim the slot another scope was using and evict its prefix cache. A
+  denial of service rather than a KV leak — the scope check still cleared the KV on
+  mismatch — closed while the feature is new.
+- **A failed write during a download is reported, and Req's retry can no longer
+  append a second response body.** `IO.binwrite/2` does not return
+  `{:error, reason}`; it calls `:erlang.error(reason)`, so a full disk raised
+  `:enospc` out of Req's streaming callback and past `download/3` into the caller's
+  crash report — with the request options, `:token` included, in the stacktrace.
+  The write now goes through `:file.write/2` and a failure becomes
+  `{:error, reason}` with nothing left in the cache. Separately, Req's retry
+  re-runs the request with the same `into:` closure over the still-open device
+  (`req/lib/req/steps.ex:2315`), so a transient 503 *appended* a second body rather
+  than restarting the file — a corrupt GGUF with a plausible size and a valid ETag.
+  Retry is off for this request; a failed download is the caller's to repeat.
+- **A broken GPU backend no longer reports as "no GPUs".**
+  `ModelManager`'s device enumeration rescued all of `ErlangError`, which covers
+  both "the NIF is not loaded" and "the backend call failed", so a genuine failure
+  silently turned every VRAM budget into a RAM budget. Only `:not_loaded` degrades
+  now; anything else propagates with its original stacktrace.
+
+### Fixed
+
+- **Source builds are possible again (Critical).** `package()` `files:` omitted
+  `.gitmodules` and the Makefile required `vendor/llama.cpp/CMakeLists.txt` with no
+  fallback, so *every* source build died at `No rule to make target` — including
+  every documented `LLAMA_BACKEND` user, since setting it forces a source build.
+  The Makefile now clones llama.cpp pinned to the submodule SHA. Regression-tested
+  by extracting a Hex tarball into a clean directory with no `vendor/` and no
+  surrounding git repository and running `LLAMA_BACKEND=cpu mix compile`; it fails
+  on the old Makefile and succeeds on the new one.
+- **Published Linux artifacts were compiled with `-march=native`.**
+  `GGML_NATIVE_DEFAULT` is `ON` unless cross-compiling, and nothing neutralized
+  it, so the published `x86_64-linux-gnu` `.so` was tuned to whatever CPU the
+  release runner had — a SIGILL risk on user machines and a non-reproducible
+  build. The precompile workflow now sets `LLAMA_PORTABLE=1`, which adds
+  `-DGGML_NATIVE=OFF`; local builds keep native tuning. Reproduced on an M4, where
+  the untuned build emits `-mcpu=native+…+sme` and `sme` does not exist on an M1.
+- **The `.built` sentinel made submodule bumps and backend switches silent
+  no-ops.** The llama.cpp build directory is now keyed by backend and portability
+  and the stamp by the llama.cpp commit, so either change forces a rebuild. This
+  repo bumps llama.cpp in 61 of its 223 commits.
+- **Hex publishing used `master`, not the tag.** The checksum job's five-attempt
+  rebase loop is itself evidence that concurrent `master` commits are expected, so
+  published source could differ from the binaries `checksum.exs` vouches for.
+- **GitHub Releases went public with 1 of 4 assets.** The release is now created
+  as a draft and published only after every artifact has uploaded.
+- **`Server.init/1` hard-matched everything expensive.** `LlamaCppEx.init()`, a
+  multi-hundred-MB `Model.load`, `Context.create` and `n_parallel` sampler chains
+  were all `{:ok, x} = …` inside `init/1`, so a load failure surfaced as an opaque
+  `MatchError` and `start_link/1` blocked the supervision tree's boot for the whole
+  load. Cheap validation stays in `init/1` (so a bad `:model_path`, a missing
+  `:model_path` and a typo'd `:batch_strategy` still fail `start_link/1`
+  synchronously, with a named reason); everything expensive moved to
+  `handle_continue/2` and reports `{:stop, {:load_failed, reason}}`.
+- **`Server` had no `handle_info/2` catch-all.** One stray message — a late
+  `:ssl_closed`, a reply to a timed-out call — was a `FunctionClauseError` that
+  killed the model, dropped the `%Model{}`/`%Context{}` refs and failed every
+  in-flight request; and because backing servers are `restart: :temporary`, it
+  never came back.
+- **`:batch_strategy` is validated at startup.** A typo previously surfaced as an
+  `UndefinedFunctionError` inside `handle_info(:tick)` — after the model load.
+- **`Server.stream/3` and `generate/3` no longer hard-match tokenization**, and
+  `LlamaCppEx.generate/3`, `chat/3`, `stream/3` and both `chat_completion` clauses
+  thread every fallible step through `with`. The `Stream.resource` cases used to
+  raise lazily on the consumer's first `Enum.take`, far from the call that
+  configured them.
+- **Exception-driven feature detection no longer swallows real failures.**
+  `ModelManager`'s `:ets` rescues could not distinguish "table absent" from "key
+  absent"; device enumeration reported a genuine backend failure as "this machine
+  has no GPUs", silently turning every VRAM budget into a RAM budget. The bare
+  `rescue`/`catch` in `Budget.system_memory_bytes/0` is narrowed to the one
+  exception `System.cmd/3` can actually raise.
+- **A crashed backing server's permanent `:error` entry is now documented.**
+  `restart: :temporary` is the right call — it stops the `DynamicSupervisor`
+  resurrecting a server `ModelManager` has disowned — but the entry then returned
+  `{:error, {:not_ready, :error}}` forever with no documented way out. The log line
+  now names the recovery: `unload/1` then `load/3`.
+- **`req` is no longer pinned away from 0.6.x** — `"~> 0.5 or ~> 0.6"`.
+- **A caller-supplied `:grammar` can no longer crash a `LlamaCppEx.Server`.**
+  `Sampler.create/2` gained `{:error, :invalid_grammar}` but one of its four call
+  sites — `init_slot/4`, inside the GenServer that owns the model — still
+  hard-matched `{:ok, sampler}`. Because backing servers run `restart: :temporary`,
+  a single bad grammar killed the server permanently. A new validate-only
+  `grammar_validate` NIF checks the grammar at the admission boundary, so every
+  public entry point returns `{:error, :invalid_grammar}` synchronously and the
+  request never reaches a slot; `init_slot/4` keeps a `case` as depth-2 defence
+  that fails the request rather than the server.
+- **`MTP.stream_events/3` no longer returns an infinite stream on setup failure.**
+  The failure was signalled by *adding* a `:setup_error` key instead of flipping
+  the discriminant the clauses dispatch on, so the halt clause never matched and
+  `generate/3`'s `Enum.to_list/1` hung with a growing heap. Reachable from
+  `grammar: "not gbnf"` or any tokenization failure.
+- **A timed-out server-routed `stream_chat_completion/3` cancels its request.**
+  The after-function decided by `phase != :done`, and the timeout path set
+  `phase: :done`, so the slot stayed occupied and the model decoded to
+  `max_tokens` for a consumer that had gone — the leak `stop_generator/3` prevents
+  on the model-routed path, reintroduced on the server path.
+- **`Generator.stop/1` no longer leaves a stray `{:EXIT, pid, :normal}`.**
+  `Process.unlink/1` does not remove an exit signal already in the mailbox, and
+  the runner exits normally the instant the NIF returns. A trapping consumer got
+  noise; one using the `{:stop, reason, state}` shape — which `LlamaCppEx.Server`
+  itself does — shut down silently. Reproduced 200/200 before the fix, 0/200 after.
+- **`Server.fetch_model/1` and the streaming admission calls turn every exit into
+  a value.** `fetch_model/1` caught `:noproc`, `:normal` and `:timeout`, so
+  `handle_continue/2`'s `{:stop, {:load_failed, reason}, state}` — plus
+  `{:shutdown, _}` and `:killed` — exited the caller from inside both
+  `Stream.resource` start-functions, past a `@spec` that promised a total
+  function. Both admission calls are also bounded by the caller's `:timeout` now
+  rather than `GenServer.call/2`'s implicit 5000 ms.
+- **`memory_seq_rm` returning `false` is handled instead of hard-matched.**
+  `llama_memory_recurrent::seq_rm` refuses a partial rollback deeper than
+  `n_rs_seq` and returns `false`; the Elixir guard covered only `seq_rm_kind ==
+  :full`, so on an `:rs` context `true = ...` was a `MatchError` inside the
+  server's tick. Both call sites now fall back to a full clear and log.
+- **`ModelManager.load/3` forwards only what each destination reads.** The
+  `Keyword.drop/2` denylist let `:vocab_only` through to `Server.start_link/1`,
+  which rejects it — while `load/3` documents accepting "any `Model.load/2` or
+  `Server.start_link/1` options". Two allowlists now route it, with one gate on
+  their union so a typo like `n_paralell` still fails loudly instead of silently
+  running the default `:n_parallel`.
+- **A NIF failure inside `PromptCache.save/4` is logged rather than being
+  indistinguishable from "the prefix was too short".** Four of the five `with`
+  clauses are policy decisions and stay silent; the `{:error, reason}` clause is
+  split out. The symmetric operation already disagreed — `apply_ram_restore/4`
+  logs on restore failure.
+
+### Performance
+
+- **`tokenize`, `detokenize`, `sampler_init` and `sampler_reset` moved to dirty
+  schedulers.** `tokenize` measured 862 µs at 1k tokens, 8.56 ms at 10k and 137 ms
+  at 160k — it crosses the 1 ms normal-scheduler budget at ~1160 prompt tokens and
+  it runs in the *caller's* process. `sampler_init` compiles GBNF eagerly (190 µs
+  on a 245-rule schema) and `sampler_reset` silently re-parses the entire grammar,
+  both per request inside `Server.handle_call/3`.
+- **`Slots.donor_prefix_match/2` no longer rebuilds each candidate slot's token
+  history.** `prompt_tokens ++ Enum.reverse(generated_token_ids)` measured 85.4 µs
+  and ~460 KB of garbage per candidate at a 32k prompt — ~600 µs per request at
+  `n_parallel: 8`, in the process that runs every forward pass. The two lists are
+  now walked in sequence, and the generated tail is only reversed when the whole
+  prompt matched.
+- **The longest-common-prefix scan is no longer computed twice per request.**
+  `Slots.pick_cached_slot/2` returns `{seq_id, lcp}` so the caller reuses the match
+  it just computed (~69 µs at 32k), and `length(tokens)` is computed once instead
+  of six times.
+- **A busy slot no longer holds three copies of its prompt.** The previous
+  request's `cached_tokens` stayed reachable alongside the new prompt's list *and*
+  its tuple for the whole request — ~2.6 MB of garbage at `n_parallel: 8` with 8k
+  prompts.
+- **Model swaps no longer trigger a global GC.** The `Server` model handle moved
+  from `:persistent_term` to a `Registry`. `:persistent_term.put/1` and `erase/1`
+  each force every process in the VM to scan its heap, and `ModelManager`'s
+  load/unload path did exactly that per swap. The `Registry` entry is also removed
+  automatically when the server dies, closing the leak `:persistent_term` had on
+  `Process.exit(server, :kill)`, where `terminate/2` never runs.
+
+### Added
+
+- **`LlamaCppEx.Options`** — single owner for cross-module option policy: the
+  scalar `:timeout` defaults (`blocking_timeout/0` = 60_000 for calls that block
+  until generation completes, `stream_timeout/0` = 30_000 for per-chunk stream
+  waits) and unknown-key validation. There were six hand-rolled `:timeout`
+  defaults across three modules, and `stream_chat_completion/3` chose between
+  60s and 30s purely on the type of its first argument.
+- **`LlamaCppEx.Server.PromptCache`** — the level-2 RAM prompt cache extracted
+  from `LlamaCppEx.Server` with its state in a `%PromptCache{entries, bytes,
+  budget_bytes}` struct. The two functions that were `@doc false`-public solely so
+  tests could reach them are now this module's real API (`covers?/4`,
+  `evict_to_budget/1`), and `best_candidate/4` — previously private and therefore
+  untestable — is public.
+- **`LlamaCppEx.Server.Request`** — replaces a positional 7-tuple that was
+  destructured at five sites and pattern-matched by index inside two
+  `:queue.filter/2` callbacks. `init_slot/9` takes it instead of seven positional
+  arguments, two of which were always `nil`.
+- **`LlamaCppEx.Generator`** — the streaming-NIF lifecycle protocol (cancel flag →
+  `spawn_link` → `request_cancel` → `unlink` → `exit(:kill)` → drain), which was
+  spelled out at three call sites. Killing the runner alone does not interrupt a
+  running NIF, so a missed cancel flag means the dirty scheduler keeps decoding to
+  `max_tokens` for a departed consumer.
+- **`Server.request_option_keys/0`** and `Server.fetch_model/1`.
+- **CI now runs real inference.** CI compiled the 2100-line NIF but never ran a
+  single forward pass, while 61 of 223 commits bumped `vendor/llama.cpp`. A new
+  `inference` job downloads two revision-pinned GGUF models (SmolLM2-135M-Instruct
+  and bge-small-en-v1.5, ~181 MB, cached) and runs the `:smoke` and `:embeddings`
+  suites: greedy generation, grammar-constrained generation, the batching server,
+  and embeddings.
+- **CI also runs `mix credo --strict` and `mix test --cover`**, and the
+  `--warnings-as-errors` compile is no longer skipped on a cache hit — the cache
+  key now includes `lib/**`, so the warnings gate was previously dead for exactly
+  the changes most likely to introduce warnings. The dialyzer PLT cache now
+  actually hits (`:dialyzer` `plt_local_path`/`plt_core_path` point at the
+  `priv/plts` that CI caches; dialyxir was writing under `_build`).
+
+### Tests
+
+- **67 of 268 test cases never compiled.** Five compile-time
+  `if @model_path && File.exists?(@model_path)` gates meant a quarter of the suite
+  rotted invisibly — the `server.ex` decomposition shipped with its 40 tests
+  uncompiled. Those gates are now `:smoke` / `:embeddings` / `:slow` / `:mtp` tags,
+  each naming the one model it needs, and every case compiles.
+- Dead `@tag :skip` + `flunk(...)` placeholders are deleted: `:skip` means the body
+  never runs, so the `flunk` message reached nobody.
+- Whole-body `if capability do` wrappers are gone. The `chat` describe set
+  `has_template: false` and then skipped every assertion *inside a passing test*.
+
 ## v0.8.39
 
 Maintenance release: llama.cpp bump to b10133, on top of b10075 from v0.8.38.

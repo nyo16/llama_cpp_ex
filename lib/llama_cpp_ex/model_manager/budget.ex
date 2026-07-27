@@ -25,6 +25,8 @@ defmodule LlamaCppEx.ModelManager.Budget do
   offload (`0 < n_gpu_layers < n_layers`) is treated coarsely as fully offloaded.
   """
 
+  require Logger
+
   @type limit :: non_neg_integer() | :infinity
   @type placement :: %{ram: non_neg_integer(), vram: %{non_neg_integer() => non_neg_integer()}}
   @type budget ::
@@ -229,18 +231,19 @@ defmodule LlamaCppEx.ModelManager.Budget do
     n_ctx * per_token * n_parallel
   end
 
-  # Best-effort total system memory in bytes, or nil. Shelled out once at budget
-  # resolution; failures fall back to nil.
+  # Best-effort total system memory in bytes, or nil.
+  #
+  # The blanket `rescue _`/`catch _, _` this used to carry swallowed everything,
+  # including a KeyError or a typo'd function name in the branches below. Each
+  # platform branch now handles its own failure mode explicitly, so a real bug
+  # here surfaces as a crash instead of silently degrading the memory budget to
+  # "unknown" — which is the failure mode you would never notice.
   defp system_memory_bytes do
     case :os.type() do
       {:unix, :darwin} -> darwin_memory()
       {:unix, :linux} -> linux_memory()
       _ -> nil
     end
-  rescue
-    _ -> nil
-  catch
-    _, _ -> nil
   end
 
   defp darwin_memory do
@@ -248,6 +251,12 @@ defmodule LlamaCppEx.ModelManager.Budget do
       {out, 0} -> parse_bytes(out)
       _ -> nil
     end
+  rescue
+    # System.cmd/3 raises ErlangError :enoent when the executable is missing —
+    # possible in a stripped container. Nothing else here can raise.
+    e in ErlangError ->
+      Logger.debug("sysctl unavailable: #{Exception.message(e)}")
+      nil
   end
 
   # `sysctl` output should be a plain integer, but parse defensively so unexpected
@@ -260,15 +269,12 @@ defmodule LlamaCppEx.ModelManager.Budget do
   end
 
   defp linux_memory do
-    case File.read("/proc/meminfo") do
-      {:ok, contents} ->
-        case Regex.run(~r/MemTotal:\s+(\d+)\s+kB/, contents) do
-          [_, kb] -> String.to_integer(kb) * 1024
-          _ -> nil
-        end
-
-      _ ->
-        nil
+    with {:ok, contents} <- File.read("/proc/meminfo"),
+         [_, kb] <- Regex.run(~r/MemTotal:\s+(\d+)\s+kB/, contents),
+         {bytes, _rest} <- Integer.parse(kb) do
+      bytes * 1024
+    else
+      _ -> nil
     end
   end
 end

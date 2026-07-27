@@ -48,6 +48,58 @@ defmodule LlamaCppEx.ModelManager.BudgetTest do
       assert p == %{ram: 6_000, vram: %{}}
     end
 
+    test "a partial offload is charged to VRAM in full, like a total offload" do
+      full = Budget.distribute(6_000, [mode: :direct, n_gpu_layers: -1], 1)
+      partial = Budget.distribute(6_000, [mode: :direct, n_gpu_layers: 1], 1)
+
+      # `offloaded? = n_gpu_layers != 0 and n_gpus > 0` collapses every nonzero
+      # layer count onto the same branch, which then charges 100% of the file to
+      # VRAM and nothing to RAM — so a model with one layer on the GPU is
+      # budgeted as if it were entirely resident there. That is an intentional
+      # over-estimate (it refuses loads that would in fact fit, never the
+      # reverse), and only `-1` and `0` were covered before, which left the
+      # accounting structurally uncatchable. Pinned here so making it
+      # proportional is a deliberate change rather than a silent one.
+      assert partial == full
+      assert partial == %{ram: 0, vram: %{0 => 6_000}}
+    end
+
+    test "every nonzero n_gpu_layers offloads; only 0 stays in RAM" do
+      for n <- [-1, 1, 5, 33, 99] do
+        assert Budget.distribute(6_000, [mode: :direct, n_gpu_layers: n], 1) ==
+                 %{ram: 0, vram: %{0 => 6_000}},
+               "n_gpu_layers: #{n} should be treated as offloaded"
+      end
+
+      assert Budget.distribute(6_000, [mode: :direct, n_gpu_layers: 0], 1) ==
+               %{ram: 6_000, vram: %{}}
+    end
+
+    test "a partial offload puts the whole KV cache on the GPU too" do
+      opts = [mode: :server, n_gpu_layers: 2, n_ctx: 1024, n_parallel: 1]
+      p = Budget.distribute(6_000, opts, 1)
+
+      # The KV cache follows :offload_kqv, not the layer count, so a two-layer
+      # offload is charged for all of it.
+      assert p.ram == 0
+      assert p.vram[0] > 6_000
+
+      in_ram = Budget.distribute(6_000, [{:offload_kqv, false} | opts], 1)
+      assert in_ram.vram[0] == 6_000
+      assert in_ram.ram == p.vram[0] - 6_000
+    end
+
+    test "a partial offload splits across GPUs by tensor_split, not by layer count" do
+      p =
+        Budget.distribute(
+          8_000,
+          [mode: :direct, n_gpu_layers: 3, split_mode: :layer, tensor_split: [1, 3]],
+          2
+        )
+
+      assert p == %{ram: 0, vram: %{0 => 2_000, 1 => 6_000}}
+    end
+
     test "no GPUs detected falls back to RAM" do
       p = Budget.distribute(6_000, [mode: :direct, n_gpu_layers: -1], 0)
       assert p == %{ram: 6_000, vram: %{}}

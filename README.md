@@ -44,25 +44,58 @@ end
 
 ### Prerequisites
 
-- C++17 compiler (GCC, Clang, or MSVC)
-- CMake 3.14+
-- Git (for the llama.cpp submodule)
+Elixir `~> 1.18`, enforced by `mix.exs`. The Erlang/OTP floor depends on how the
+NIF is obtained:
+
+Precompiled NIFs are published for `aarch64-apple-darwin` (Metal) and
+`x86_64-linux-gnu` (CPU) at NIF versions 2.17 and 2.18 — that is **Erlang/OTP 26
+or newer** (OTP 26, 27 and 28 report NIF 2.17; OTP 29 reports 2.18). On those
+platforms `mix deps.get` and `mix compile` download a binary and none of the
+build tooling below is needed.
+
+Everything else builds from source: OTP 25 (NIF 2.16), other architectures,
+musl, Windows, and every GPU backend except Metal. A source build needs
+
+- a C++17 compiler (GCC, Clang, or MSVC),
+- CMake 3.14+,
+- Git — the Hex package ships `.gitmodules` rather than the llama.cpp tree, so
+  the Makefile clones the pinned commit on demand.
 
 ### Backend Selection
 
+What the published artifacts actually contain is Metal on Apple Silicon and
+plain CPU on Linux. **There is no CUDA or Vulkan artifact**, and a downloaded
+artifact never runs the Makefile, so nothing is auto-detected at install time.
+GPU acceleration beyond Metal always means an explicit source build:
+
 ```bash
-mix compile                        # Auto-detect (Metal on macOS, CUDA if nvcc found, else CPU)
+mix compile                        # Precompiled artifact when one matches this
+                                   # OS/arch/NIF version, else a source build
 LLAMA_BACKEND=metal mix compile    # Apple Silicon GPU
-LLAMA_BACKEND=cuda mix compile     # NVIDIA GPU
-LLAMA_BACKEND=vulkan mix compile   # Vulkan
+LLAMA_BACKEND=cuda mix compile     # NVIDIA GPU, needs the CUDA toolkit
+LLAMA_BACKEND=vulkan mix compile   # Vulkan, needs the Vulkan SDK
 LLAMA_BACKEND=cpu mix compile      # CPU only
 ```
+
+Setting `LLAMA_BACKEND` to anything forces a source build and bypasses the
+precompiled artifact — that is how a CUDA or Vulkan build is obtained. When a
+source build runs with `LLAMA_BACKEND` unset it picks Metal on macOS, CUDA if
+`nvcc` is on `PATH`, and CPU otherwise.
 
 Power users can pass arbitrary CMake flags:
 
 ```bash
 LLAMA_CMAKE_ARGS="-DGGML_CUDA_FORCE_CUBLAS=ON" mix compile
 ```
+
+Two more build variables:
+
+- `LLAMA_PORTABLE=1` drops `-march=native`. ggml turns it on by default, which
+  tunes the binary to the exact CPU it was built on; the release workflow sets
+  this so published artifacts run on every machine of that architecture. Leave
+  it unset locally, where the native flags are free performance.
+- `LLAMA_COMMIT=<sha>` overrides the pinned llama.cpp commit used when
+  `vendor/llama.cpp` has to be cloned.
 
 ## Quick Start
 
@@ -105,7 +138,7 @@ model
 Download GGUF models directly from HuggingFace Hub. Requires the optional `:req` dependency:
 
 ```elixir
-{:req, "~> 0.5"}
+{:req, "~> 0.5 or ~> 0.6"}
 ```
 
 ```elixir
