@@ -33,7 +33,11 @@ defmodule LlamaCppEx.Server.Slots do
   Session affinity: the slot that served this session last, if it is idle.
 
   Overrides the similarity rule — the session's cache lives there. Takes the
-  server's `sessions` map (session => seq_id) rather than the whole state.
+  server's `sessions` map (key => seq_id) rather than the whole state.
+
+  The key is opaque here. `LlamaCppEx.Server` supplies `{cache_scope, session}`
+  rather than the bare session id, because affinity that routed on the session
+  alone let a guessed id steal another scope's slot and evict its cache.
   """
   def session_slot_if_idle(_sessions, nil, _idle_slots), do: nil
 

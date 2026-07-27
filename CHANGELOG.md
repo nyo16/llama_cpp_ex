@@ -56,6 +56,38 @@ facade's streams emit errors instead of truncating silently.
 - **Test env vars renamed** to one family: `LLAMA_SMOKE_GEN_MODEL`,
   `LLAMA_SMOKE_EMB_MODEL`, `LLAMA_SMOKE_MTP_MODEL`. The old
   `LLAMA_MODEL_PATH` / `LLAMA_EMBEDDING_MODEL_PATH` / `LLAMA_MTP_MODEL_PATH` are gone.
+- **`LlamaCppEx.Hub` caches under `<repo_id>/<revision>/<filename>`.** `revision`
+  was absent from the cache key, so pinning `revision: "<sha>"` returned the
+  cached `main` copy once `main` had been fetched — the pin bought nothing, and
+  said nothing about it. **Migration:** existing caches are laid out without the
+  revision component and will be treated as misses, so the next `download/3` for
+  each file re-downloads once. Delete the old tree or leave it; nothing reads it.
+- **A download whose file has no published SHA-256 now fails.** `:verify_checksum`
+  takes `true` (default, fail closed), `:best_effort` (warn and proceed when
+  HuggingFace publishes no digest), or `false` (skip the check and the metadata
+  request). Verification used to fall back to a warning whenever
+  `siblings[].lfs.sha256` was absent, which made it downgradable by the *metadata*
+  response: a MITM with a trusted cert — or the TLS-terminating corporate proxy
+  this module explicitly supports — strips one JSON key and the bytes are cached
+  unverified. Any other value for `:verify_checksum` is now rejected rather than
+  treated as truthy.
+- **`LlamaCppEx.Server.stream/3` and `stream_tokens/3` emit `{:error, :timeout}`**
+  on a per-token timeout instead of truncating silently, and cancel the request
+  server-side. They were the last two streams in the library that ended a failed
+  generation indistinguishably from a successful one, contradicting their own
+  `@doc`.
+- **The undocumented-but-documented `:template` option is gone.** `chat/3` and
+  `chat_completion/3` advertised "Custom chat template string" and accepted the
+  key; nothing ever read it — `Chat.apply_template/3` goes through
+  `chat_apply_template_jinja`, which uses the model's embedded template. Passing
+  it now raises an unknown-option `ArgumentError` instead of being ignored.
+- **`LlamaCppEx.Server` request options are validated on the streaming path too,
+  and the server-routed facade rejects start-time options.**
+  `chat_completion/3`/`stream_chat_completion/3` against a server used to accept
+  `:n_ctx` and every `Context.tuning_option_keys()` entry — 21 keys a running
+  server cannot honour — and then raised an `ArgumentError` naming
+  `LlamaCppEx.Server.complete_tokens/3`, a function the caller never called. They
+  are now rejected up front, naming the function the caller did call.
 
 ### Security
 
@@ -132,6 +164,28 @@ facade's streams emit errors instead of truncating silently.
 - **`ErlNifEnv` and `llama_batch` leaks** in the three streaming NIFs are fixed
   with RAII guards, so a C++ exception unwinding out of a generation loop no
   longer leaks.
+- **Session affinity is keyed by `{cache_scope, session}`, not by `:session`
+  alone.** `:session` was a global keyspace: affinity routed on the session id
+  while only prefix *reuse* checked `:cache_scope`, so a guessed session id let one
+  scope claim the slot another scope was using and evict its prefix cache. A
+  denial of service rather than a KV leak — the scope check still cleared the KV on
+  mismatch — closed while the feature is new.
+- **A failed write during a download is reported, and Req's retry can no longer
+  append a second response body.** `IO.binwrite/2` does not return
+  `{:error, reason}`; it calls `:erlang.error(reason)`, so a full disk raised
+  `:enospc` out of Req's streaming callback and past `download/3` into the caller's
+  crash report — with the request options, `:token` included, in the stacktrace.
+  The write now goes through `:file.write/2` and a failure becomes
+  `{:error, reason}` with nothing left in the cache. Separately, Req's retry
+  re-runs the request with the same `into:` closure over the still-open device
+  (`req/lib/req/steps.ex:2315`), so a transient 503 *appended* a second body rather
+  than restarting the file — a corrupt GGUF with a plausible size and a valid ETag.
+  Retry is off for this request; a failed download is the caller's to repeat.
+- **A broken GPU backend no longer reports as "no GPUs".**
+  `ModelManager`'s device enumeration rescued all of `ErlangError`, which covers
+  both "the NIF is not loaded" and "the backend call failed", so a genuine failure
+  silently turned every VRAM budget into a RAM budget. Only `:not_loaded` degrades
+  now; anything else propagates with its original stacktrace.
 
 ### Fixed
 
@@ -191,6 +245,53 @@ facade's streams emit errors instead of truncating silently.
   `{:error, {:not_ready, :error}}` forever with no documented way out. The log line
   now names the recovery: `unload/1` then `load/3`.
 - **`req` is no longer pinned away from 0.6.x** — `"~> 0.5 or ~> 0.6"`.
+- **A caller-supplied `:grammar` can no longer crash a `LlamaCppEx.Server`.**
+  `Sampler.create/2` gained `{:error, :invalid_grammar}` but one of its four call
+  sites — `init_slot/4`, inside the GenServer that owns the model — still
+  hard-matched `{:ok, sampler}`. Because backing servers run `restart: :temporary`,
+  a single bad grammar killed the server permanently. A new validate-only
+  `grammar_validate` NIF checks the grammar at the admission boundary, so every
+  public entry point returns `{:error, :invalid_grammar}` synchronously and the
+  request never reaches a slot; `init_slot/4` keeps a `case` as depth-2 defence
+  that fails the request rather than the server.
+- **`MTP.stream_events/3` no longer returns an infinite stream on setup failure.**
+  The failure was signalled by *adding* a `:setup_error` key instead of flipping
+  the discriminant the clauses dispatch on, so the halt clause never matched and
+  `generate/3`'s `Enum.to_list/1` hung with a growing heap. Reachable from
+  `grammar: "not gbnf"` or any tokenization failure.
+- **A timed-out server-routed `stream_chat_completion/3` cancels its request.**
+  The after-function decided by `phase != :done`, and the timeout path set
+  `phase: :done`, so the slot stayed occupied and the model decoded to
+  `max_tokens` for a consumer that had gone — the leak `stop_generator/3` prevents
+  on the model-routed path, reintroduced on the server path.
+- **`Generator.stop/1` no longer leaves a stray `{:EXIT, pid, :normal}`.**
+  `Process.unlink/1` does not remove an exit signal already in the mailbox, and
+  the runner exits normally the instant the NIF returns. A trapping consumer got
+  noise; one using the `{:stop, reason, state}` shape — which `LlamaCppEx.Server`
+  itself does — shut down silently. Reproduced 200/200 before the fix, 0/200 after.
+- **`Server.fetch_model/1` and the streaming admission calls turn every exit into
+  a value.** `fetch_model/1` caught `:noproc`, `:normal` and `:timeout`, so
+  `handle_continue/2`'s `{:stop, {:load_failed, reason}, state}` — plus
+  `{:shutdown, _}` and `:killed` — exited the caller from inside both
+  `Stream.resource` start-functions, past a `@spec` that promised a total
+  function. Both admission calls are also bounded by the caller's `:timeout` now
+  rather than `GenServer.call/2`'s implicit 5000 ms.
+- **`memory_seq_rm` returning `false` is handled instead of hard-matched.**
+  `llama_memory_recurrent::seq_rm` refuses a partial rollback deeper than
+  `n_rs_seq` and returns `false`; the Elixir guard covered only `seq_rm_kind ==
+  :full`, so on an `:rs` context `true = ...` was a `MatchError` inside the
+  server's tick. Both call sites now fall back to a full clear and log.
+- **`ModelManager.load/3` forwards only what each destination reads.** The
+  `Keyword.drop/2` denylist let `:vocab_only` through to `Server.start_link/1`,
+  which rejects it — while `load/3` documents accepting "any `Model.load/2` or
+  `Server.start_link/1` options". Two allowlists now route it, with one gate on
+  their union so a typo like `n_paralell` still fails loudly instead of silently
+  running the default `:n_parallel`.
+- **A NIF failure inside `PromptCache.save/4` is logged rather than being
+  indistinguishable from "the prefix was too short".** Four of the five `with`
+  clauses are policy decisions and stay silent; the `{:error, reason}` clause is
+  split out. The symmetric operation already disagreed — `apply_ram_restore/4`
+  logs on restore failure.
 
 ### Performance
 

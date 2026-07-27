@@ -8,16 +8,49 @@ defmodule LlamaCppEx.HubTest do
     @tag :tmp_dir
     test "builds correct directory structure", %{tmp_dir: tmp_dir} do
       path = Hub.cache_path("Qwen/Qwen3-4B-GGUF", "model.gguf", cache_dir: tmp_dir)
-      assert path == Path.join([tmp_dir, "Qwen", "Qwen3-4B-GGUF", "model.gguf"])
+      assert path == Path.join([tmp_dir, "Qwen", "Qwen3-4B-GGUF", "main", "model.gguf"])
     end
 
     @tag :tmp_dir
     test "uses LLAMA_CACHE_DIR env var", %{tmp_dir: tmp_dir} do
       System.put_env("LLAMA_CACHE_DIR", tmp_dir)
       path = Hub.cache_path("org/model", "file.gguf")
-      assert path == Path.join([tmp_dir, "org", "model", "file.gguf"])
+      assert path == Path.join([tmp_dir, "org", "model", "main", "file.gguf"])
     after
       System.delete_env("LLAMA_CACHE_DIR")
+    end
+
+    # W-17: `revision` was absent from the cache key, so pinning
+    # `revision: "<sha>"` returned whatever had been cached for `main` and the pin
+    # bought nothing — silently, which is the whole problem with a pin that does
+    # not pin.
+    @tag :tmp_dir
+    test "two revisions of the same file cache separately", %{tmp_dir: tmp_dir} do
+      main = Hub.cache_path("org/model", "model.gguf", cache_dir: tmp_dir)
+      pinned = Hub.cache_path("org/model", "model.gguf", cache_dir: tmp_dir, revision: "abc123")
+
+      assert main != pinned
+      assert main == Path.join([tmp_dir, "org", "model", "main", "model.gguf"])
+      assert pinned == Path.join([tmp_dir, "org", "model", "abc123", "model.gguf"])
+    end
+
+    @tag :tmp_dir
+    test "an explicit revision: \"main\" is the same path as the default", %{tmp_dir: tmp_dir} do
+      assert Hub.cache_path("org/model", "f.gguf", cache_dir: tmp_dir) ==
+               Hub.cache_path("org/model", "f.gguf", cache_dir: tmp_dir, revision: "main")
+    end
+
+    # The revision is a caller-supplied path component now, so it gets the same
+    # traversal validation as the repo id and the filename.
+    @tag :tmp_dir
+    test "a traversing revision is refused", %{tmp_dir: tmp_dir} do
+      assert_raise ArgumentError, ~r/invalid revision.*path components/s, fn ->
+        Hub.cache_path("org/model", "model.gguf", cache_dir: tmp_dir, revision: "../../../etc")
+      end
+
+      assert_raise ArgumentError, ~r/invalid revision.*relative path/s, fn ->
+        Hub.cache_path("org/model", "model.gguf", cache_dir: tmp_dir, revision: "/etc")
+      end
     end
   end
 
@@ -274,7 +307,7 @@ defmodule LlamaCppEx.HubTest do
                  http_client: hub_stub(sha256(body), body)
                )
 
-      assert path == Path.join([tmp_dir, "org", "model", "model.gguf"])
+      assert path == Path.join([tmp_dir, "org", "model", "main", "model.gguf"])
       assert File.read!(path) == body
       assert File.read!(path <> ".etag") == ~s("stub-etag")
       assert leftover_parts(path) == []
@@ -296,7 +329,7 @@ defmodule LlamaCppEx.HubTest do
       assert message =~ expected
       assert message =~ sha256(body)
 
-      dest = Path.join([tmp_dir, "org", "model", "model.gguf"])
+      dest = Path.join([tmp_dir, "org", "model", "main", "model.gguf"])
       refute File.exists?(dest)
       assert leftover_parts(dest) == []
     end
@@ -310,7 +343,7 @@ defmodule LlamaCppEx.HubTest do
 
       assert message =~ "cannot verify org/model/model.gguf"
       assert message =~ "verify_checksum: false"
-      refute File.exists?(Path.join([tmp_dir, "org", "model", "model.gguf"]))
+      refute File.exists?(Path.join([tmp_dir, "org", "model", "main", "model.gguf"]))
     end
 
     @tag :tmp_dir
@@ -323,8 +356,34 @@ defmodule LlamaCppEx.HubTest do
       assert message =~ "file not found in org/model@main: model.gguf"
     end
 
+    # The downgrade this closes: `sibling_sha256/5` fell through to `{:ok, nil}`
+    # and `verify_integrity/3` turned `nil` into a warning and `:ok`, so
+    # verification was downgradable by the *metadata* response — strip one JSON
+    # key and the bytes are cached unverified. A MITM with a trusted cert, or the
+    # TLS-terminating corporate proxy this module explicitly supports, can do that.
     @tag :tmp_dir
-    test "a non-LFS file with no published digest warns and proceeds", %{tmp_dir: tmp_dir} do
+    test "a file with no published digest is refused by default", %{tmp_dir: tmp_dir} do
+      body = "small gguf"
+
+      assert {:error, message} =
+               Hub.download("org/model", "model.gguf",
+                 cache_dir: tmp_dir,
+                 http_client: hub_stub(nil, body)
+               )
+
+      assert message =~ "publishes no SHA-256"
+      # And it names both escape hatches, so the error is actionable.
+      assert message =~ "verify_checksum: :best_effort"
+      assert message =~ "verify_checksum: false"
+
+      # Nothing was cached, and no temp file survived.
+      dest = Path.join([tmp_dir, "org", "model", "main", "model.gguf"])
+      refute File.exists?(dest)
+      assert leftover_parts(dest) == []
+    end
+
+    @tag :tmp_dir
+    test "verify_checksum: :best_effort warns and proceeds", %{tmp_dir: tmp_dir} do
       body = "small gguf"
 
       log =
@@ -332,6 +391,7 @@ defmodule LlamaCppEx.HubTest do
           assert {:ok, path} =
                    Hub.download("org/model", "model.gguf",
                      cache_dir: tmp_dir,
+                     verify_checksum: :best_effort,
                      http_client: hub_stub(nil, body)
                    )
 
@@ -339,6 +399,41 @@ defmodule LlamaCppEx.HubTest do
         end)
 
       assert log =~ "publishes no SHA-256"
+      assert log =~ ":best_effort"
+    end
+
+    @tag :tmp_dir
+    test ":best_effort still verifies when a digest IS published", %{tmp_dir: tmp_dir} do
+      body = "gguf bytes"
+
+      assert {:error, message} =
+               Hub.download("org/model", "model.gguf",
+                 cache_dir: tmp_dir,
+                 verify_checksum: :best_effort,
+                 http_client: hub_stub(String.duplicate("a", 64), body)
+               )
+
+      assert message =~ "checksum mismatch"
+    end
+
+    @tag :tmp_dir
+    test "an unrecognised :verify_checksum value is rejected, not treated as truthy", %{
+      tmp_dir: tmp_dir
+    } do
+      # `if Keyword.get(opts, :verify_checksum, true)` used to accept anything
+      # truthy, so a typo like `verify_checksum: :yes` silently meant "verify" and
+      # `verify_checksum: nil` silently meant "do not".
+      for value <- [:yes, :required, "true", 1, nil] do
+        assert {:error, message} =
+                 Hub.download("org/model", "model.gguf",
+                   cache_dir: tmp_dir,
+                   verify_checksum: value,
+                   http_client: no_network()
+                 ),
+               "verify_checksum: #{inspect(value)} should be rejected"
+
+        assert message =~ "invalid :verify_checksum"
+      end
     end
 
     @tag :tmp_dir
@@ -367,7 +462,7 @@ defmodule LlamaCppEx.HubTest do
     @tag capture_log: true
     test "the temp file is created exclusively before any body arrives", %{tmp_dir: tmp_dir} do
       body = "gguf bytes"
-      dest = Path.join([tmp_dir, "org", "model", "model.gguf"])
+      dest = Path.join([tmp_dir, "org", "model", "main", "model.gguf"])
       test_pid = self()
 
       # Runs while the request is in flight, i.e. after `File.open/2` and before
@@ -410,7 +505,7 @@ defmodule LlamaCppEx.HubTest do
       victim = Path.join(tmp_dir, "victim")
       File.write!(victim, "untouched")
       body = "gguf bytes"
-      dest = Path.join([tmp_dir, "org", "model", "model.gguf"])
+      dest = Path.join([tmp_dir, "org", "model", "main", "model.gguf"])
 
       # Even an attacker who wins the race *after* the exclusive open cannot get
       # bytes into the victim: the device is already bound to the original
@@ -438,7 +533,7 @@ defmodule LlamaCppEx.HubTest do
     @tag capture_log: true
     test "the temp target is unpredictable and lands beside the destination", %{tmp_dir: tmp_dir} do
       body = "gguf bytes"
-      dest = Path.join([tmp_dir, "org", "model", "model.gguf"])
+      dest = Path.join([tmp_dir, "org", "model", "main", "model.gguf"])
       test_pid = self()
 
       record = fn -> send(test_pid, {:tmp, hd(leftover_parts(dest))}) end
@@ -476,7 +571,7 @@ defmodule LlamaCppEx.HubTest do
     @tag :tmp_dir
     @tag capture_log: true
     test "a non-200 body is never written to the temp file", %{tmp_dir: tmp_dir} do
-      dest = Path.join([tmp_dir, "org", "model", "model.gguf"])
+      dest = Path.join([tmp_dir, "org", "model", "main", "model.gguf"])
       test_pid = self()
 
       # A function `into:` is driven for every status, so without hub.ex's
@@ -520,13 +615,14 @@ defmodule LlamaCppEx.HubTest do
       assert mode(cache_dir) == 0o700
       assert mode(Path.join(cache_dir, "org")) == 0o700
       assert mode(Path.join([cache_dir, "org", "model"])) == 0o700
+      assert mode(Path.join([cache_dir, "org", "model", "main"])) == 0o700
     end
   end
 
   describe "download/3 caching" do
     @tag :tmp_dir
     test "a cached file is returned with no HTTP request at all", %{tmp_dir: tmp_dir} do
-      repo_dir = Path.join([tmp_dir, "test-org", "test-model"])
+      repo_dir = Path.join([tmp_dir, "test-org", "test-model", "main"])
       File.mkdir_p!(repo_dir)
       cached_path = Path.join(repo_dir, "model.gguf")
       File.write!(cached_path, "fake model data")
@@ -547,7 +643,7 @@ defmodule LlamaCppEx.HubTest do
     # this test flips to asserting the refresh.
     @tag :tmp_dir
     test "a stale cached file is not revalidated against the Hub", %{tmp_dir: tmp_dir} do
-      repo_dir = Path.join([tmp_dir, "org", "model"])
+      repo_dir = Path.join([tmp_dir, "org", "model", "main"])
       File.mkdir_p!(repo_dir)
       cached = Path.join(repo_dir, "model.gguf")
       File.write!(cached, "stale bytes")
@@ -568,7 +664,7 @@ defmodule LlamaCppEx.HubTest do
     @tag :tmp_dir
     @tag capture_log: true
     test "force: true re-downloads over a cached file", %{tmp_dir: tmp_dir} do
-      repo_dir = Path.join([tmp_dir, "org", "model"])
+      repo_dir = Path.join([tmp_dir, "org", "model", "main"])
       File.mkdir_p!(repo_dir)
       cached = Path.join(repo_dir, "model.gguf")
       File.write!(cached, "stale bytes")
@@ -589,7 +685,7 @@ defmodule LlamaCppEx.HubTest do
     @tag :tmp_dir
     test "offline mode returns cached file", %{tmp_dir: tmp_dir} do
       System.put_env("LLAMA_OFFLINE", "1")
-      repo_dir = Path.join([tmp_dir, "org", "model"])
+      repo_dir = Path.join([tmp_dir, "org", "model", "main"])
       File.mkdir_p!(repo_dir)
       path = Path.join(repo_dir, "cached.gguf")
       File.write!(path, "cached")

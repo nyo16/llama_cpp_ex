@@ -114,6 +114,39 @@ defmodule LlamaCppEx.ServerTest do
     end
   end
 
+  # W-19. `:session` was a *global* keyspace: affinity routed on the session id
+  # while only prefix *reuse* checked `:cache_scope`, so a guessed session id let
+  # one scope claim the slot another scope was using and evict its prefix cache.
+  # A DoS rather than a KV leak — the scope check still cleared the KV on mismatch
+  # — but worth closing while the feature is new.
+  #
+  # `Slots.session_slot_if_idle/3` is agnostic about the key; the fix is that
+  # `LlamaCppEx.Server` builds `{cache_scope, session}`. These pin the property
+  # from the map's side, which is what the server's callers observe.
+  describe "session affinity is keyed by {cache_scope, session}" do
+    test "the same session id under two scopes does not share a slot" do
+      sessions = %{{"tenant-a", "conv-1"} => 1}
+      idle = [idle_slot(0), idle_slot(1)]
+
+      assert Slots.session_slot_if_idle(sessions, {"tenant-a", "conv-1"}, idle) == 1
+
+      # Tenant B guesses the id. Under a bare-session key this returned 1 and
+      # evicted tenant A's cache.
+      assert Slots.session_slot_if_idle(sessions, {"tenant-b", "conv-1"}, idle) == nil
+
+      # And the default (nil) scope is a keyspace of its own, not a wildcard.
+      assert Slots.session_slot_if_idle(sessions, {nil, "conv-1"}, idle) == nil
+    end
+
+    test "an unscoped session keeps its own affinity" do
+      sessions = %{{nil, "conv-1"} => 1}
+      idle = [idle_slot(0), idle_slot(1)]
+
+      assert Slots.session_slot_if_idle(sessions, {nil, "conv-1"}, idle) == 1
+      assert Slots.session_slot_if_idle(sessions, {"tenant-a", "conv-1"}, idle) == nil
+    end
+  end
+
   describe "donor_prefix_match/2 (only fed tokens count)" do
     test "idle donor matches against its cached tokens" do
       slot = TestSlots.slot(idle_slot(0, cached_tokens: [1, 2, 3, 4]))

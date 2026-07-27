@@ -36,6 +36,8 @@ defmodule LlamaCppEx.Server.PromptCache do
   # perf audit found elsewhere. `scope` is the `:cache_scope` of the request that
   # produced the entry — see `covers?/4`.
 
+  require Logger
+
   alias LlamaCppEx.Server.Slots
 
   # Evicted caches below this many tokens are not worth a KV-sized state copy.
@@ -134,7 +136,22 @@ defmodule LlamaCppEx.Server.PromptCache do
       {cache, evicted} = evict_to_budget(cache)
       {cache, entry, evicted}
     else
-      _ -> {cache, nil, []}
+      # A NIF failure and "the caller declined the save" used to be the same
+      # `_ -> {cache, nil, []}`. Four of the five clauses above are policy
+      # decisions and are correctly silent; this one is not. The operator symptom
+      # was "the RAM prompt cache mysteriously never populates" with no way to
+      # tell it from a normal decline, and the symmetric operation already
+      # disagreed — `Server.apply_ram_restore/4` logs on restore failure.
+      {:error, reason} ->
+        Logger.warning(
+          "LlamaCppEx.Server.PromptCache: state_seq_get_data failed for seq #{seq_id} " <>
+            "(#{inspect(reason)}); this slot's KV was not saved to the RAM prompt cache"
+        )
+
+        {cache, nil, []}
+
+      _declined ->
+        {cache, nil, []}
     end
   end
 

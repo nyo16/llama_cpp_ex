@@ -150,10 +150,13 @@ defmodule LlamaCppEx.Hub do
   An already-cached file is returned immediately, without contacting the Hub.
   There is no upstream revalidation — the ETag written to the `<file>.etag`
   sidecar is never read back — so pass `force: true` to refresh a cached file.
+  The cache key includes `:revision`, so two revisions of the same file cache
+  separately.
 
   A fresh download is streamed into a randomly named temporary file opened with
   `O_EXCL`, verified against the SHA-256 HuggingFace publishes for the file, and
-  only then renamed into place with mode `0o600`.
+  only then renamed into place with mode `0o600`. A missing published digest is a
+  failure, not a warning — see `:verify_checksum`.
 
   > #### Integrity is not authenticity {: .warning}
   >
@@ -168,14 +171,19 @@ defmodule LlamaCppEx.Hub do
       or the `LLAMA_CACHE_DIR` environment variable.
     * `:token` - HuggingFace API token. Defaults to `HF_TOKEN` environment variable.
     * `:revision` - Git revision (branch, tag, or commit). Defaults to `"main"`.
+      Part of the cache key.
     * `:force` - Force re-download even if cached. Defaults to `false`.
-    * `:verify_checksum` - Verify the download against the SHA-256 published by
-      HuggingFace. Defaults to `true`. Setting it to `false` also skips the
-      metadata request, and is logged as a warning.
+    * `:verify_checksum` - Integrity policy. Defaults to `true`.
+      * `true` — fail closed. The download is checked against the SHA-256
+        HuggingFace publishes, and a file the Hub lists *without* one is refused.
+        Verification used to be downgradable by the metadata response itself: it
+        fell back to a warning when `siblings[].lfs.sha256` was absent, so
+        stripping one JSON key was enough to have the bytes cached unverified.
+      * `:best_effort` — warn and proceed when the Hub publishes no digest. For
+        the rare non-LFS blob that is genuinely small enough to have none.
+      * `false` — skip the check and the metadata request entirely. Logged as a
+        warning.
     * `:proxy`, `:no_proxy` - Proxy overrides. See the "Proxies" section above.
-
-  An unsafe `repo_id` or `filename` — one that would escape the cache directory —
-  returns `{:error, reason}` rather than raising. See `cache_path/3`.
   """
   @spec download(String.t(), String.t(), keyword()) :: {:ok, String.t()} | {:error, String.t()}
   def download(repo_id, filename, opts \\ []) do
@@ -382,11 +390,15 @@ defmodule LlamaCppEx.Hub do
   @doc """
   Build the local cache path for a model file.
 
-  `repo_id` and `filename` become path components beneath the cache directory,
-  so both are validated first: a component that is absolute, empty, `"."`,
-  `".."`, `~`-prefixed, or contains a null byte would escape the cache and is
-  rejected with an `ArgumentError`. `download/3` performs the same validation but
-  surfaces it as `{:error, reason}`.
+  The path is `<cache_dir>/<repo_id>/<revision>/<filename>`. `revision` is part of
+  the key because otherwise pinning `revision: "<sha>"` returned whatever had been
+  cached for `main` — the pin bought nothing, silently. It defaults to `"main"`.
+
+  All three components are caller-supplied and become path components, so each is
+  validated first: one that is absolute, empty, `"."`, `".."`, `~`-prefixed, or
+  contains a null byte would escape the cache and is rejected with an
+  `ArgumentError`. `download/3` performs the same validation but surfaces it as
+  `{:error, reason}`.
   """
   @spec cache_path(String.t(), String.t(), keyword()) :: String.t()
   def cache_path(repo_id, filename, opts \\ []) do
@@ -406,9 +418,12 @@ defmodule LlamaCppEx.Hub do
         System.get_env("LLAMA_CACHE_DIR") ||
         @default_cache_dir
 
+    revision = Keyword.get(opts, :revision, "main")
+
     with :ok <- validate_path_fragment(repo_id, "repository id"),
+         :ok <- validate_path_fragment(revision, "revision"),
          :ok <- validate_path_fragment(filename, "filename") do
-      {:ok, Path.join([cache_dir, repo_id, filename])}
+      {:ok, Path.join([cache_dir, repo_id, revision, filename])}
     end
   end
 
@@ -578,31 +593,46 @@ defmodule LlamaCppEx.Hub do
 
   # --- Integrity ---
 
-  # Resolves the SHA-256 HuggingFace publishes for the file. `:unverified` means
-  # the caller opted out; `nil` means the repo lists the file but publishes no
-  # digest for it (a small, non-LFS blob), so there is nothing to compare against.
+  # Resolves the SHA-256 HuggingFace publishes for the file, or `:unverified` when
+  # the caller has deliberately opted out.
+  #
+  # There is no longer a "the metadata did not mention a digest, so proceed"
+  # outcome. `sibling_sha256/5` fell through to `{:ok, nil}` and
+  # `verify_integrity/3` turned `nil` into a warning and `:ok`, which made
+  # verification downgradable *by the metadata response*: a party who can shape it
+  # — a MITM with a trusted cert, or the TLS-terminating corporate proxy this
+  # module explicitly supports — strips one JSON key and the bytes are cached
+  # unverified. Every GGUF large enough to matter is LFS-backed, so a missing
+  # digest is now an error naming its own escape hatch.
   defp expected_sha256(repo_id, filename, opts) do
-    if Keyword.get(opts, :verify_checksum, true) do
-      fetch_expected_sha256(repo_id, filename, opts)
-    else
-      Logger.warning(
-        "integrity verification disabled for #{repo_id}/#{filename} — the downloaded " <>
-          "bytes will not be checked against HuggingFace's SHA-256"
-      )
+    case Keyword.get(opts, :verify_checksum, true) do
+      false ->
+        Logger.warning(
+          "integrity verification disabled for #{repo_id}/#{filename} — the downloaded " <>
+            "bytes will not be checked against HuggingFace's SHA-256"
+        )
 
-      {:ok, :unverified}
+        {:ok, :unverified}
+
+      mode when mode in [true, :best_effort] ->
+        fetch_expected_sha256(repo_id, filename, opts, mode)
+
+      other ->
+        {:error,
+         "invalid :verify_checksum #{inspect(other)}: expected true (fail closed), " <>
+           ":best_effort (warn when the Hub publishes no digest), or false (skip)"}
     end
   end
 
   # `siblings[].lfs.sha256` from the revision API is the file's real SHA-256 (the
   # same value the resolve URL returns as `x-linked-etag`); the plain `etag` on
   # the download response is the CDN's, which is a different hash entirely.
-  defp fetch_expected_sha256(repo_id, filename, opts) do
+  defp fetch_expected_sha256(repo_id, filename, opts, mode) do
     revision = Keyword.get(opts, :revision, "main")
 
     case hf_get("#{@hf_api_url}/#{repo_id}/revision/#{revision}", opts, params: [blobs: true]) do
       {:ok, %{status: 200, body: %{"siblings" => siblings}}} when is_list(siblings) ->
-        sibling_sha256(siblings, repo_id, filename, revision)
+        sibling_sha256(siblings, repo_id, filename, revision, mode)
 
       other ->
         {:error, reason} = hf_api_error(other, repo_id)
@@ -613,24 +643,35 @@ defmodule LlamaCppEx.Hub do
     end
   end
 
-  defp sibling_sha256(siblings, repo_id, filename, revision) do
+  defp sibling_sha256(siblings, repo_id, filename, revision, mode) do
     case Enum.find(siblings, &(&1["rfilename"] == filename)) do
-      nil -> {:error, "file not found in #{repo_id}@#{revision}: #{filename}"}
-      %{"lfs" => %{"sha256" => sha}} when is_binary(sha) -> {:ok, String.downcase(sha)}
-      %{} -> {:ok, nil}
+      nil ->
+        {:error, "file not found in #{repo_id}@#{revision}: #{filename}"}
+
+      %{"lfs" => %{"sha256" => sha}} when is_binary(sha) ->
+        {:ok, String.downcase(sha)}
+
+      %{} when mode == :best_effort ->
+        Logger.warning(
+          "#{repo_id}/#{filename}@#{revision} is not LFS-backed and HuggingFace publishes " <>
+            "no SHA-256 for it; proceeding unverified because verify_checksum: :best_effort"
+        )
+
+        {:ok, :unverified}
+
+      %{} ->
+        {:error,
+         "#{repo_id}/#{filename}@#{revision} is listed but HuggingFace publishes no " <>
+           "SHA-256 for it, so the download cannot be integrity-checked. Every GGUF " <>
+           "large enough to matter is LFS-backed, so this usually means the metadata " <>
+           "response was not what it claimed. Pass `verify_checksum: :best_effort` to " <>
+           "warn and proceed, or `verify_checksum: false` to skip the check entirely"}
     end
   end
 
+  # No `nil` clause: a missing digest is refused in sibling_sha256/5 rather than
+  # downgraded here. That clause was the downgrade path.
   defp verify_integrity(_path, :unverified, _label), do: :ok
-
-  defp verify_integrity(_path, nil, label) do
-    Logger.warning(
-      "#{label} is not LFS-backed and HuggingFace publishes no SHA-256 for it; the " <>
-        "downloaded bytes could not be integrity-checked"
-    )
-
-    :ok
-  end
 
   defp verify_integrity(path, expected, label) do
     actual = sha256_file(path)
@@ -770,12 +811,22 @@ defmodule LlamaCppEx.Hub do
       [
         headers: auth_headers(opts),
         max_redirects: 10,
+        # Req's retry re-runs the request with this same `into:` closure, which
+        # still holds `device` positioned at the end of whatever the failed attempt
+        # already wrote (`deps/req/lib/req/steps.ex:2315` calls `run_request/1` on
+        # the unhalted request). A transient 503 or a dropped connection therefore
+        # *appended a second response body* instead of restarting the file — a
+        # corrupt GGUF with a plausible size and a valid ETag. There is no hook
+        # that runs before a retry with access to the device, so retry is off here
+        # and a failed download is the caller's to repeat: `download/3` deletes the
+        # temp file and returns an error, so a repeat starts clean.
+        retry: false,
         # Unlike the Collectable form, a function `into:` is invoked for every
         # status, so the body of a 404 or a gated-model 403 would otherwise land
         # in the temp file. Only 200 bodies are written; the caller deletes the
         # temp file on any error either way.
         into: fn {:data, data}, {req, resp} ->
-          if resp.status == 200, do: IO.binwrite(device, data)
+          if resp.status == 200, do: write_chunk!(device, data)
           {:cont, {req, resp}}
         end
       ] ++ proxy_request_options(url, opts)
@@ -798,6 +849,29 @@ defmodule LlamaCppEx.Hub do
 
       {:error, exception} ->
         {:error, "network error: #{Exception.message(exception)}"}
+    end
+  catch
+    :throw, {:write_failed, posix} ->
+      {:error, "cannot write download: #{:file.format_error(posix)}"}
+  end
+
+  # A failed write must become an error tuple, not an exception.
+  #
+  # The result of the old `IO.binwrite/2` was discarded, but not for the reason it
+  # looked like: `IO.binwrite/2` does not return `{:error, reason}` at all — it
+  # calls `:erlang.error(reason)` (`elixir/lib/io.ex:305-310`). So a full disk
+  # raised `** (ErlangError) :enospc` from inside Req's streaming callback, which
+  # unwound past `download/3` into the caller's crash report — with the request
+  # options, including `:token`, in the stacktrace. `:file.write/2` is the variant
+  # that reports, so the failure is handled here and the temp file is deleted.
+  #
+  # Thrown rather than returned because this runs inside Req's `into:` callback,
+  # where the only way out is to unwind: `{:halt, _}` ends the stream but still
+  # reports `{:ok, resp}`, which is the truncated-file-with-a-valid-etag outcome.
+  defp write_chunk!(device, data) do
+    case :file.write(device, data) do
+      :ok -> :ok
+      {:error, posix} -> throw({:write_failed, posix})
     end
   end
 

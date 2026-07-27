@@ -1047,8 +1047,7 @@ defmodule LlamaCppEx.Server do
         :no_slots
 
       slots ->
-        session_pick =
-          Slots.session_slot_if_idle(state.sessions, Keyword.get(req_opts, :session), slots)
+        session_pick = Slots.session_slot_if_idle(state.sessions, session_key(req_opts), slots)
 
         cond do
           session_pick != nil ->
@@ -1113,7 +1112,7 @@ defmodule LlamaCppEx.Server do
   defp install_slot(state, seq_id, %Request{} = request, lcp, sampler) do
     %Request{tokens: tokens, max_tokens: max_tokens, opts: req_opts} = request
 
-    state = update_session_mapping(state, seq_id, Keyword.get(req_opts, :session))
+    state = update_session_mapping(state, seq_id, session_key(req_opts))
     slot = state.slots[seq_id]
     cache_prompt? = request_cache_prompt?(state, req_opts)
 
@@ -1444,6 +1443,24 @@ defmodule LlamaCppEx.Server do
   defp slot_mode(%{stream_pid: pid}) when is_pid(pid), do: :stream
   defp slot_mode(_slot), do: :generate
 
+  # Session affinity is keyed by `{cache_scope, session}`, never by the session id
+  # alone.
+  #
+  # `:session` was a *global* keyspace: affinity routed on the session id while
+  # only prefix *reuse* checked `:cache_scope`, so a guessed session id let one
+  # scope claim the slot another scope was using and evict its prefix cache. The
+  # scope check still cleared the KV on mismatch, so this is a denial of service
+  # rather than a KV leak — worth closing while the feature is new.
+  #
+  # `nil` in, `nil` out: a request with no `:session` has no affinity, and pairing
+  # a scope with a missing session id would invent one.
+  defp session_key(req_opts) do
+    case Keyword.get(req_opts, :session) do
+      nil -> nil
+      session -> {Keyword.get(req_opts, :cache_scope), session}
+    end
+  end
+
   # Keeps sessions ↔ slots consistent: the slot remembers its session (so an
   # idle slot can be re-picked by affinity) and the reverse map points each
   # session at the slot serving it. A slot taken over by a different session
@@ -1485,11 +1502,7 @@ defmodule LlamaCppEx.Server do
       Enum.reduce(requests, {state, []}, fn request, {state, rest} ->
         opts = request.opts
 
-        case Slots.session_slot_if_idle(
-               state.sessions,
-               Keyword.get(opts, :session),
-               idle_slots(state)
-             ) do
+        case Slots.session_slot_if_idle(state.sessions, session_key(opts), idle_slots(state)) do
           nil ->
             {state, [request | rest]}
 

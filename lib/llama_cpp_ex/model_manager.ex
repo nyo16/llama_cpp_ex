@@ -832,24 +832,42 @@ defmodule LlamaCppEx.ModelManager do
     end
   end
 
-  # The `devices/0` NIF is genuinely absent in some environments (no NIF loaded
-  # in a pure-Elixir test run, unsupported platform), and there is no way to ask
-  # ahead of time — `Code.ensure_loaded?/1` says nothing about whether the .so
-  # loaded. So this one keeps a rescue, but narrowed to the two exceptions a
-  # missing NIF actually raises, and it logs instead of swallowing: a real
-  # backend failure used to be reported as "this machine has no GPUs", which
-  # silently turns every VRAM budget into a RAM budget.
+  # The `devices/0` NIF is genuinely absent in some environments (no NIF loaded in
+  # a pure-Elixir test run, unsupported platform), and there is no way to ask ahead
+  # of time — `Code.ensure_loaded?/1` says nothing about whether the .so loaded.
+  # So this keeps a rescue, but only for "the NIF is not there".
+  #
+  # `ErlangError` alone was still too wide: it covers both `:not_loaded` and a
+  # genuine backend failure raised from inside `backend_init/0` or `device_list/0`,
+  # so a real failure was reported as "this machine has no GPUs" — silently turning
+  # every VRAM budget into a RAM budget, which is the exact failure mode the
+  # narrowing was supposed to remove. A backend that is present and broken must
+  # propagate; only its absence degrades.
   defp gpu_devices do
     LlamaCppEx.devices()
     |> Enum.filter(&(&1.type in [:gpu, :igpu]))
   rescue
-    e in [ErlangError, UndefinedFunctionError] ->
-      Logger.warning(
-        "LlamaCppEx.ModelManager: device enumeration unavailable " <>
-          "(#{Exception.message(e)}); budgeting everything as RAM"
-      )
+    e in UndefinedFunctionError ->
+      warn_no_devices(e)
 
-      []
+    e in ErlangError ->
+      # `:not_loaded` is the NIF's absence; anything else is the backend itself
+      # failing, and re-raising it is the point of this task. `reraise/2` keeps the
+      # original stacktrace, so the caller sees where in the NIF it broke.
+      if e.original == :not_loaded do
+        warn_no_devices(e)
+      else
+        reraise(e, __STACKTRACE__)
+      end
+  end
+
+  defp warn_no_devices(exception) do
+    Logger.warning(
+      "LlamaCppEx.ModelManager: device enumeration unavailable " <>
+        "(#{Exception.message(exception)}); budgeting everything as RAM"
+    )
+
+    []
   end
 
   # Same shape, same reasoning: init/0 is a thin NIF call, so a missing NIF is
