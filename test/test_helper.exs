@@ -4,7 +4,8 @@
 #   :smoke      — generation/chat/grammar/server paths; needs LLAMA_SMOKE_GEN_MODEL
 #   :embeddings — embedding paths;                      needs LLAMA_SMOKE_EMB_MODEL
 #   :mtp        — MTP speculative decoding;             needs LLAMA_SMOKE_MTP_MODEL
-#   :slow       — the long-running comparison matrices (e.g. F16 vs Q8_0 KV cache)
+#   :slow       — long-running comparison matrices (F16 vs Q8_0 KV cache);
+#                 needs LLAMA_SMOKE_GEN_MODEL
 #
 # `--include` beats `--exclude` in ExUnit, so the tags are independent: opt into
 # exactly the ones whose model you have. The helper `LlamaCppEx.TestModels`

@@ -147,6 +147,65 @@ defmodule LlamaCppEx.ServerTest do
     end
   end
 
+  # W-15. `TestSlots` is a hand-maintained copy of `idle_slot_fields/3`, and its
+  # entire value is *completeness*: a batching strategy or slot helper that reads a
+  # field the fixture omits must raise `KeyError` in the test rather than quietly
+  # matching a stub. All 26 fields agree today, and `TestSlots.base_fields/0` was
+  # exported specifically so a drift test could be written — it had zero callers.
+  # That is the `F5`/`F18` hole recurring in a new shape: a seam built for a test
+  # that was never written.
+  describe "TestSlots does not drift from a real slot" do
+    # The three fields that deliberately live outside the per-request reset: slot
+    # metadata that must survive `reset_slot/2`.
+    @outside_the_reset [:sampler, :session, :t_last_used]
+
+    test "base_fields/0 is idle_slot_fields/3 plus exactly those three" do
+      real = idle_slot_field_names()
+      fixture = TestSlots.base_fields() |> Map.keys() |> Enum.sort()
+      expected = Enum.sort(real ++ @outside_the_reset)
+
+      assert fixture == expected,
+             """
+             LlamaCppEx.TestSlots.base_fields/0 has drifted from
+             LlamaCppEx.Server.idle_slot_fields/3.
+
+             In the real slot, missing from the fixture: #{inspect(expected -- fixture)}
+             In the fixture, not in a real slot:          #{inspect(fixture -- expected)}
+
+             Add the field to @base in test/support/test_slots.exs (or remove it),
+             so every strategy test keeps running against a complete slot.
+             """
+    end
+
+    test "the three excluded fields really are outside idle_slot_fields/3" do
+      # The complement: if one of them were folded into the reset map, the test
+      # above would still pass while the fixture silently disagreed about whether
+      # a reset clears it.
+      for field <- @outside_the_reset do
+        refute field in idle_slot_field_names(),
+               "#{inspect(field)} is now part of idle_slot_fields/3 — it is reset per " <>
+                 "request, so drop it from @outside_the_reset here"
+      end
+    end
+
+    # `idle_slot_fields/3` is private, so its key set is read from the source. The
+    # map is a literal, so the scan is exact — the same technique
+    # option_forwarding_test.exs uses, for the same reason.
+    defp idle_slot_field_names do
+      [_, body | _] =
+        "lib/llama_cpp_ex/server.ex"
+        |> File.read!()
+        |> String.split("defp idle_slot_fields(")
+
+      body
+      |> String.split(~r/\n  end\n/, parts: 2)
+      |> hd()
+      |> then(&Regex.scan(~r/^\s+([a-z_0-9]+):/m, &1))
+      |> Enum.map(fn [_, key] -> String.to_existing_atom(key) end)
+      |> Enum.sort()
+    end
+  end
+
   describe "donor_prefix_match/2 (only fed tokens count)" do
     test "idle donor matches against its cached tokens" do
       slot = TestSlots.slot(idle_slot(0, cached_tokens: [1, 2, 3, 4]))
@@ -434,6 +493,8 @@ defmodule LlamaCppEx.ServerTest do
     ]
 
     for {reason, expected} <- @exit_reasons do
+      # The stub stops abnormally on purpose; its SASL report is not a finding.
+      @tag capture_log: true
       test "fetch_model/1 turns a #{inspect(reason)} exit into #{inspect(expected)}" do
         Process.flag(:trap_exit, true)
         {:ok, pid} = Stopping.start_link(unquote(Macro.escape(reason)))
@@ -444,6 +505,7 @@ defmodule LlamaCppEx.ServerTest do
       end
     end
 
+    @tag capture_log: true
     test "no exit reason escapes fetch_model/1 as an exit" do
       # The catch-all is the point: an uncatalogued reason must still become a
       # value, because every caller is inside a stream start-function or a `with`.

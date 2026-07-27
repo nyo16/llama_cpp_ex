@@ -389,4 +389,76 @@ defmodule LlamaCppEx.ServerSmokeTest do
     assert stats.active_slots == 0
     assert stats.queue_depth == 0
   end
+
+  # `PromptCache.restore/4` had no direct coverage, and the branch that mattered
+  # was the error one: a partial restore leaves garbage KV that the next decode
+  # reads as real positions, so a failed `state_seq_set_data` must clear the
+  # sequence rather than report a prefix that is not there. Needs a real context,
+  # which is why it lives here rather than beside the pure PromptCache tests.
+  describe "PromptCache.restore/4 against a real context" do
+    alias LlamaCppEx.{Context, Tokenizer}
+    alias LlamaCppEx.Server.PromptCache
+
+    setup do
+      {:ok, model} = LlamaCppEx.load_model(LlamaCppEx.TestModels.path!(:gen), n_gpu_layers: 0)
+      {:ok, ctx} = Context.create(model, n_ctx: 512, n_seq_max: 2)
+      {:ok, tokens} = Tokenizer.encode(model, "The capital of France is")
+      :ok = LlamaCppEx.NIF.decode(ctx.ref, tokens)
+      {:ok, blob} = LlamaCppEx.NIF.state_seq_get_data(ctx.ref, 0)
+
+      %{ctx: ctx, tokens: tokens, blob: blob}
+    end
+
+    test "restores a full entry and reports the whole prefix", %{
+      ctx: ctx,
+      tokens: tokens,
+      blob: blob
+    } do
+      entry = %{
+        tokens: tokens,
+        len: length(tokens),
+        bin: blob,
+        bytes: byte_size(blob),
+        scope: nil
+      }
+
+      assert {:ok, len} = PromptCache.restore(ctx.ref, 1, entry, entry.len)
+      assert len == entry.len
+      assert LlamaCppEx.NIF.memory_seq_pos_max(ctx.ref, 1) == entry.len - 1
+    end
+
+    test "trims the unusable tail when only a prefix is reusable", %{
+      ctx: ctx,
+      tokens: tokens,
+      blob: blob
+    } do
+      entry = %{
+        tokens: tokens,
+        len: length(tokens),
+        bin: blob,
+        bytes: byte_size(blob),
+        scope: nil
+      }
+
+      keep = entry.len - 2
+
+      assert {:ok, ^keep} = PromptCache.restore(ctx.ref, 1, entry, keep)
+      assert LlamaCppEx.NIF.memory_seq_pos_max(ctx.ref, 1) == keep - 1
+    end
+
+    test "a blob that cannot be restored leaves the sequence empty", %{
+      ctx: ctx,
+      tokens: tokens
+    } do
+      # Garbage of a plausible length: state_seq_set_data rejects it, and the
+      # destination must come back empty rather than half-written.
+      garbage = :crypto.strong_rand_bytes(4096)
+      entry = %{tokens: tokens, len: length(tokens), bin: garbage, bytes: 4096, scope: nil}
+
+      assert {:error, _reason} = PromptCache.restore(ctx.ref, 1, entry, entry.len)
+
+      assert LlamaCppEx.NIF.memory_seq_pos_max(ctx.ref, 1) == -1,
+             "a refused restore left KV behind, which the next decode would read as real positions"
+    end
+  end
 end

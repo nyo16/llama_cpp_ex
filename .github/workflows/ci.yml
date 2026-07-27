@@ -239,10 +239,32 @@ jobs:
       # 2100-line NIF but never ran a single forward pass, while 61 of 223
       # commits bumped vendor/llama.cpp. The :smoke suite covers greedy
       # generate, grammar-constrained generate and the Server; :embeddings
-      # covers embed/2 and embed_batch/2.
+      # covers embed/2 and embed_batch/2; :slow covers the F16-vs-Q8_0 KV
+      # quantization matrix, whose 10 cases had never executed anywhere — the
+      # tag was excluded by default and included by nothing, even though the
+      # generation model it needs is already cached above.
       - name: Run inference tests
-        run: mix test --include smoke --include embeddings
+        run: mix test --include smoke --include embeddings --include slow
         env:
           LLAMA_BACKEND: cpu
           LLAMA_SMOKE_GEN_MODEL: models/SmolLM2-135M-Instruct-Q8_0.gguf
+          LLAMA_SMOKE_EMB_MODEL: models/bge-small-en-v1.5-q8_0.gguf
+
+      # The taxonomy's invariant, checked rather than trusted: each gate tag must
+      # stand alone, because `--include` beats `--exclude` and a test carrying two
+      # of them runs whenever *either* is included — needing a model the runner
+      # was never told about. Two tests violated this and CI masked it by
+      # happening to pass both flags together.
+      - name: Each gate tag runs alone
+        run: |
+          mix test --include smoke
+          mix test --include slow
+        env:
+          LLAMA_BACKEND: cpu
+          LLAMA_SMOKE_GEN_MODEL: models/SmolLM2-135M-Instruct-Q8_0.gguf
+
+      - name: Embeddings tag runs alone
+        run: mix test --include embeddings
+        env:
+          LLAMA_BACKEND: cpu
           LLAMA_SMOKE_EMB_MODEL: models/bge-small-en-v1.5-q8_0.gguf

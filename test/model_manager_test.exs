@@ -103,6 +103,29 @@ defmodule LlamaCppEx.ModelManagerTest do
     :ok
   end
 
+  # `started?/0` is the predicate every "is the manager in the supervision tree?"
+  # branch reads, and the reason `list/0` and `default/0` can return
+  # `{:error, :not_started}` instead of `[]` and `nil`. It had no direct coverage,
+  # so nothing pinned that it keys off the ETS table rather than a registered name
+  # — the distinction that makes the not-started answer reliable.
+  describe "started?/0" do
+    test "is false with no manager running" do
+      refute ModelManager.started?()
+      assert ModelManager.list() == {:error, :not_started}
+      assert ModelManager.default() == {:error, :not_started}
+    end
+
+    test "is true once the manager is up, and false again after it stops" do
+      start_manager()
+      assert ModelManager.started?()
+      assert ModelManager.list() == []
+
+      stop_supervised!(ModelManager)
+      refute ModelManager.started?()
+      assert ModelManager.list() == {:error, :not_started}
+    end
+  end
+
   describe "load/3 and lifecycle" do
     setup do
       start_manager()

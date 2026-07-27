@@ -142,12 +142,101 @@ defmodule LlamaCppEx.ModelManager.ModelIOTest do
       assert message =~ "LlamaCppEx.ModelManager.load/3"
     end
 
-    test "the child is temporary, so a crashed server is not resurrected" do
-      # ModelManager disowns a crashed server and marks the entry :error; a
-      # :permanent child would have the DynamicSupervisor bring it back behind
-      # the manager's back.
+    # W-23: this used to assert `count_children(...).active == 0` after a failed
+    # `start_child`, which cannot fail on the property it names — `active` is 0
+    # after a failed start for *any* `restart:` value, `:permanent` included. The
+    # spec itself is the observable thing, so assert that.
+    test "the child spec is :temporary, so a crashed server is not resurrected" do
       assert {:error, _} = ModelIO.start_server("chat", "/nonexistent/model.gguf", [])
       assert DynamicSupervisor.count_children(ModelIO.dynamic_supervisor()).active == 0
+    end
+  end
+
+  # A stub standing in for the DynamicSupervisor, so the child spec
+  # `start_server/3` builds can be read directly. `DynamicSupervisor.start_child/2`
+  # is a `GenServer.call(sup, {:start_child, child})`, and `child` arrives in the
+  # normalized `{mfa, restart, shutdown, type, modules}` form.
+  defmodule SpecRecorder do
+    @moduledoc false
+    use GenServer
+
+    def start_link(test_pid) do
+      GenServer.start_link(__MODULE__, test_pid, name: ModelIO.dynamic_supervisor())
+    end
+
+    @impl true
+    def init(test_pid), do: {:ok, test_pid}
+
+    @impl true
+    def handle_call({:start_child, child}, _from, test_pid) do
+      send(test_pid, {:child_spec, child})
+      {:reply, {:error, :recorded}, test_pid}
+    end
+  end
+
+  describe "the child spec start_server/3 builds" do
+    setup do
+      start_supervised!({SpecRecorder, self()})
+      :ok
+    end
+
+    test "names Server.start_link/1 as :temporary, so a crash is not resurrected" do
+      # ModelManager disowns a crashed server and marks the entry :error; a
+      # :permanent or :transient child would have the DynamicSupervisor bring it
+      # back behind the manager's back, leaving an unowned process holding VRAM.
+      assert {:error, :recorded} =
+               ModelIO.start_server("chat", "/nonexistent/model.gguf", n_parallel: 1)
+
+      assert_receive {:child_spec, child}
+
+      assert {{LlamaCppEx.Server, :start_link, [opts]}, :temporary, _shutdown, :worker,
+              [LlamaCppEx.Server]} = child
+
+      # And the opts are the ones the manager meant to pass: the resolved path, the
+      # via-tuple name, and only server options.
+      assert Keyword.fetch!(opts, :model_path) == "/nonexistent/model.gguf"
+      assert Keyword.fetch!(opts, :name) == {:via, Registry, {ModelIO.registry(), "chat"}}
+      assert Keyword.fetch!(opts, :n_parallel) == 1
+    end
+
+    test "carries no hub or manager options" do
+      assert {:error, :recorded} =
+               ModelIO.start_server("chat", "/nonexistent/model.gguf",
+                 mode: :server,
+                 capabilities: [:chat],
+                 default: false,
+                 memory_budget: :infinity,
+                 io: __MODULE__,
+                 cache_dir: "/tmp",
+                 token: "hf_secret",
+                 revision: "main",
+                 force: false,
+                 progress: nil,
+                 vocab_only: true,
+                 n_gpu_layers: 0
+               )
+
+      assert_receive {:child_spec, {{_, _, [opts]}, _, _, _, _}}
+
+      for key <- [
+            :mode,
+            :capabilities,
+            :default,
+            :memory_budget,
+            :io,
+            :cache_dir,
+            :token,
+            :revision,
+            :force,
+            :progress,
+            :vocab_only
+          ] do
+        refute Keyword.has_key?(opts, key),
+               "#{inspect(key)} must not reach Server.start_link/1"
+      end
+
+      # ...and the one legitimate model option still gets through.
+      assert Keyword.fetch!(opts, :n_gpu_layers) == 0
     end
   end
 

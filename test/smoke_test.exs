@@ -1,27 +1,25 @@
 defmodule LlamaCppEx.SmokeTest do
   @moduledoc """
-  End-to-end smoke test that loads real GGUF models and exercises every public
-  inference path against the freshly built NIF: generation, streaming, chat
-  (template application), structured output (JSON-schema grammar), and
-  embeddings.
+  End-to-end smoke test that loads a real GGUF model and exercises every public
+  generation path against the freshly built NIF: generation, streaming, chat
+  (template application) and structured output (JSON-schema grammar).
 
   This suite is **excluded by default** (it is tagged `:smoke` and
-  `test/test_helper.exs` excludes that tag) because it requires model files and
+  `test/test_helper.exs` excludes that tag) because it requires a model file and
   is slow. Run it explicitly after bumping the `vendor/llama.cpp` submodule or
   rebuilding the NIF:
 
       GGML_METAL_NO_RESIDENCY=1 \\
       LLAMA_SMOKE_GEN_MODEL=/path/to/chat-model.gguf \\
-      LLAMA_SMOKE_EMB_MODEL=/path/to/embedding-model.gguf \\
-        mix test test/smoke_test.exs --include smoke --include embeddings
+        mix test test/smoke_test.exs --include smoke
 
   On Metal, `GGML_METAL_NO_RESIDENCY=1` keeps a passing run from aborting with
   exit 134 while the VM tears down; `test/test_helper.exs` explains why.
 
-  `LLAMA_SMOKE_GEN_MODEL` is required for the generation/chat/grammar tests. The
-  embedding tests carry the separate `:embeddings` tag, also excluded by default;
-  including that tag requires `LLAMA_SMOKE_EMB_MODEL`.
-  Any small instruct model works for generation (e.g. a 0.5B–3B Q4 GGUF).
+  `LLAMA_SMOKE_GEN_MODEL` is the only model this suite needs — any small instruct
+  model works (e.g. a 0.5B–3B Q4 GGUF). Embedding paths live in
+  `test/embeddings_test.exs` behind the separate `:embeddings` tag, because a test
+  must carry exactly one gate tag.
   """
   use ExUnit.Case, async: false
 
@@ -197,58 +195,9 @@ defmodule LlamaCppEx.SmokeTest do
     end
   end
 
-  describe "embeddings" do
-    setup do
-      {:ok, em} = LlamaCppEx.load_model(LlamaCppEx.TestModels.path!(:emb), n_gpu_layers: -1)
-      {:ok, emb_model: em}
-    end
-
-    @tag :embeddings
-    test "embed/2 and embed_batch/2 return numeric vectors", %{emb_model: em} do
-      assert {:ok, vec} = LlamaCppEx.embed(em, "Elixir is a functional language.")
-      assert is_list(vec) and vec != []
-      assert Enum.all?(vec, &is_float/1)
-
-      assert {:ok, [a, b]} =
-               LlamaCppEx.embed_batch(em, ["functional programming", "a sunny afternoon"])
-
-      assert length(a) == length(b)
-      assert length(a) == length(vec)
-    end
-
-    # Guards the multi-sequence batch refactor: batched embeddings (single
-    # context, many sequences) must match one-context-per-text, including when
-    # grouping splits the batch (max_batch_sequences forces multiple groups).
-    @tag :embeddings
-    test "embed_batch matches per-text embed (incl. multi-group)", %{emb_model: em} do
-      texts = [
-        "Elixir is a functional programming language.",
-        "Erlang runs on the BEAM virtual machine.",
-        "The weather today is sunny and warm.",
-        "Cats and dogs are common household pets.",
-        "Quantum computing uses qubits."
-      ]
-
-      reference =
-        Enum.map(texts, fn t ->
-          {:ok, e} = LlamaCppEx.embed(em, t)
-          e
-        end)
-
-      assert {:ok, batched} = LlamaCppEx.embed_batch(em, texts)
-      assert {:ok, grouped} = LlamaCppEx.embed_batch(em, texts, max_batch_sequences: 2)
-
-      assert length(batched) == length(texts)
-      assert max_elementwise_diff(batched, reference) < 1.0e-3
-      assert max_elementwise_diff(grouped, reference) < 1.0e-3
-    end
-  end
-
-  defp max_elementwise_diff(a, b) do
-    Enum.zip(a, b)
-    |> Enum.map(fn {va, vb} ->
-      Enum.zip(va, vb) |> Enum.map(fn {x, y} -> abs(x - y) end) |> Enum.max()
-    end)
-    |> Enum.max()
-  end
+  # The embedding tests moved to test/embeddings_test.exs. They carried both
+  # `:smoke` (from this module) and `:embeddings`, and `--include` beats
+  # `--exclude`, so `--include smoke` alone dragged them in and failed for want of
+  # `LLAMA_SMOKE_EMB_MODEL`. One gate tag per suite is the invariant the whole
+  # taxonomy in test/test_helper.exs rests on.
 end
