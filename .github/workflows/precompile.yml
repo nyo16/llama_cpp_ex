@@ -94,6 +94,11 @@ jobs:
           # controls it — and it is interpolated into the sed script below, where
           # GNU sed's `e` flag turns a crafted value into command execution. It
           # also lands in $GITHUB_ENV. Accept strict semver and nothing else.
+          # The `case` glob is load-bearing, not belt-and-braces: `grep -Eq` is
+          # LINE-oriented, so a two-line value whose *second* line is valid semver
+          # passes the regex on its own. The glob rejects the newline (it is
+          # outside [0-9A-Za-z.+-]) before grep ever sees it. Do not "simplify"
+          # this to the regex alone.
           case "$TAG_VERSION" in
             ''|*[!0-9A-Za-z.+-]*)
               echo "::error::refusing to release '${GITHUB_REF}': version '${TAG_VERSION}' has characters outside [0-9A-Za-z.+-]"
@@ -152,6 +157,11 @@ jobs:
           TAG_VERSION="${GITHUB_REF#refs/tags/v}"
           # See the matching step in `precompile`: GITHUB_REF reaches sed, and
           # GNU sed's `e` flag would execute it.
+          # The `case` glob is load-bearing, not belt-and-braces: `grep -Eq` is
+          # LINE-oriented, so a two-line value whose *second* line is valid semver
+          # passes the regex on its own. The glob rejects the newline (it is
+          # outside [0-9A-Za-z.+-]) before grep ever sees it. Do not "simplify"
+          # this to the regex alone.
           case "$TAG_VERSION" in
             ''|*[!0-9A-Za-z.+-]*)
               echo "::error::refusing to release '${GITHUB_REF}': version '${TAG_VERSION}' has characters outside [0-9A-Za-z.+-]"
@@ -303,6 +313,11 @@ jobs:
           # See the matching step in `precompile`: GITHUB_REF reaches sed, and
           # GNU sed's `e` flag would execute it. The tag's mix.exs should already
           # carry this version; the rewrite makes the tag authoritative.
+          # The `case` glob is load-bearing, not belt-and-braces: `grep -Eq` is
+          # LINE-oriented, so a two-line value whose *second* line is valid semver
+          # passes the regex on its own. The glob rejects the newline (it is
+          # outside [0-9A-Za-z.+-]) before grep ever sees it. Do not "simplify"
+          # this to the regex alone.
           case "$TAG_VERSION" in
             ''|*[!0-9A-Za-z.+-]*)
               echo "::error::refusing to release '${GITHUB_REF}': version '${TAG_VERSION}' has characters outside [0-9A-Za-z.+-]"

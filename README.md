@@ -44,6 +44,9 @@ end
 
 ### Prerequisites
 
+Elixir `~> 1.18`, enforced by `mix.exs`. The Erlang/OTP floor depends on how the
+NIF is obtained:
+
 Precompiled NIFs are published for `aarch64-apple-darwin` (Metal) and
 `x86_64-linux-gnu` (CPU) at NIF versions 2.17 and 2.18 — that is **Erlang/OTP 26
 or newer** (OTP 26, 27 and 28 report NIF 2.17; OTP 29 reports 2.18). On those

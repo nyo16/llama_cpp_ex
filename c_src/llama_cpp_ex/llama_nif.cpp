@@ -37,8 +37,27 @@ inline auto unsupported     = fine::Atom("unsupported");
 //
 // llama.cpp's GGML_ASSERT is never NDEBUG-gated, so it calls ggml_abort() ->
 // abort(). That takes down the whole BEAM: no exception, no supervisor, no
-// crash report. Every value crossing this boundary comes from Elixir and must
-// therefore be range-checked *here*, before it reaches an assert.
+// crash report. Every value crossing this boundary comes from Elixir, so every
+// one has to be bounded — but by exactly one of two mechanisms, and knowing
+// which is why the guard set below is what it is:
+//
+//   1. Values that reach a `llama_memory_*` or `llama_state_seq_*` call
+//      DIRECTLY are bounded here. Those functions assert on their arguments,
+//      and nothing upstream sees the value first.
+//
+//   2. Values carried INSIDE a `llama_batch` are bounded by upstream's
+//      `llama_batch_allocr::init` (vendor/llama.cpp/src/llama-batch.cpp:61-64),
+//      which range-checks batch seq ids and positions and returns false rather
+//      than asserting — so `llama_decode` returns non-zero and the NIF returns
+//      `{:error, _}`. That check is load-bearing and invisible from this file,
+//      which is part of why the three unguarded sites in category 1
+//      (embed_decode, embed_batch_decode, batch_eval_sample's purge list)
+//      looked closed: their neighbours really were safe, for a reason nobody
+//      had written down.
+//
+// `test/nif_guards_test.exs` enumerates both categories and is checked against
+// LlamaCppEx.NIF's own source, so a new seq_id-taking NIF cannot be added
+// without classifying it.
 
 // A sequence id is valid iff 0 <= seq_id < llama_n_seq_max(ctx). Out of range
 // trips GGML_ASSERT in the KV cache implementation.
@@ -785,6 +804,22 @@ fine::Ok<> memory_clear(ErlNifEnv* env, fine::ResourcePtr<LlamaContext> ctx) {
 }
 FINE_NIF(memory_clear, 0);
 
+// Returns llama_memory_seq_rm's boolean verbatim, which callers must read
+// according to the range they asked for. This is the convention every call site
+// in this file and in lib/llama_cpp_ex/server{,/prompt_cache}.ex follows, and it
+// is the reason some of them discard the result and others do not:
+//
+//   * A FULL clear (`p0 <= 0 && p1 < 0`) succeeds for every memory module, so
+//     the return value carries no information and is discarded — the bare calls
+//     in embed_decode, embed_batch_decode and bes_decode_range's purge loop, and
+//     the `_ = ...` matches on the Elixir side.
+//   * A PARTIAL trim can be refused: `llama_memory_recurrent::seq_rm` honours a
+//     rollback of at most `n_rs_seq` positions
+//     (vendor/llama.cpp/src/llama-memory-recurrent.cpp:181-187) and returns
+//     false beyond that, without raising. Every partial trim therefore has to
+//     check, and fall back to a full clear when refused.
+//
+// A `true = ...` on a partial trim was a MatchError inside the Server's tick.
 bool memory_seq_rm(ErlNifEnv* env, fine::ResourcePtr<LlamaContext> ctx,
                    int64_t seq_id, int64_t p0, int64_t p1) {
     check_seq_id(env, ctx->ctx, seq_id);

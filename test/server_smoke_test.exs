@@ -318,62 +318,101 @@ defmodule LlamaCppEx.ServerSmokeTest do
 
   # W-6. `stream/3` and `stream_tokens/3` truncated silently on a per-token
   # timeout, which is indistinguishable from a completed generation and
-  # contradicted their own `@doc` and the three facade pipelines. `:timeout` is 1
-  # ms, so the wait expires before the first token on any model.
+  # contradicted their own `@doc` and the three facade pipelines.
   #
-  # W-5. The request is still generating when the consumer gives up, so the
-  # cleanup has to cancel it. On the facade's server path the after-function read
-  # `phase != :done` to decide, and `halt_with_error/2` sets `phase: :done` —
-  # so a timed-out stream held its slot and decoded to `max_tokens` for a consumer
-  # that had gone. The slot assertion is the half that catches that.
+  # W-5. The request the consumer abandoned has to be cancelled. On the facade's
+  # server path the after-function read `phase != :done` to decide, and
+  # `halt_with_error/2` sets `phase: :done` — so a timed-out stream held its slot
+  # and decoded to `max_tokens` for a consumer that had gone. The slot assertion is
+  # the half that catches that.
+  #
+  # The timeout is forced by *queue occupancy*, not by racing a decode. A tiny
+  # `:timeout` against a live generation is not deterministic: the server sends
+  # tokens as fast as it decodes them, so a consumer that keeps up finds each one
+  # already in its mailbox and the stream runs to completion with no timeout at
+  # all. Filling the only slot first means the stream under test waits in the
+  # queue with nothing to read, which expires every time.
   describe "a stream whose per-token timeout expires" do
     @long_prompt "User: Write a very long story about the sea.\nAssistant:"
+    @chunk_timeout 50
 
-    test "Server.stream/3 emits {:error, :timeout} and releases the slot" do
+    setup do
       server = start_server(n_parallel: 1)
 
-      elements =
-        server
-        |> Server.stream(@long_prompt, max_tokens: 400, timeout: 1)
-        |> Enum.to_list()
+      # Occupies the single slot for far longer than @chunk_timeout, so the stream
+      # under test waits in the *queue*.
+      hog = Task.async(fn -> Server.generate(server, @long_prompt, max_tokens: 400) end)
+      await_stats(server, &(&1.active_slots == 1))
 
+      %{server: server, hog: hog}
+    end
+
+    defp assert_timed_out_and_released(server, hog, elements) do
       assert List.last(elements) == {:error, :timeout}
+
+      # Read the queue *before* the hog finishes. `Server.cancel/2` is a cast and
+      # `get_stats/1` is a call issued after it from this same process, so FIFO
+      # message ordering guarantees the server has already processed the cancel —
+      # no sleeping, no polling. This is the assertion that catches W-5: without
+      # the cancel the abandoned request is still sitting in the queue and would
+      # take the slot the moment the hog frees one, generating to `max_tokens` for
+      # a consumer that has gone.
+      stats = Server.get_stats(server)
+
+      assert stats.active_slots == 1,
+             "the hog finished early — this test can no longer tell a cancelled " <>
+               "request from a queued one"
+
+      assert stats.queue_depth == 0,
+             "the abandoned request was left in the queue instead of being cancelled"
+
+      assert {:ok, _} = Task.await(hog, 120_000)
       assert_slots_released(server)
     end
 
-    test "Server.stream_tokens/3 emits {:error, :timeout} and releases the slot" do
-      server = start_server(n_parallel: 1)
-      {:ok, tokens} = LlamaCppEx.Tokenizer.encode(Server.get_model(server), @long_prompt)
-
+    test "Server.stream/3 emits {:error, :timeout} and releases the slot", ctx do
       elements =
-        server
-        |> Server.stream_tokens(tokens, max_tokens: 400, timeout: 1)
+        ctx.server
+        |> Server.stream("hello there", max_tokens: 8, timeout: @chunk_timeout)
         |> Enum.to_list()
 
-      assert List.last(elements) == {:error, :timeout}
-      assert_slots_released(server)
+      assert_timed_out_and_released(ctx.server, ctx.hog, elements)
     end
 
-    test "the facade's server-routed stream cancels the request it abandoned" do
-      server = start_server(n_parallel: 1)
-      messages = [%{role: "user", content: "Write a very long story about the sea."}]
+    test "Server.stream_tokens/3 emits {:error, :timeout} and releases the slot", ctx do
+      {:ok, tokens} = LlamaCppEx.Tokenizer.encode(Server.get_model(ctx.server), "hello there")
+
+      elements =
+        ctx.server
+        |> Server.stream_tokens(tokens, max_tokens: 8, timeout: @chunk_timeout)
+        |> Enum.to_list()
+
+      assert_timed_out_and_released(ctx.server, ctx.hog, elements)
+    end
+
+    test "the facade's server-routed stream cancels the request it abandoned", ctx do
+      messages = [%{role: "user", content: "hello there"}]
 
       chunks =
-        server
-        |> LlamaCppEx.stream_chat_completion(messages, max_tokens: 400, timeout: 1)
+        ctx.server
+        |> LlamaCppEx.stream_chat_completion(messages,
+          max_tokens: 8,
+          timeout: @chunk_timeout
+        )
         |> Enum.to_list()
 
-      assert List.last(chunks) == {:error, :timeout}
-      assert_slots_released(server)
+      assert_timed_out_and_released(ctx.server, ctx.hog, chunks)
     end
 
-    test "the server keeps serving afterwards" do
-      server = start_server(n_parallel: 1)
+    test "the server keeps serving afterwards", ctx do
+      elements =
+        ctx.server
+        |> Server.stream("hello there", max_tokens: 8, timeout: @chunk_timeout)
+        |> Enum.to_list()
 
-      _ = server |> Server.stream(@long_prompt, max_tokens: 400, timeout: 1) |> Enum.to_list()
-      assert_slots_released(server)
+      assert_timed_out_and_released(ctx.server, ctx.hog, elements)
 
-      assert {:ok, text} = Server.generate(server, "2 + 2 =", max_tokens: 4)
+      assert {:ok, text} = Server.generate(ctx.server, "2 + 2 =", max_tokens: 4)
       assert is_binary(text)
     end
   end

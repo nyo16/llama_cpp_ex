@@ -19,7 +19,10 @@ with.
 
 Artifacts are published for NIF 2.17 and 2.18, which means Erlang/OTP 26 or
 newer. Anything else — including OTP 25, which reports NIF 2.16 — falls back to a
-source build.
+source build. The NIF-version-to-OTP mapping is verified against
+`erts/emulator/beam/erl_nif.h` in the OTP source; see the comment on
+`make_precompiler_nif_versions` in `mix.exs`, which also explains why no "2.16"
+entry is declared even though OTP 25 works.
 
 ## Backend Selection
 
