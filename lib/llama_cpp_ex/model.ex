@@ -62,11 +62,11 @@ defmodule LlamaCppEx.Model do
   > #### Load mode {: .info}
   >
   > llama.cpp collapsed its three loading booleans into one `load_mode` enum, so
-  > these options resolve to a single mode with `:use_direct_io` > `:use_mlock` >
-  > `:use_mmap` precedence — respectively `dio`, `mlock`, `mmap`, and `none` when
-  > all are false. Because `mlock` now implies mmap upstream, passing
-  > `use_mlock: true, use_mmap: false` memory-maps the file rather than reading
-  > it into anonymous memory.
+  > these options resolve to a single mode. `:use_direct_io` takes precedence
+  > over everything and selects `dio`; otherwise `:use_mlock` and `:use_mmap`
+  > combine — both true selects `mmap_mlock`, `:use_mlock` alone selects `mlock`
+  > (read into anonymous memory, no mapping), `:use_mmap` alone selects `mmap`,
+  > and all false selects `none`.
 
   > #### Untrusted models {: .warning}
   >

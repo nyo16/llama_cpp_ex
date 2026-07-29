@@ -88,6 +88,16 @@ facade's streams emit errors instead of truncating silently.
   server cannot honour — and then raised an `ArgumentError` naming
   `LlamaCppEx.Server.complete_tokens/3`, a function the caller never called. They
   are now rejected up front, naming the function the caller did call.
+- **`use_mlock: true, use_mmap: false` no longer memory-maps the model.** Since
+  v0.8.39 the three load booleans have collapsed into llama.cpp's single
+  `load_mode` enum, where `LLAMA_LOAD_MODE_MLOCK` meant "mmap **and** mlock" — so
+  `:use_mlock` silently forced a memory map and `:use_mmap` was unreachable
+  whenever it was set. Upstream b10173 split that into `MLOCK` (mlock without
+  mmap) and `MMAP_MLOCK` (both), and `Model.load/2` now honours the two options
+  independently: both true selects `mmap_mlock`, `:use_mlock` alone selects
+  `mlock` and reads the weights into anonymous memory. `:use_direct_io` still
+  takes precedence over both, and the default path is unaffected because
+  `:use_mmap` defaults to `true`.
 
 ### Security
 
@@ -358,6 +368,48 @@ facade's streams emit errors instead of truncating silently.
   the changes most likely to introduce warnings. The dialyzer PLT cache now
   actually hits (`:dialyzer` `plt_local_path`/`plt_core_path` point at the
   `priv/plts` that CI caches; dialyxir was writing under `_build`).
+
+### Changed
+
+- **llama.cpp submodule** — Updated from ff067f76d to 992c32532 (45 commits, tag
+  b10178). Three binding-relevant headers changed, one of them behaviour-changing:
+  - `include/llama.h` — **behaviour change**: `enum llama_load_mode` gains
+    `LLAMA_LOAD_MODE_MMAP_MLOCK` and renumbers `_DIRECT_IO` from 3 to 4.
+    `LLAMA_LOAD_MODE_MLOCK` previously meant "mmap **and** mlock" and now means
+    mlock *without* mmap, with the new `_MMAP_MLOCK` covering the combination
+    (#26135). The NIF selects the mode by name so the renumbering is transparent,
+    but the redefinition is not: `model_load/10` now maps `:use_mlock` +
+    `:use_mmap` to `_MMAP_MLOCK` and `:use_mlock` alone to `_MLOCK`, which is what
+    the Breaking entry above describes. Without that change `use_mlock: true`
+    would have silently stopped memory-mapping.
+  - `common/common.h` — the free functions `common_context_seq_rm`,
+    `common_context_seq_add` and `common_context_seq_cp` became `static` and were
+    replaced by a `common_memory` struct carrying target/draft contexts and
+    exposing them as methods (#26221). The binding never called them — it drives
+    `llama_memory_*` directly and only reads `common_context_can_seq_rm`, whose
+    signature and `common_context_seq_rm_type` enum are both unchanged — so the
+    refactor is inert here. A new `COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK` enum
+    value and its `need_n_rs_seq()` branch (#25173) are likewise inert: the
+    binding sets `types` explicitly for its MTP path.
+  - `common/chat.h` — additive only: a `COMMON_CHAT_FORMAT_PEG_MINIMAX_M3` format
+    for the new MiniMax-M3 parser (#26210).
+  - `ggml/include/ggml.h`, `ggml/include/ggml-backend.h`,
+    `common/json-schema-to-grammar.h`, `common/sampling.h` and
+    `common/speculative.h` are untouched in this range.
+  - **llama core / models**: MiniMax-M3 (MiniMax Sparse Attention) support
+    (#24908) and its indexer tensors kept at F32 for speed and accuracy (#26144);
+    Nanbeige4.2 (#25994); a Laguna-S-2.1 `LLM_TYPE` (#26233); NextN/MTP
+    speculative decoding for GLM_DSA / GLM-5.2 (#25980).
+  - **common / speculative**: DSpark speculative decoding (#25173); eagle3-v3
+    support for gpt-oss (#25794); `common_print_available_devices()` (#26170);
+    explicit `-md` precedence over draft sidecar resolution (#26165); a
+    `subproc.h` wrapper, disabled on android/ios (#26102); NextN (MTP) blocks now
+    counted in `n_gpu_layers` so front layers stay on GPU (#26177).
+  - **ggml / Metal**: an FWHT kernel for the Metal backend (#25924); view-src
+    output is now set (#25729); op offloading logic adjusted to prefer the
+    weight's backend (#25832).
+  - **mtmd**: GLM-5.2-Vision (#26126); MiniMax-M3 vision (#25113); Nemotron 3
+    Nano Omni / parakeet (#22520); MiMo-V2.5 RVQ audio input (#26190).
 
 ### Tests
 
