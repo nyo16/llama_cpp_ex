@@ -313,8 +313,8 @@ defmodule LlamaCppEx.Server do
     * Model loading options are forwarded to `LlamaCppEx.Model.load/2` —
       `:main_gpu`, `:split_mode`, `:tensor_split`, `:use_mmap`, `:use_mlock`,
       `:use_direct_io` and `:check_tensors`. The three load flags collapse into
-      llama.cpp's single `load_mode` with `:use_direct_io` > `:use_mlock` >
-      `:use_mmap` precedence; see `LlamaCppEx.Model.load/2`.
+      llama.cpp's single `load_mode`: `:use_direct_io` wins outright, otherwise
+      `:use_mlock` and `:use_mmap` combine; see `LlamaCppEx.Model.load/2`.
     * GenServer options like `:name`.
 
   """
