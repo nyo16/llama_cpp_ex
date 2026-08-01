@@ -1,5 +1,66 @@
 # Changelog
 
+## v0.8.41
+
+Maintenance release: llama.cpp bump to b10217, on top of b10178 from v0.8.40.
+This range does **not** break the upstream C API — no NIF change was required and
+the public Elixir API is unchanged. Full suite against the rebuilt NIF with real
+GGUF models (`:smoke` and `:embeddings` included, dense Llama-3.2-1B as the
+generation model): 489 passed, 0 failures.
+
+### Changed
+
+- **llama.cpp submodule** — Updated from 992c32532 to ddd4ec142 (39 commits, tag
+  b10217). Two binding-relevant headers changed, both additive:
+  - `include/llama.h` — additive only. `llama_model_params` gains a trailing
+    `bool load_mtp` ("whether to load MTP layers"), so MTP tensors are only
+    loaded when actually used (#26296). The NIF builds its params from
+    `llama_model_default_params()` (`llama_nif.cpp:329`) rather than
+    aggregate-initialising the struct, so the new field picks up its upstream
+    default and the addition is source-compatible — no change needed. A new
+    `llama_vocab_get_suppress_tokens` accessor exposes the
+    `tokenizer.ggml.suppress_tokens` GGUF key now that suppress-token handling
+    moved into `common/sampling` (#26276); the binding does not read it.
+  - `common/common.h` — the inline `common_params_sampling::has_logit_bias()`
+    helper was removed alongside the suppress-tokens refactor (#26276), and a
+    test-only `common_get_model_or_exit` declaration was added (#26317). The
+    binding calls neither — it does not use `common_params_sampling` — so both
+    are inert here.
+  - `include/llama.h` aside, `ggml/include/ggml.h`, `ggml/include/ggml-backend.h`,
+    `ggml/include/ggml-metal.h`, `common/chat.h`, `common/sampling.h`,
+    `common/speculative.h` and `common/json-schema-to-grammar.h` are all
+    untouched in this range.
+  - **llama core / models**: load MTP tensors only if they are really used
+    (#26296); enforce the same K and V cache types for DeepSeek V4 and enable
+    flash attention when the V cache is quantized (#25871); support rotated KV
+    cache quantization (#26180); sync pending async copies before clearing
+    `embd_seq` in `llama-context` (#25676); move suppress-tokens handling to
+    `common/sampling` (#26276); enable tool calls inside thinking blocks for DS4
+    (#26269); address MTP review feedback for mimo2 (#26228).
+  - **ggml**: bump ggml version to 0.18.0 (ggml/1576) and sync.
+  - **Metal**: fix memory unwire when a model is freed without any GPU
+    operations having run (#26082); remove a custom CPU op from the M3 graph and
+    express it with stock ops (#26297).
+  - **CUDA**: add Q2_0 support (#25707); extract Q2_0 elements via `__byte_perm`
+    (#25603); allow transpose-free gemmv computation (#26171); disable MMQ on
+    devices with less than 48 KiB shared memory (#26141).
+  - **Vulkan**: add a POOL_1D op (#25431); support quantized concat (#25684);
+    update the Vulkan SDK to 1.4.357.0 (#26303); add a driver-version check for
+    Windows Intel GPUs to mitigate crashing (#25192).
+  - **SYCL**: add oneMKL GEMM flash attention for XMX-accelerated prompt
+    processing (#25025); support q2 `mul_mat` (#26231); fuse RMS_NORM + MUL
+    (#26015); support the missed types in `cpy` (#26005); support dev2dev memcpy
+    via `DEV2DEV_MEMCPY_FORWARD` (#26234); contiguous fast path and 32-bit index
+    math for unary elementwise ops (#25946).
+  - **WebGPU**: improve `flash_attn_vec` for quantized KV at long contexts
+    (#25956).
+  - **ZenDNN**: group matmul direct API for `mul_mat_id` (#25918).
+  - **mtmd**: add `n_embd_head` (#26342); add a lanczos resize method (#26341).
+  - **server / tools**: correct accepted tokens when a draft-token replay is
+    needed (#26320); support input embeddings to generate the next token
+    (#26313). Neither path is used by this binding's own server.
+  - **kleidiai**: fix a CI issue and a `stringop-overflow` warning (#26277).
+
 ## v0.8.40
 
 Audit-remediation release. Closes 72 of the 106 findings from the
