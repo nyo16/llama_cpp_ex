@@ -272,8 +272,14 @@ jobs:
           # it -- but the toolkit stub exports exactly the driver API under that
           # same soname, so pointing the loader at it resolves the real symbols
           # rather than faking them.
-          stub=$(find /usr/local -path '*/lib64/stubs/libcuda.so' | head -1)
+          # Globs, not `find`: `lib64` is a symlink to targets/<triple>/lib and
+          # find will not descend through it, which is why a `-path '*/lib64/*'`
+          # search comes back empty on a perfectly good toolkit.
+          stub=$(ls -1 /usr/local/cuda*/lib64/stubs/libcuda.so \
+                       /usr/local/cuda*/targets/*/lib/stubs/libcuda.so \
+                       2>/dev/null | head -1)
           test -n "$stub" || { echo "::error::no libcuda stub in the toolkit"; exit 1; }
+          echo "driver stub: $stub"
           mkdir -p /tmp/driver
           ln -sf "$stub" /tmp/driver/libcuda.so.1
           LD_LIBRARY_PATH=/tmp/driver ldd -r "$so" > /tmp/ldd.txt 2>&1 || true
