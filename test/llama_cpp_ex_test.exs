@@ -930,10 +930,28 @@ defmodule LlamaCppExTest do
       {:ok, t2} =
         LlamaCppEx.Server.generate(server, shared <> "Pick a color.", max_tokens: 12)
 
-      # The shared prefix really was reused, so the trimming path under test ran
-      # rather than being skipped by a cache miss.
       assert_receive {:started, %{prefix_cache_tokens: reused}}, 60_000
-      assert reused > 0
+
+      # Which path the divergent request takes is decided by the model, and both
+      # are under test here:
+      #
+      #   :part — partial trim is supported, so the shared prefix is reused and
+      #           the trimming path itself ran rather than being skipped by a
+      #           cache miss.
+      #   :full — the hybrid GDN case this test is named for. The documented fix
+      #           is to detect `:full` at server init and fall back to a full
+      #           slot reset, so reuse is *declined*: a non-zero count here would
+      #           mean the fallback did not fire and the M-RoPE positional
+      #           mismatch is reachable again.
+      case LlamaCppEx.TestModels.seq_rm_kind(:gen) do
+        :part ->
+          assert reused > 0
+
+        kind when kind in [:full, :rs] ->
+          assert reused == 0,
+                 "#{kind} model reported #{reused} reused tokens; the full-reset " <>
+                   "fallback did not fire and a partial trim was attempted anyway"
+      end
 
       # A small model can legitimately emit EOG immediately, so the content is
       # not the subject here — surviving the divergent second request is. The
@@ -1034,7 +1052,13 @@ defmodule LlamaCppExTest do
 
     setup do
       :ok = LlamaCppEx.init()
-      {:ok, model} = LlamaCppEx.load_model(LlamaCppEx.TestModels.path!(:mtp), n_gpu_layers: 999)
+
+      {:ok, model} =
+        LlamaCppEx.load_model(LlamaCppEx.TestModels.path!(:mtp),
+          n_gpu_layers: 999,
+          load_mtp: true
+        )
+
       {:ok, mtp} = LlamaCppEx.MTP.init(model, n_draft: 3, n_ctx: 4096)
       on_exit(fn -> :ok end)
       %{model: model, mtp: mtp}

@@ -39,6 +39,43 @@ defmodule LlamaCppEx.TestModels do
     path(kind) || raise(unavailable(kind))
   end
 
+  @doc """
+  `seq_rm` support reported by the `kind` model: `:part` (any position range),
+  `:full` (whole sequence only) or `:rs` (bounded partial rollback).
+
+  Prefix-cache reuse is not a property of the library alone — it is a property of
+  the model's memory module. Hybrid GDN architectures (Qwen 3.5 / 3.6, Mamba,
+  RWKV) keep recurrent state that cannot be rolled back to an arbitrary position,
+  so `llama_memory_seq_rm` refuses a partial range and the Server deliberately
+  disables prefix reuse for anything needing a trim (`server.ex:812`). Tests that
+  assert reuse *happened* are therefore only meaningful on `:part` models, and
+  must assert the documented fallback instead on `:full` ones.
+
+  Probed once per suite run and memoised: it costs a model load plus a two-token
+  decode.
+  """
+  @spec seq_rm_kind(kind()) :: :part | :full | :rs | :no
+  def seq_rm_kind(kind) when kind in @kinds do
+    case :persistent_term.get({__MODULE__, :seq_rm_kind, kind}, :miss) do
+      :miss ->
+        probed = probe_seq_rm_kind(kind)
+        :persistent_term.put({__MODULE__, :seq_rm_kind, kind}, probed)
+        probed
+
+      cached ->
+        cached
+    end
+  end
+
+  # n_gpu_layers: 0 — the probe only needs the memory module's answer, and
+  # keeping it off the GPU avoids competing with the test that is about to run.
+  defp probe_seq_rm_kind(kind) do
+    :ok = LlamaCppEx.init()
+    {:ok, model} = LlamaCppEx.load_model(path!(kind), n_gpu_layers: 0)
+    {:ok, ctx} = LlamaCppEx.Context.create(model, n_ctx: 64)
+    LlamaCppEx.NIF.context_can_seq_rm(ctx.ref)
+  end
+
   defp unavailable(kind) do
     {var, description} = Map.fetch!(@vars, kind)
 

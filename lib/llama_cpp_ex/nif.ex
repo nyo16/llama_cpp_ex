@@ -35,7 +35,8 @@ defmodule LlamaCppEx.NIF do
         _use_mlock,
         _use_direct_io,
         _vocab_only,
-        _check_tensors
+        _check_tensors,
+        _load_mtp
       ),
       do: :erlang.nif_error(:not_loaded)
 

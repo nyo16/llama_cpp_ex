@@ -325,7 +325,8 @@ FINE_NIF(device_list, ERL_NIF_DIRTY_JOB_IO_BOUND);
 std::variant<fine::Ok<fine::ResourcePtr<LlamaModel>>, fine::Error<std::string>>
 model_load(ErlNifEnv* env, std::string path, int64_t n_gpu_layers, bool use_mmap,
            int64_t main_gpu, int64_t split_mode, std::vector<double> tensor_split,
-           bool use_mlock, bool use_direct_io, bool vocab_only, bool check_tensors) {
+           bool use_mlock, bool use_direct_io, bool vocab_only, bool check_tensors,
+           bool load_mtp) {
     auto params = llama_model_default_params();
     params.n_gpu_layers = static_cast<int32_t>(n_gpu_layers);
     params.main_gpu = static_cast<int32_t>(main_gpu);
@@ -343,6 +344,14 @@ model_load(ErlNifEnv* env, std::string path, int64_t n_gpu_layers, bool use_mmap
                                              : LLAMA_LOAD_MODE_NONE;
     params.vocab_only = vocab_only;
     params.check_tensors = check_tensors;
+    // Upstream defaults this to false so that non-speculative callers do not pay
+    // for the MTP head's tensors (#26296). It has to be set at *load* time: the
+    // layers are either read off disk here or they are absent for the model's
+    // whole lifetime, and `common_speculative_init` still succeeds without them
+    // — the failure surfaces much later as `verify decode failed: code=-1` from
+    // the first MTP draft. `LlamaCppEx.MTP.init/2` therefore refuses a model
+    // loaded without this flag rather than letting that error escape.
+    params.load_mtp = load_mtp;
 
     std::vector<float> ts_float;
     if (!tensor_split.empty()) {
@@ -652,7 +661,8 @@ sampler_init(
     // Add samplers in recommended order: penalties -> top_k -> top_p -> min_p -> temp -> dist/greedy
     if (penalty_repeat != 1.0 || penalty_freq != 0.0 || penalty_present != 0.0) {
         llama_sampler_chain_add(chain,
-            llama_sampler_init_penalties(64, static_cast<float>(penalty_repeat),
+            llama_sampler_init_penalties(llama_vocab_n_tokens(model->vocab()), 64,
+                static_cast<float>(penalty_repeat),
                 static_cast<float>(penalty_freq), static_cast<float>(penalty_present)));
     }
 
