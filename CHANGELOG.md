@@ -59,6 +59,19 @@ the GPU, and passes the smoke suite: **528 tests, 0 failures**.
 
 ### Added
 
+- **`LlamaCppEx.MTP.init/2` now says when a checkpoint has no MTP head**, via a
+  new `LlamaCppEx.NIF.model_n_layer_nextn/1` wrapping upstream's
+  `llama_model_n_layer_nextn`. Previously this surfaced as
+  `{:error, "failed to create context"}`, with the real reason — llama.cpp's
+  `context type MTP requested but model doesn't contain MTP layers` — buried in
+  engine output the caller may not be showing.
+
+  This is not the `load_mtp` case and no flag recovers it: most GGUF conversions
+  of an MTP-capable model simply drop the head. Unsloth's
+  `Qwen3.6-35B-A3B-UD-Q4_K_XL` reports zero nextn layers; their separate
+  `Qwen3.6-35B-A3B-MTP-GGUF` build of the same model carries them. The message
+  now says so and points at the `-MTP` build.
+
 - **Precompiled CUDA artifacts** — `x86_64-linux-gnu-cu12` and
   `x86_64-linux-gnu-cu13` join the existing `aarch64-apple-darwin` (Metal) and
   `x86_64-linux-gnu` (CPU) targets, at NIF 2.17 and 2.18. `mix compile` on an

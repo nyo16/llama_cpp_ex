@@ -58,6 +58,36 @@ defmodule LlamaCppEx.MTPTest do
     end
   end
 
+  # A checkpoint with no MTP head is a different failure from a model loaded
+  # without the flag, and no flag recovers it. Most GGUF conversions of an
+  # MTP-capable model drop the head — unsloth's Qwen3.6-35B-A3B-UD-Q4_K_XL has
+  # zero nextn layers while their separate -MTP build of the same model has
+  # them — so this is the case a user actually lands on first.
+  #
+  # One gate tag (`:smoke`), never `:mtp` as well: the generation model is an
+  # ordinary checkpoint, which is exactly what makes it the right fixture here.
+  describe "init/2 on a checkpoint with no MTP head" do
+    @describetag :smoke
+
+    setup do
+      path = LlamaCppEx.TestModels.path!(:gen)
+      {:ok, model} = LlamaCppEx.load_model(path, n_gpu_layers: 0, load_mtp: true)
+      %{model: model}
+    end
+
+    test "reports zero nextn layers rather than guessing", %{model: model} do
+      assert LlamaCppEx.NIF.model_n_layer_nextn(model.ref) == 0
+    end
+
+    test "refuses with the reason, not 'failed to create context'", %{model: model} do
+      assert {:error, message} = MTP.init(model, n_draft: 3)
+      assert message =~ "no MTP head"
+      assert message =~ "-MTP"
+      # The bare context error is what this guard exists to replace.
+      refute message =~ "failed to create context"
+    end
+  end
+
   describe "the %MTP{} struct" do
     test "enforces every field, because each one is a live NIF resource" do
       # A partially built MTP would hand a nil reference to the NIF.

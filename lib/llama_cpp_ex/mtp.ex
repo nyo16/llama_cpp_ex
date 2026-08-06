@@ -110,6 +110,19 @@ defmodule LlamaCppEx.MTP do
          "model was loaded without load_mtp: true, so its MTP head layers are " <>
            "absent; reload it with LlamaCppEx.load_model(path, load_mtp: true)"}
 
+      LlamaCppEx.NIF.model_n_layer_nextn(model.ref) == 0 ->
+        # Distinct from the branch above and not fixable by any flag: the
+        # checkpoint simply has no MTP head. llama.cpp logs "context type MTP
+        # requested but model doesn't contain MTP layers" and returns null, which
+        # reaches the caller as a bare "failed to create context" with the real
+        # reason buried in engine output the caller may not even be showing.
+        # Most GGUF conversions of an MTP-capable model drop the head; the
+        # publisher usually ships it as a separate `-MTP` repository.
+        {:error,
+         "this GGUF contains no MTP head (0 nextn layers), so MTP speculative " <>
+           "decoding is unavailable for it; use an MTP-preserving conversion of " <>
+           "the model, which publishers typically ship as a separate -MTP build"}
+
       true ->
         do_init(model, opts, n_draft)
     end

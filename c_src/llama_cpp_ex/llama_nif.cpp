@@ -379,6 +379,17 @@ int64_t model_n_embd(ErlNifEnv* env, fine::ResourcePtr<LlamaModel> model) {
 }
 FINE_NIF(model_n_embd, 0);
 
+// Number of MTP / "next-N" prediction layers the checkpoint carries. Zero means
+// the GGUF has no MTP head at all, which is a different situation from a model
+// loaded with load_mtp: false: no flag can recover it, only a different file.
+// Without this, asking for an MTP context on such a model surfaces as a bare
+// "failed to create context" while the real reason is one line above it in
+// llama.cpp's own log.
+int64_t model_n_layer_nextn(ErlNifEnv* env, fine::ResourcePtr<LlamaModel> model) {
+    return llama_model_n_layer_nextn(model->model);
+}
+FINE_NIF(model_n_layer_nextn, 0);
+
 std::string model_desc(ErlNifEnv* env, fine::ResourcePtr<LlamaModel> model) {
     char buf[256];
     llama_model_desc(model->model, buf, sizeof(buf));
