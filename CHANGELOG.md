@@ -5,13 +5,31 @@
 CUDA is a first-class target: the NIF now links correctly against it, and the
 release publishes prebuilt CUDA artifacts for CUDA 12 and CUDA 13.
 
-Verified on 2x NVIDIA DGX Spark (GB10, `sm_121a`, aarch64, CUDA 13.0.2) — a
-source build with `LLAMA_BACKEND=cuda` loads, reports `backend: "CUDA"` from
-`LlamaCppEx.devices()`, offloads 31/31 layers to the GPU, and passes the smoke
-suite: **525 tests, 0 failures**.
+Verified on 2x NVIDIA DGX Spark (GB10, `sm_121a`, aarch64, CUDA 13.0.2) against
+this base (llama.cpp b10280) — a source build with `LLAMA_BACKEND=cuda` loads,
+reports `backend: "CUDA"` from `LlamaCppEx.devices()`, offloads 31/31 layers to
+the GPU, and passes the smoke suite: **528 tests, 0 failures**.
 
 ### Fixed
 
+- **MTP hybrid rollback corrupted the KV cache after a partial accept.** This is
+  a different bug from the `load_mtp` one fixed in v0.8.42, and the two are
+  complementary: that one stopped the MTP layers being read off disk at all,
+  this one silently misplaces context once they are working.
+
+  The verification batch is `[sampled, drafts...]` at positions starting at
+  `n_past`, so `sampled` occupies batch element 0. When only some drafts are
+  accepted the target's KV is rolled back to `n_past` and re-decoded — but the
+  re-decode started at the first *accepted* token rather than at `sampled`.
+  Every token therefore landed one position early, and the last accepted token
+  was written into the context even though it becomes the next iteration's
+  `sampled` and is decoded again there, duplicating it. Reading the slice from
+  `prompt[size - n_accepted_total - 1]` restores `sampled, accepted[0..k-2]`
+  across `[n_past, n_past + k)`, which is exactly the span `n_past` then
+  advances over.
+
+  Only reachable on a partial accept, which is why a working MTP setup can still
+  post plausible acceptance rates while quietly drifting.
 - **The CUDA NIF could not be loaded** — `ggml-cuda.a` leaves the CUDA runtime,
   cuBLAS/cuBLASLt and the CUDA driver API unresolved, but the Linux link line
   only ever added `-lstdc++ -lm -lpthread`. The resulting `.so` linked and then
@@ -65,6 +83,7 @@ suite: **525 tests, 0 failures**.
   real resolution. `enif_*` is excluded, being supplied by the BEAM at load.
 - **Precompiler unit tests** — `test/precompiler_test.exs` pins the artifact
   selection rules, including the case that motivates the driver check.
+
 ## v0.8.42
 
 llama.cpp bump to b10280, on top of b10217 from v0.8.41. Unlike the last two

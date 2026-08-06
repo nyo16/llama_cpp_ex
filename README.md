@@ -710,9 +710,13 @@ See [`examples/mtp_speculative.exs`](examples/mtp_speculative.exs) for a runnabl
 
 ## Benchmarks
 
-Measured on Apple M4 Max (64 GB), Metal backend (`n_gpu_layers: -1`).
+Each subsection names its own hardware and backend — the numbers below span
+Apple Silicon (Metal) and NVIDIA (CUDA) and are not comparable across sections
+unless they say so. Unless noted otherwise, `n_gpu_layers: -1`.
 
 ### Single-model generation speed
+
+Apple M4 Max (64 GB), Metal backend.
 
 | Model | Quantization | Tokens/sec |
 |-------|-------------|------------|
@@ -732,6 +736,32 @@ New `qwen35moe` architecture with Gated Delta Net (hybrid linear/full attention)
 | Qwen3.6-35B-A3B | Q4_K_XL | 43.8 |
 
 128-token generation, `temp: 0.0`, 3-run average (43.3 / 44.1 / 44.0 t/s).
+
+### CUDA: NVIDIA DGX Spark (GB10)
+
+Same model and quantization as the M1 Max row above, so the two are directly
+comparable. GB10 (`sm_121a`, aarch64, 128 GB unified), CUDA 13.0.2, driver
+580.173.02, llama.cpp b10280, source build with `LLAMA_BACKEND=cuda`.
+
+| Model | Quantization | Tokens/sec (GB10) | Tokens/sec (M1 Max) |
+|-------|-------------|-------------------|---------------------|
+| Qwen3.6-35B-A3B | UD-Q4_K_XL | **62.1** | 43.8 |
+
+128-token generation, `temp: 0.0`, `n_gpu_layers: -1`. Median of 5 runs after a
+discarded warm-up: 61.7 / 62.0 / 62.1 / 62.2 / 62.2 t/s — a 0.9% spread, so the
+1.42x over M1 Max is well outside the noise. All 41 layers offload; the model
+takes 20 799 MiB of device memory.
+
+Two notes on method, both learned the hard way:
+
+- **Each run uses a distinct prompt.** Repeating one prompt hits the context
+  reuse path and reports a throughput the engine never achieved.
+- **Tokens are counted by re-encoding the output**, not by counting stream
+  chunks — a chunk is not a token, and under speculative decoding it can carry
+  several.
+
+The first call after load is discarded: it pays CUDA graph capture and the
+allocator's first-touch layout, and is not representative of steady state.
 
 ### Single-sequence generation (Qwen3-4B Q4_K_M)
 
