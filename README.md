@@ -555,7 +555,41 @@ Multi-Token Prediction speculative decoding (upstream PR [#22673](https://github
 > - Qwen 3.6 35B-A3B-MTP (hybrid MoE): plain 39.5 → MTP **44.0 tok/s (1.11×)**
 > - Qwen 3.6 27B (dense): plain 10.7 → MTP **10.6 tok/s (~1.0×, neutral)**
 >
-> Larger `n_draft` hurts on Metal because verify cost grows faster than acceptance benefit. On NVIDIA, `n_draft: 3` is the right default — that's what the upstream 2× number assumes.
+> Larger `n_draft` hurts on Metal because verify cost grows faster than acceptance benefit.
+
+> **Performance note: NVIDIA GB10 (DGX Spark).** MTP does pay here, but nothing
+> like the upstream 2×, and the best `n_draft` is not 3. Qwen3.6-35B-A3B
+> UD-Q4_K_XL from the `-MTP` build, 128-token greedy generations, plain and MTP
+> interleaved in one process so drift hits both arms equally (n=11 each):
+>
+> | | median tok/s | range | vs plain |
+> |---|---|---|---|
+> | plain | 61.4 | 61.2–62.4 | — |
+> | MTP `n_draft: 2` | **71.2** | 62.5–75.5 | **+16%** |
+>
+> The ranges do not overlap — MTP's slowest run beat plain's fastest — so the
+> gain is real despite MTP being the noisier arm by an order of magnitude.
+>
+> Sweeping `n_draft` on the same model, though, puts the optimum at 2 rather
+> than 3, and the engine's own counters say why:
+>
+> | `n_draft` | acceptance | tokens/iteration | tok/s |
+> |---|---|---|---|
+> | 2 | 68.5% | 2.38 | 63.0 |
+> | 3 | 57.2% | 2.73 | 52.8 |
+>
+> Going from 2 to 3 buys 15% more tokens per iteration and pays 31% more drafting
+> plus 10% more verify for them, because the third draft position is the one
+> least likely to be accepted. Marginal acceptance decays faster than marginal
+> cost, so the extra draft loses money. In a five-run sweep `n_draft: 3` came out
+> 2% *below* plain and `n_draft: 4` 14% below.
+>
+> So the shape matches Apple Silicon even though the cause differs: on Metal the
+> wide verify is expensive, while GB10 is a unified-memory part whose MoE decode
+> is memory-bandwidth bound, and a wider verify reads more expert weights per
+> step. Both end up wanting a narrower draft than a datacenter GPU does. Treat
+> `n_draft: 3` as the datacenter default the upstream 2× assumes, not as a value
+> that transfers.
 
 ### Other speculative types (EAGLE-3, DFlash, n-gram)
 
@@ -693,7 +727,10 @@ end)
 
 `LlamaCppEx.MTP.init/2`:
 
-  * `:n_draft` — draft tokens proposed per iteration (default `3`). On NVIDIA, 2–4 is the sweet spot. On Apple Silicon, set this to `1` — see the Apple Silicon performance note above.
+  * `:n_draft` — draft tokens proposed per iteration (default `3`). The optimum
+    is hardware-specific and worth measuring rather than assuming: `1` on Apple
+    Silicon, `2` on GB10 (where `3` measured *slower* than no speculation at
+    all), `2–4` on datacenter NVIDIA. See the two performance notes above.
   * `:n_ctx`, `:n_threads`, `:flash_attn`, `:type_k`/`:type_v`, `:offload_kqv`, … — any `LlamaCppEx.Context` option; applied to both target and draft contexts.
 
 `LlamaCppEx.MTP.stream/3`:
@@ -762,6 +799,22 @@ Two notes on method, both learned the hard way:
 
 The first call after load is discarded: it pays CUDA graph capture and the
 allocator's first-touch layout, and is not representative of steady state.
+
+With MTP speculative decoding, using the separate `-MTP` build of the same model
+(the plain UD-Q4_K_XL carries no MTP head — `MTP.init/2` now says so rather than
+failing with a bare context error):
+
+| | median tok/s | vs plain |
+|---|---|---|
+| plain | 61.4 | — |
+| `n_draft: 2` | **71.2** | +16% |
+| `n_draft: 3` | 61.1 | −2% |
+| `n_draft: 4` | 53.8 | −14% |
+
+`n_draft: 2` is the optimum on this hardware, not the documented default of 3.
+See the GB10 performance note under [Speculative decoding
+(MTP)](#speculative-decoding-mtp) for the acceptance and timing counters behind
+that.
 
 ### Single-sequence generation (Qwen3-4B Q4_K_M)
 
