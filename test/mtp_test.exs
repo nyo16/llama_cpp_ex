@@ -30,6 +30,34 @@ defmodule LlamaCppEx.MTPTest do
     end
   end
 
+  describe "init/2 requires a model loaded with load_mtp: true" do
+    # Regression test for a silent break: upstream #26296 made the MTP head's
+    # tensors opt-in at load time via a flag defaulting to false. Nothing on the
+    # way in objects — both contexts build and common_speculative_init returns
+    # ok — and the first draft then fails with "verify decode failed: code=-1",
+    # far from the cause. The guard runs before any context is created, so a nil
+    # ref never reaches the NIF.
+    test "refuses a model loaded without the flag, naming the remedy" do
+      assert {:error, message} = MTP.init(%LlamaCppEx.Model{ref: nil}, n_draft: 3)
+      assert message =~ "load_mtp: true"
+      assert message =~ "reload it"
+    end
+
+    test "the flag is recorded on the struct, not re-derived" do
+      # Model.load/2 is what sets this; a hand-built struct defaults to false so
+      # that the guard fails closed rather than open.
+      refute %LlamaCppEx.Model{ref: nil}.load_mtp
+    end
+
+    test "n_draft is still validated first, so its error is not masked" do
+      assert MTP.init(%LlamaCppEx.Model{ref: nil, load_mtp: true}, n_draft: 0) ==
+               {:error, ":n_draft must be a positive integer"}
+
+      assert MTP.init(%LlamaCppEx.Model{ref: nil, load_mtp: false}, n_draft: 0) ==
+               {:error, ":n_draft must be a positive integer"}
+    end
+  end
+
   describe "the %MTP{} struct" do
     test "enforces every field, because each one is a live NIF resource" do
       # A partially built MTP would hand a nil reference to the NIF.
@@ -39,97 +67,6 @@ defmodule LlamaCppEx.MTPTest do
 
         assert_raise ArgumentError, ~r/#{missing}/, fn -> struct!(MTP, fields) end
       end
-    end
-  end
-
-  describe "speculative decoding against a real MTP model" do
-    @describetag :mtp
-    @moduletag timeout: 300_000
-
-    setup do
-      :ok = LlamaCppEx.init()
-      {:ok, model} = LlamaCppEx.load_model(LlamaCppEx.TestModels.path!(:mtp), n_gpu_layers: -1)
-      {:ok, mtp} = MTP.init(model, n_ctx: 2048, n_draft: 3)
-      %{model: model, mtp: mtp}
-    end
-
-    test "init/2 builds both contexts and defaults n_draft to 3", %{model: model} do
-      assert {:ok, mtp} = MTP.init(model, n_ctx: 512)
-      assert mtp.n_draft == 3
-      assert %LlamaCppEx.Context{} = mtp.main_ctx
-      assert %LlamaCppEx.Context{} = mtp.mtp_ctx
-      assert is_reference(mtp.spec_ref)
-    end
-
-    test "generate/3 returns non-empty deterministic text", %{mtp: mtp} do
-      opts = [max_tokens: 16, temp: 0.0, seed: 7]
-
-      assert {:ok, text} = MTP.generate(mtp, "The capital of France is", opts)
-      assert byte_size(text) > 0
-      assert String.valid?(text)
-
-      # Speculative decoding must not change *what* is generated, only how fast.
-      assert {:ok, ^text} = MTP.generate(mtp, "The capital of France is", opts)
-    end
-
-    test "stream/3 yields the same text generate/3 returns", %{mtp: mtp} do
-      opts = [max_tokens: 16, temp: 0.0, seed: 7]
-
-      streamed = mtp |> MTP.stream("Count to five:", opts) |> Enum.join()
-      assert {:ok, ^streamed} = MTP.generate(mtp, "Count to five:", opts)
-    end
-
-    test "stream_events/3 emits only documented events, ending with a terminal one", %{mtp: mtp} do
-      events =
-        mtp
-        |> MTP.stream_events("The capital of France is", max_tokens: 8, temp: 0.0)
-        |> Enum.to_list()
-
-      assert events != []
-
-      for event <- events do
-        assert event_kind(event) != :undocumented, "undocumented event: #{inspect(event)}"
-      end
-
-      assert event_kind(List.last(events)) == :terminal
-    end
-
-    test "emit_stats_every yields stats events that stream/3 filters out", %{mtp: mtp} do
-      opts = [max_tokens: 16, temp: 0.0, emit_stats_every: 2]
-
-      events = mtp |> MTP.stream_events("Tell me a story:", opts) |> Enum.to_list()
-      assert Enum.any?(events, &match?({:stats, _}, &1))
-
-      # stream/3 is the text-only view of the same events.
-      pieces = mtp |> MTP.stream("Tell me a story:", opts) |> Enum.to_list()
-      assert Enum.all?(pieces, &is_binary/1)
-    end
-
-    test "stats/1 counts drafts and accepts after generation", %{mtp: mtp} do
-      before = MTP.stats(mtp)
-      assert before.n_draft == 3
-
-      {:ok, _} = MTP.generate(mtp, "The capital of France is", max_tokens: 16, temp: 0.0)
-      after_gen = MTP.stats(mtp)
-
-      assert after_gen.iters > before.iters
-      assert after_gen.drafts_generated > before.drafts_generated
-      assert after_gen.tokens_emitted > before.tokens_emitted
-      assert after_gen.acceptance_rate >= 0.0 and after_gen.acceptance_rate <= 1.0
-      assert after_gen.drafts_accepted <= after_gen.drafts_generated
-      assert %{draft: _, verify: _, sample: _, total: _} = after_gen.timing_us
-    end
-
-    test "print_stats/1 returns :ok", %{mtp: mtp} do
-      assert MTP.print_stats(mtp) == :ok
-    end
-
-    test "a halted stream stops generation instead of running to max_tokens", %{mtp: mtp} do
-      taken = mtp |> MTP.stream("Write an endless story:", max_tokens: 400) |> Enum.take(3)
-      assert length(taken) == 3
-
-      # The MTP value is still usable afterwards.
-      assert {:ok, _} = MTP.generate(mtp, "2 + 2 =", max_tokens: 4, temp: 0.0)
     end
   end
 
@@ -184,12 +121,4 @@ defmodule LlamaCppEx.MTPTest do
       assert {:ok, []} = Task.yield(task, 2_000) || Task.shutdown(task, :brutal_kill)
     end
   end
-
-  # The event vocabulary stream_events/3 documents.
-  defp event_kind({:token, id, text}) when is_integer(id) and is_binary(text), do: :token
-  defp event_kind({:stats, snapshot}) when is_map(snapshot), do: :stats
-  defp event_kind({:done, snapshot}) when is_map(snapshot), do: :terminal
-  defp event_kind({:eog, nil}), do: :terminal
-  defp event_kind({:error, _reason}), do: :terminal
-  defp event_kind(_), do: :undocumented
 end

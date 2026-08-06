@@ -539,7 +539,11 @@ Upstream llama.cpp implements more speculative types behind the same `common_spe
 - [`ggml-org/Qwen3.6-27B-MTP-GGUF`](https://huggingface.co/ggml-org/Qwen3.6-27B-MTP-GGUF)
 - [`unsloth/Qwen3.6-35B-A3B-MTP-GGUF`](https://huggingface.co/unsloth/Qwen3.6-35B-A3B-MTP-GGUF)
 
-A regular (non-MTP) Qwen 3.6 quant will fail at `LlamaCppEx.MTP.init/2` — the GGUF must contain `mtp-*` tensors.
+A regular (non-MTP) Qwen 3.6 quant will fail at `LlamaCppEx.MTP.init/2` — the GGUF must contain the MTP head's tensors. To check a file before loading it, look for a `*.nextn_predict_layers` key and `blk.N.nextn.*` tensors in its metadata.
+
+The model must also be loaded with `load_mtp: true` (see below). Upstream gates those tensors behind a load-time flag that defaults to off, and they cannot be attached afterwards, so `MTP.init/2` refuses a model loaded without it rather than letting the omission surface later as `verify decode failed: code=-1`.
+
+> **Do not reuse a session straight after abandoning a stream.** Cancellation is asynchronous and unacknowledged, and a session's two contexts are shared by every call on it, so starting the next `generate/3` immediately can put a second writer on a KV cache the cancelled draft loop has not released — which aborts the VM. Let an abandoned stream reach a terminal event, or build a fresh session. Tracked in the v0.8.42 changelog.
 
 ### Usage
 
@@ -551,7 +555,11 @@ A regular (non-MTP) Qwen 3.6 quant will fail at `LlamaCppEx.MTP.init/2` — the 
 {:ok, model} =
   LlamaCppEx.load_model(
     Path.expand("~/Downloads/Qwen3.6-35B-A3B-MTP-Q4_K_M.gguf"),
-    n_gpu_layers: 999
+    n_gpu_layers: 999,
+    # Required. Upstream defaults this off so non-speculative callers do not pay
+    # for the MTP head's tensors, and they cannot be attached to an
+    # already-loaded model, so MTP.init/2 refuses a model loaded without it.
+    load_mtp: true
   )
 
 # Build the speculative session once — it owns a target context and a

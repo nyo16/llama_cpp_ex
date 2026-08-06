@@ -1,5 +1,155 @@
 # Changelog
 
+## v0.8.42
+
+llama.cpp bump to b10280, on top of b10217 from v0.8.41. Unlike the last two
+ranges this one **does** break the upstream C API, and validating it against real
+models surfaced a separate bug that had made MTP speculative decoding inoperable
+since v0.8.41. The public Elixir API gains one option and no removals.
+
+### Fixed
+
+- **MTP speculative decoding was completely broken and is now working.** b10217
+  (in v0.8.41) added `bool load_mtp` to `llama_model_params` to stop
+  non-speculative callers paying for the MTP head's tensors (#26296, extended by
+  #26412 here). v0.8.41's notes read that field as inert because the NIF builds
+  its params from `llama_model_default_params()` and so picks up new fields
+  automatically — which is true at compile time and wrong at runtime: the default
+  is `false`, so the MTP layers stopped being read off disk. Nothing on the way in
+  objects. Both contexts build and `common_speculative_init` returns ok; the first
+  draft then fails with `verify decode failed: code=-1`, far from the cause.
+
+  `LlamaCppEx.Model.load/2` therefore gains a `:load_mtp` option (default
+  `false`, matching upstream), the flag is recorded on `%Model{}`, and
+  `LlamaCppEx.MTP.init/2` refuses a model loaded without it, naming the remedy —
+  the layers cannot be attached after the fact, so failing at `init/2` is the only
+  place the error is actionable.
+
+  This went unnoticed because the `:mtp` suite had never been run against a real
+  model: it needs an MTP-enabled GGUF, and none was available when the tests were
+  written. It is now verified end-to-end against `Qwen3.5-9B` (`qwen35` with
+  `nextn_predict_layers`), at ~67% draft acceptance with `n_draft: 3`.
+
+### Changed
+
+- **llama.cpp submodule** — Updated from ddd4ec142 to 61881b1f7 (63 commits, tag
+  b10280). Two binding-relevant signatures changed, both breaking:
+  - `llama_sampler_init_penalties` gained a leading `int32_t n_vocab` parameter
+    (#26520, which moved `n_vocab` out of `llama_sampler_data` and into the
+    penalty sampler so the CUDA backend sampler added in #25262 can size its
+    buffers). The NIF's one call site now passes
+    `llama_vocab_n_tokens(model->vocab())`. Note that the argument *count*
+    changed, so a missed call site is a compile error rather than a silent
+    reordering — but the two leading `int32_t`s are interchangeable to the
+    compiler, which is why the penalties path is now covered behaviourally
+    (a repetition-inducing prompt under greedy decoding must be diverted by
+    `penalty_repeat`, and `penalty_repeat: 1.0` must be a byte-identical no-op)
+    rather than only by constructing a sampler.
+  - `llama_sampler_init_dry` dropped its `int32_t n_ctx_train` parameter in the
+    same range. The binding does not expose the DRY sampler, so nothing to do.
+  - **Sampler semantics**: `-1` no longer means "context size" for
+    `penalty_last_n` or `dry_penalty_last_n` — history-based samplers lost their
+    full-context windows (#26524) and a negative value now clamps to `0`, i.e.
+    disabled. The NIF hardcodes `penalty_last_n = 64`, so behaviour here is
+    unchanged, but anyone who read `-1` as "whole context" upstream should note it.
+  - `include/llama.h` aside, `common/chat.h`, `common/speculative.h` and
+    `common/json-schema-to-grammar.h` are untouched in this range.
+    `common/common.h` changed only in ways the binding does not reach: the
+    `common_params_vocoder` struct was replaced by `tts_lang` / `tts_speaker_file`
+    fields on `common_params` (#26254, which also breaks the `llama-tts` binary),
+    and `common_get_env` / `common_set_env` were added.
+  - **Speculative / MTP**: `common_speculative_init` refactored its enabled-config
+    handling (#26510); MTP support added for Qwen3-Next (#25589), DeepSeek V3.2
+    (#26457), GLM-4.7-Flash (#24868) and DeepSeek V4 alongside DSpark (#25784);
+    MiMo V2 MTP tensors are loaded only when used (#26412); dflash `wo_a` reshape
+    fixed on load (#26577).
+  - **llama core / models**: tensors may be reshaped during load (#26531); the
+    indexer cache is allocated only in "full" indexer layers (#26474); MiniMax M3
+    moves MSA into a new memory implementation (#26338) and its graph no longer
+    leaves input tensors unused (#26519); a DeepSeek V4 Flash 0731 chat template
+    (#26398) and a Qwen3 specialized parser (#26252) were added.
+  - **vocab / convert**: default special token ids (#26506) and plamo2 byte tokens
+    (#26511) are now validated; `gguf-py`'s reader validates `n_dims` and guards
+    against `uint64` overflow (#25401).
+  - **ggml**: version bumped to 0.18.1 (ggml/1578) and synced; split-graph inputs
+    now use dynamic allocation (#22789).
+  - **Metal**: DeepSeek V4 Lightning Indexer (#25893) and hyper-connections
+    (#26459) implemented; `SILU_BACK` (#25982) and F16 support for binary ops
+    (#26465) added; `GGML_METAL_USE_BF16` removed from the build scripts (#26604).
+  - **CUDA**: a backend sampler for penalties (#25262); a data race fixed when
+    reusing SMEM in `block_reduce` (#26385).
+  - **SYCL**: non-contiguous concat kernel parallelized (#25852); oneDNN SDPA
+    extended to non-FP16 KV caches (#25874); iGPU classification fixed (#26105).
+  - **Vulkan / OpenCL / WebGPU**: `GATED_LINEAR_ATTN` implemented (#25601);
+    `topk_moe` fusion extended to `sqrt(softplus)` (#26124); large `q6_K` lm_head
+    routed to the flat GEMV and workgroup sizes limited for GLU (#26427, #26383);
+    f16 repeat support added to the WebGPU backend (#26307).
+  - **vendor**: BoringSSL updated twice (#26353, #26523), cpp-httplib to 0.52.0
+    (#26485), and patches applied for `subprocess.h` (#26606). None of these link
+    into the NIF, which builds with `LLAMA_BUILD_SERVER=OFF` and
+    `LLAMA_OPENSSL=OFF`.
+- **`Makefile`** — `LLAMA_COMMIT` follows the submodule to 61881b1f7. It is what a
+  Hex *source* build clones when `vendor/llama.cpp` is absent, so leaving it behind
+  gives source builds the old llama.cpp and git checkouts the new one.
+
+### Tests
+
+- **Three smoke tests asserted prefix reuse that is impossible on hybrid GDN
+  models.** `server_smoke_test.exs` (cache-scope isolation, `PromptCache.restore/4`
+  partial trim) and `llama_cpp_ex_test.exs` (the hybrid `cache_prompt` regression
+  test) all required `prefix_cache_tokens > 0`. Recurrent state cannot be rolled
+  back to an arbitrary position, so `llama_memory_seq_rm` refuses a partial range
+  and the Server *correctly* declines reuse (`server.ex:812`) — meaning the
+  hybrid-model regression test contradicted the very fallback it documents. They
+  passed only because CI's generation model is a dense one.
+
+  Each now branches on `LlamaCppEx.TestModels.seq_rm_kind/1` (a memoised probe of
+  `common_context_can_seq_rm`) and asserts the documented behaviour for the model
+  in hand: reuse on `:part`, the full-reset fallback and `{:error, :seq_rm_refused}`
+  on `:full`. No branch is a skip, and neither `case` has a catch-all, so an
+  unexpected verdict raises instead of passing quietly. Verified both ways —
+  502 passed against a `:part` model and 502 against a `:full` one.
+
+  This was **not** a regression from the bump: `llama-memory-recurrent.cpp` and
+  both hybrid memory implementations are byte-identical between b10217 and b10280.
+
+### Known issues
+
+- **Cancelling an MTP stream and immediately reusing the session aborts the VM.**
+  `request_cancel` sets a flag and the MTP loop then stops without emitting a
+  terminal event (`llama_nif.cpp:2009`), so `Generator.stop/1` has no completion
+  signal to await and returns while the dirty scheduler may still be inside
+  `llama_decode`. For `LlamaCppEx.stream/3` this is harmless — each call owns a
+  context that dies with it — but an `%MTP{}` session holds two long-lived contexts
+  that every call shares, so the next `generate/3` can put a second writer on a KV
+  cache the cancelled loop has not released, tripping
+  `GGML_ASSERT(offset + size <= ggml_nbytes(tensor))` or segfaulting.
+
+  Pre-existing and unrelated to this bump; it became reachable only because MTP
+  works again. Fixing it means acknowledging cancellation in the NIF and in the
+  cancellation protocol that non-MTP streaming shares, so it is deliberately not
+  bundled here. `LlamaCppEx.MTP`'s docs carry the warning and the reproduction
+  lives in `LlamaCppEx.MTPCancelTest`, gated behind its own `:mtp_cancel` tag —
+  its own module, without `:mtp`, because `--include` beats `--exclude` and a
+  second gate tag would abort `--include mtp` runs.
+
+### Validation
+
+Built from source against the bumped submodule (Metal, `LLAMA_BACKEND=auto`) and
+run against real GGUF models from local storage:
+
+- **374 passed** in the default suite (no model required).
+- **502 passed** with `--include smoke --include embeddings --include slow`,
+  twice: once with `Llama-3.2-3B-Instruct` (`:part` seq_rm) and once with
+  `Qwen3.5-0.8B` (`:full`, hybrid GDN).
+- **384 passed** with `--include mtp` against `Qwen3.5-9B` (MTP head).
+- Generation, chat templating, streaming, JSON-schema-constrained sampling,
+  grammar-with-penalties, and the penalties path itself were additionally checked
+  across nine architectures — `llama`, `qwen3`, `qwen35`, `qwen35moe`, `gemma4`,
+  `gpt-oss`, `bert` (Ministral), plus `Qwen3-Embedding-0.6B` for the embedding
+  paths (L2 norm exactly 1.0; paraphrase similarity 0.73 against 0.20 for
+  unrelated text).
+
 ## v0.8.41
 
 Maintenance release: llama.cpp bump to b10217, on top of b10178 from v0.8.40.

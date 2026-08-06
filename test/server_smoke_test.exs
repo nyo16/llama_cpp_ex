@@ -298,7 +298,6 @@ defmodule LlamaCppEx.ServerSmokeTest do
     # Same tenant, same prompt: the cache is exactly what it is for.
     {:ok, _} = Server.generate(server, prompt, max_tokens: 8, cache_scope: "tenant-a")
     {%{prefix_cache_tokens: same_scope}, _} = next_telemetry()
-    assert same_scope > 0
 
     # Another tenant, byte-identical prompt: no reuse. This is the leak.
     {:ok, _} = Server.generate(server, prompt, max_tokens: 8, cache_scope: "tenant-b")
@@ -313,7 +312,31 @@ defmodule LlamaCppEx.ServerSmokeTest do
     # ...and it caches for itself like any other scope.
     {:ok, _} = Server.generate(server, prompt, max_tokens: 8)
     {%{prefix_cache_tokens: default_again}, _} = next_telemetry()
-    assert default_again > 0
+
+    # The two same-scope reads above are this test's positive control: without
+    # them, `cross_scope == 0` is equally satisfied by a server that never
+    # reuses anything, and M6 would look proven while proving nothing.
+    #
+    # That control is only available where the model can reuse a prefix at all.
+    # Each request leaves its 8 generated tokens in the slot's KV, so a repeat of
+    # the same prompt is a shorter match than what the slot holds and needs a
+    # partial trim — which a `:full` (hybrid GDN) model refuses, making the
+    # Server correctly decline reuse (`server.ex:1243`). Scope isolation is
+    # covered architecture-independently by the `best_candidate/4` and
+    # `covers?/4` unit tests in `server_test.exs`; here we assert whichever
+    # behaviour this model actually contracts for.
+    case LlamaCppEx.TestModels.seq_rm_kind(:gen) do
+      :part ->
+        assert same_scope > 0
+        assert default_again > 0
+
+      kind when kind in [:full, :rs] ->
+        assert same_scope == 0,
+               "#{kind} model reused a prefix that required a partial trim"
+
+        assert default_again == 0,
+               "#{kind} model reused a prefix that required a partial trim"
+    end
   end
 
   # W-6. `stream/3` and `stream_tokens/3` truncated silently on a per-token
@@ -441,11 +464,18 @@ defmodule LlamaCppEx.ServerSmokeTest do
     setup do
       {:ok, model} = LlamaCppEx.load_model(LlamaCppEx.TestModels.path!(:gen), n_gpu_layers: 0)
       {:ok, ctx} = Context.create(model, n_ctx: 512, n_seq_max: 2)
+
+      # Probed before the blob is built, not after: the probe clears the
+      # context's KV memory and decodes two throwaway tokens to reach its
+      # verdict, so running it later would invalidate the state captured below.
+      seq_rm_kind = LlamaCppEx.NIF.context_can_seq_rm(ctx.ref)
+      :ok = LlamaCppEx.NIF.memory_clear(ctx.ref)
+
       {:ok, tokens} = Tokenizer.encode(model, "The capital of France is")
       :ok = LlamaCppEx.NIF.decode(ctx.ref, tokens)
       {:ok, blob} = LlamaCppEx.NIF.state_seq_get_data(ctx.ref, 0)
 
-      %{ctx: ctx, tokens: tokens, blob: blob}
+      %{ctx: ctx, tokens: tokens, blob: blob, seq_rm_kind: seq_rm_kind}
     end
 
     test "restores a full entry and reports the whole prefix", %{
@@ -469,7 +499,8 @@ defmodule LlamaCppEx.ServerSmokeTest do
     test "trims the unusable tail when only a prefix is reusable", %{
       ctx: ctx,
       tokens: tokens,
-      blob: blob
+      blob: blob,
+      seq_rm_kind: seq_rm_kind
     } do
       entry = %{
         tokens: tokens,
@@ -481,8 +512,35 @@ defmodule LlamaCppEx.ServerSmokeTest do
 
       keep = entry.len - 2
 
-      assert {:ok, ^keep} = PromptCache.restore(ctx.ref, 1, entry, keep)
-      assert LlamaCppEx.NIF.memory_seq_pos_max(ctx.ref, 1) == keep - 1
+      result = PromptCache.restore(ctx.ref, 1, entry, keep)
+      pos_max = LlamaCppEx.NIF.memory_seq_pos_max(ctx.ref, 1)
+
+      case seq_rm_kind do
+        :part ->
+          assert {:ok, ^keep} = result
+          assert pos_max == keep - 1
+
+        :full ->
+          # Hybrid GDN: recurrent state is not preserved per token, so upstream
+          # refuses to erase a partial tail. The blob is already in KV by then,
+          # so the only safe answer is to drop the whole sequence — reporting a
+          # prefix that is not there would have the next decode read stale
+          # positions as real. That fallback is the contract here, not an error.
+          assert {:error, :seq_rm_refused} = result
+
+          assert pos_max == -1,
+                 "a refused trim left KV behind, which the next decode would read as real positions"
+
+        :rs ->
+          # Bounded partial rollback: whether two positions are within
+          # `n_rs_seq` is a context-configuration question, so both outcomes are
+          # legal. The invariant that must hold either way is that the sequence
+          # never reports a prefix it is not actually holding.
+          case result do
+            {:ok, ^keep} -> assert pos_max == keep - 1
+            {:error, :seq_rm_refused} -> assert pos_max == -1
+          end
+      end
     end
 
     test "a blob that cannot be restored leaves the sequence empty", %{

@@ -4,9 +4,9 @@ defmodule LlamaCppEx.Model do
   """
 
   @enforce_keys [:ref]
-  defstruct [:ref]
+  defstruct [:ref, load_mtp: false]
 
-  @type t :: %__MODULE__{ref: reference()}
+  @type t :: %__MODULE__{ref: reference(), load_mtp: boolean()}
 
   @tuning_option_keys [
     :main_gpu,
@@ -18,7 +18,7 @@ defmodule LlamaCppEx.Model do
     :check_tensors
   ]
 
-  @structural_option_keys [:n_gpu_layers, :vocab_only]
+  @structural_option_keys [:n_gpu_layers, :vocab_only, :load_mtp]
 
   @doc """
   Options that are safe for a caller to forward from user-supplied opts.
@@ -58,6 +58,11 @@ defmodule LlamaCppEx.Model do
     * `:vocab_only` - Load vocabulary and metadata only, skip weights. Defaults to `false`.
     * `:check_tensors` - Validate model tensor data on load. Defaults to `false`,
       because the check walks every tensor and costs real time on a large model.
+    * `:load_mtp` - Load the Multi-Token Prediction head's layers, for use with
+      `LlamaCppEx.MTP`. Defaults to `false`, matching upstream, so that callers
+      who are not doing speculative decoding do not pay for the extra tensors.
+      Required for `LlamaCppEx.MTP.init/2`, which refuses a model loaded without
+      it — the layers cannot be added after the fact.
 
   > #### Load mode {: .info}
   >
@@ -96,6 +101,7 @@ defmodule LlamaCppEx.Model do
     use_direct_io = Keyword.get(opts, :use_direct_io, false)
     vocab_only = Keyword.get(opts, :vocab_only, false)
     check_tensors = Keyword.get(opts, :check_tensors, false)
+    load_mtp = Keyword.get(opts, :load_mtp, false)
 
     case LlamaCppEx.NIF.model_load(
            path,
@@ -107,9 +113,10 @@ defmodule LlamaCppEx.Model do
            use_mlock,
            use_direct_io,
            vocab_only,
-           check_tensors
+           check_tensors,
+           load_mtp
          ) do
-      {:ok, ref} -> {:ok, %__MODULE__{ref: ref}}
+      {:ok, ref} -> {:ok, %__MODULE__{ref: ref, load_mtp: load_mtp}}
       {:error, _} = error -> error
     end
   end

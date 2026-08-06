@@ -10,7 +10,7 @@ defmodule LlamaCppEx.MTP do
 
       :ok = LlamaCppEx.init()
       {:ok, model} = LlamaCppEx.load_model("Qwen3.6-35B-A3B-MTP-Q4_K_M.gguf",
-                                            n_gpu_layers: 999)
+                                            n_gpu_layers: 999, load_mtp: true)
 
       {:ok, mtp} = LlamaCppEx.MTP.init(model, n_draft: 3, n_ctx: 8192)
 
@@ -23,13 +23,27 @@ defmodule LlamaCppEx.MTP do
       IO.puts("acceptance: \#{Float.round(stats.acceptance_rate * 100, 1)}%")
 
   The model GGUF must contain MTP head layers (e.g.
-  `ggml-org/Qwen3.6-35B-A3B-MTP-GGUF`). Loading a non-MTP quant with `init/2`
-  will return `{:error, _}` from `common_speculative_init`.
+  `ggml-org/Qwen3.6-35B-A3B-MTP-GGUF`) — look for `*.nextn_predict_layers` in its
+  metadata — **and** must be loaded with `load_mtp: true`. Upstream defaults that
+  flag to `false` so non-speculative callers do not pay for the head's tensors,
+  and the layers cannot be attached afterwards, so `init/2` refuses a model
+  loaded without it.
 
   Upstream currently requires `n_parallel = 1` for MTP. This module reflects
   that — a single MTP session decodes one sequence at a time. Reuse the same
   `%MTP{}` value across calls to `stream/3` / `generate/3` to avoid rebuilding
   the contexts; KV caches are cleared on each call.
+
+  > #### Do not reuse a session straight after abandoning a stream {: .warning}
+  >
+  > Cancellation is asynchronous and unacknowledged: abandoning a `stream/3`
+  > early (`Enum.take/2`, `break`, an exception) sets a flag that the draft loop
+  > notices and then exits without reporting that it has done so. A session's two
+  > contexts are long-lived and shared by every call on it, so starting the next
+  > `generate/3` or `stream/3` immediately can put a second writer on a KV cache
+  > the cancelled loop has not finished with — which aborts the VM rather than
+  > returning an error. Let an abandoned stream run to a terminal event, or build
+  > a fresh session with `init/2`, before using the session again.
 
   MTP is the only speculative type this binding exposes. Upstream llama.cpp
   also implements EAGLE-3, DFlash (block-diffusion drafting via a separate
@@ -81,28 +95,45 @@ defmodule LlamaCppEx.MTP do
   def init(%Model{} = model, opts \\ []) do
     n_draft = Keyword.get(opts, :n_draft, 3)
 
-    if is_integer(n_draft) and n_draft > 0 do
-      base_ctx_opts = forwardable_context_opts(opts)
-      main_opts = Keyword.merge(base_ctx_opts, ctx_type: :default)
-      # Match upstream server: MTP draft context is created with n_rs_seq=0.
-      # The MTP impl handles state rollback internally via cached hidden
-      # states (pending_h / verify_h), not via recurrent-state snapshots.
-      draft_opts = Keyword.merge(base_ctx_opts, ctx_type: :mtp, n_rs_seq: 0)
+    cond do
+      not (is_integer(n_draft) and n_draft > 0) ->
+        {:error, ":n_draft must be a positive integer"}
 
-      with {:ok, main_ctx} <- Context.create(model, main_opts),
-           {:ok, mtp_ctx} <- Context.create(model, draft_opts),
-           {:ok, spec_ref} <-
-             LlamaCppEx.NIF.speculative_init(main_ctx.ref, mtp_ctx.ref, n_draft) do
-        {:ok,
-         %__MODULE__{
-           main_ctx: main_ctx,
-           mtp_ctx: mtp_ctx,
-           spec_ref: spec_ref,
-           n_draft: n_draft
-         }}
-      end
-    else
-      {:error, ":n_draft must be a positive integer"}
+      not model.load_mtp ->
+        # Upstream gates the MTP head's tensors behind a load-time flag that
+        # defaults to false (#26296), and nothing downstream notices they are
+        # missing: both contexts build and `common_speculative_init` returns ok,
+        # then the first draft fails with `verify decode failed: code=-1`. The
+        # layers cannot be attached to an already-loaded model, so refuse here
+        # with the actual remedy instead of surfacing that later error.
+        {:error,
+         "model was loaded without load_mtp: true, so its MTP head layers are " <>
+           "absent; reload it with LlamaCppEx.load_model(path, load_mtp: true)"}
+
+      true ->
+        do_init(model, opts, n_draft)
+    end
+  end
+
+  defp do_init(model, opts, n_draft) do
+    base_ctx_opts = forwardable_context_opts(opts)
+    main_opts = Keyword.merge(base_ctx_opts, ctx_type: :default)
+    # Match upstream server: MTP draft context is created with n_rs_seq=0.
+    # The MTP impl handles state rollback internally via cached hidden
+    # states (pending_h / verify_h), not via recurrent-state snapshots.
+    draft_opts = Keyword.merge(base_ctx_opts, ctx_type: :mtp, n_rs_seq: 0)
+
+    with {:ok, main_ctx} <- Context.create(model, main_opts),
+         {:ok, mtp_ctx} <- Context.create(model, draft_opts),
+         {:ok, spec_ref} <-
+           LlamaCppEx.NIF.speculative_init(main_ctx.ref, mtp_ctx.ref, n_draft) do
+      {:ok,
+       %__MODULE__{
+         main_ctx: main_ctx,
+         mtp_ctx: mtp_ctx,
+         spec_ref: spec_ref,
+         n_draft: n_draft
+       }}
     end
   end
 
