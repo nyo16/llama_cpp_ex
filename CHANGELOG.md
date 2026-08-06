@@ -30,6 +30,15 @@ the GPU, and passes the smoke suite: **528 tests, 0 failures**.
 
   Only reachable on a partial accept, which is why a working MTP setup can still
   post plausible acceptance rates while quietly drifting.
+
+  Cross-checked against upstream's own reference path rather than reasoned about
+  alone. `common_sampler_sample_and_accept_n` (`common/sampling.cpp`) returns the
+  tokens sampled at batch indices `0..k`, and `tools/server/server-context.cpp`
+  then does `slot.prompt.tokens.insert({ids.begin(), ids.end() - 1})` followed by
+  `slot.sampled = ids.back()` — appending every accepted token *except the last*,
+  and carrying the last into the next iteration. That is the invariant this fix
+  restores. (Upstream trims with `seq_rm` where this binding rolls back and
+  re-decodes, so the mechanisms differ; the resulting context must not.)
 - **The CUDA NIF could not be loaded** — `ggml-cuda.a` leaves the CUDA runtime,
   cuBLAS/cuBLASLt and the CUDA driver API unresolved, but the Linux link line
   only ever added `-lstdc++ -lm -lpthread`. The resulting `.so` linked and then
@@ -94,6 +103,17 @@ the GPU, and passes the smoke suite: **528 tests, 0 failures**.
   with `ldd -r` — pointing the loader at the toolkit's driver stub, which
   carries the `libcuda.so.1` soname, so a GPU-less runner can still perform a
   real resolution. `enif_*` is excluded, being supplied by the BEAM at load.
+
+  Each leg holds a runner for about twenty minutes, almost all of it nvcc, so
+  the job runs on every pull request but on master only when a CUDA build input
+  moved — `Makefile`, `c_src/`, `mix.exs`, `mix.lock`, the `vendor/llama.cpp`
+  submodule, or the workflow itself. A squash merge of an up-to-date branch
+  lands the exact tree the pull request tested; the case worth re-testing is
+  master having moved underneath it, which is what that path list detects. A
+  force-push, a missing base commit, or anything else unexpected resolves to
+  running the job. The workflow also gained a `concurrency` group so repeated
+  pushes to a branch cancel their predecessors instead of queueing behind them,
+  keyed on `run_id` for master so every landed commit keeps its own verdict.
 - **Precompiler unit tests** — `test/precompiler_test.exs` pins the artifact
   selection rules, including the case that motivates the driver check.
 

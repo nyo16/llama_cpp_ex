@@ -11,6 +11,14 @@ on:
 permissions:
   contents: read
 
+# Without this, pushing twice to a branch leaves both runs going and they queue
+# behind each other — which matters now that the CUDA jobs hold a runner for
+# ~20 minutes. master is excluded from cancellation by keying on run_id there:
+# every commit that lands deserves its own verdict, superseded or not.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref == 'refs/heads/master' && github.run_id || github.ref }}
+  cancel-in-progress: true
+
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
   MIX_ENV: test
@@ -192,6 +200,59 @@ jobs:
 
       - run: mix dialyzer
 
+  # Each CUDA leg holds a runner for ~20 minutes, almost all of it nvcc. On a
+  # pull request that is the price of the gate and it gets paid. On master it
+  # usually re-confirms a tree the pull request just tested, because a squash
+  # merge of an up-to-date branch lands exactly that tree.
+  #
+  # "Usually" is the whole question: master can move under a branch — v0.8.42
+  # landed under this one mid-review — and then the merged tree is genuinely
+  # untested. So the answer is not "skip master", it is "run master when the
+  # inputs moved". Anything unexpected resolves to running it.
+  cuda-scope:
+    name: CUDA inputs changed?
+    runs-on: ubuntu-22.04
+    outputs:
+      changed: ${{ steps.q.outputs.changed }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+      - id: q
+        env:
+          EVENT: ${{ github.event_name }}
+          BEFORE: ${{ github.event.before }}
+        run: |
+          set -eu
+          run_it() { echo "changed=true" >> "$GITHUB_OUTPUT"; echo "$1"; exit 0; }
+
+          # Written as plain `if` blocks rather than `test ... && run_it`: under
+          # `set -e` a false left-hand side makes the whole && list non-zero, and
+          # whether that exits the shell is a corner of the standard nobody should
+          # have to recall while editing CI.
+          if [ "$EVENT" = "pull_request" ]; then
+            run_it "pull request: the link job is the gate"
+          fi
+
+          # A force-push or a first push leaves no usable base. Unknown means run.
+          case "$BEFORE" in
+            ''|0000000*) run_it "no usable base commit; running to be safe" ;;
+          esac
+          if ! git cat-file -e "${BEFORE}^{commit}" 2>/dev/null; then
+            run_it "base commit ${BEFORE} not present; running to be safe"
+          fi
+
+          # vendor/llama.cpp is a submodule, so a bump shows up as a change to
+          # that path — which is exactly the case that must not be skipped.
+          if git diff --name-only "$BEFORE" "$GITHUB_SHA" | tee /tmp/changed.txt \
+             | grep -qE '^(Makefile|c_src/|mix\.exs|mix\.lock|vendor/llama\.cpp|\.github/workflows/ci\.yml)'; then
+            run_it "a CUDA build input changed"
+          fi
+
+          echo "changed=false" >> "$GITHUB_OUTPUT"
+          echo "no CUDA build input in this push; skipping the link job"
+          cat /tmp/changed.txt
+
   # Nothing in CI ever selected the CUDA backend, which is how a NIF that could
   # not resolve `cuMemCreate` reached a release. Runners have no GPU, so this
   # cannot execute a kernel; it proves the two things that were actually broken:
@@ -200,7 +261,8 @@ jobs:
   cuda-link:
     name: CUDA link (cu${{ matrix.major }})
     runs-on: ubuntu-22.04
-    needs: [setup]
+    needs: [setup, cuda-scope]
+    if: needs.cuda-scope.outputs.changed == 'true'
     strategy:
       fail-fast: false
       matrix:
