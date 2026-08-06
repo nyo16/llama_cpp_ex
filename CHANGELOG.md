@@ -30,6 +30,15 @@ the GPU, and passes the smoke suite: **528 tests, 0 failures**.
 
   Only reachable on a partial accept, which is why a working MTP setup can still
   post plausible acceptance rates while quietly drifting.
+
+  Cross-checked against upstream's own reference path rather than reasoned about
+  alone. `common_sampler_sample_and_accept_n` (`common/sampling.cpp`) returns the
+  tokens sampled at batch indices `0..k`, and `tools/server/server-context.cpp`
+  then does `slot.prompt.tokens.insert({ids.begin(), ids.end() - 1})` followed by
+  `slot.sampled = ids.back()` — appending every accepted token *except the last*,
+  and carrying the last into the next iteration. That is the invariant this fix
+  restores. (Upstream trims with `seq_rm` where this binding rolls back and
+  re-decodes, so the mechanisms differ; the resulting context must not.)
 - **The CUDA NIF could not be loaded** — `ggml-cuda.a` leaves the CUDA runtime,
   cuBLAS/cuBLASLt and the CUDA driver API unresolved, but the Linux link line
   only ever added `-lstdc++ -lm -lpthread`. The resulting `.so` linked and then
