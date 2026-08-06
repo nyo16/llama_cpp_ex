@@ -47,14 +47,33 @@ end
 Elixir `~> 1.18`, enforced by `mix.exs`. The Erlang/OTP floor depends on how the
 NIF is obtained:
 
-Precompiled NIFs are published for `aarch64-apple-darwin` (Metal) and
-`x86_64-linux-gnu` (CPU) at NIF versions 2.17 and 2.18 — that is **Erlang/OTP 26
-or newer** (OTP 26, 27 and 28 report NIF 2.17; OTP 29 reports 2.18). On those
-platforms `mix deps.get` and `mix compile` download a binary and none of the
-build tooling below is needed.
+Precompiled NIFs are published at NIF versions 2.17 and 2.18 — that is
+**Erlang/OTP 26 or newer** (OTP 26, 27 and 28 report NIF 2.17; OTP 29 reports
+2.18) — for:
 
-Everything else builds from source: OTP 25 (NIF 2.16), other architectures,
-musl, Windows, and every GPU backend except Metal. A source build needs
+| Target | Backend | Selected when |
+|---|---|---|
+| `aarch64-apple-darwin` | Metal | Apple Silicon |
+| `x86_64-linux-gnu` | CPU | no usable CUDA install found |
+| `x86_64-linux-gnu-cu12` | CUDA | driver plus a CUDA 12 runtime |
+| `x86_64-linux-gnu-cu13` | CUDA | driver plus a CUDA 13 runtime |
+
+On those platforms `mix deps.get` and `mix compile` download a binary and none
+of the build tooling below is needed.
+
+The CUDA variants are separate artifacts rather than one because the NIF links
+`libcudart`/`libcublas`/`libcublasLt` dynamically and those sonames are
+major-versioned: a cu13 build cannot load against a CUDA 12 install. Selection
+is automatic and deliberately conservative — it requires **both** a CUDA runtime
+and a driver (`libcuda.so.1`), because a CUDA artifact on a machine with no
+driver cannot be loaded at all, and falls back to the CPU artifact otherwise.
+Override with `LLAMA_CUDA_VARIANT=cu12|cu13|none` if the probe gets it wrong.
+
+No CUDA toolkit is needed to *run* these; only the runtime libraries they link.
+
+Everything else builds from source: OTP 25 (NIF 2.16), other architectures
+(including aarch64 Linux — DGX Spark and friends), musl, Windows, Vulkan, and
+any CUDA major version without a published artifact. A source build needs
 
 - a C++17 compiler (GCC, Clang, or MSVC),
 - CMake 3.14+,
@@ -63,10 +82,10 @@ musl, Windows, and every GPU backend except Metal. A source build needs
 
 ### Backend Selection
 
-What the published artifacts actually contain is Metal on Apple Silicon and
-plain CPU on Linux. **There is no CUDA or Vulkan artifact**, and a downloaded
-artifact never runs the Makefile, so nothing is auto-detected at install time.
-GPU acceleration beyond Metal always means an explicit source build:
+A downloaded artifact never runs the Makefile, so nothing is auto-detected at
+install time — the backend is whatever that artifact was built with. Vulkan, and
+CUDA on any platform without a published variant, always mean an explicit source
+build:
 
 ```bash
 mix compile                        # Precompiled artifact when one matches this
@@ -78,9 +97,14 @@ LLAMA_BACKEND=cpu mix compile      # CPU only
 ```
 
 Setting `LLAMA_BACKEND` to anything forces a source build and bypasses the
-precompiled artifact — that is how a CUDA or Vulkan build is obtained. When a
-source build runs with `LLAMA_BACKEND` unset it picks Metal on macOS, CUDA if
-`nvcc` is on `PATH`, and CPU otherwise.
+precompiled artifact. When a source build runs with `LLAMA_BACKEND` unset it
+picks Metal on macOS, CUDA if a toolkit is found, and CPU otherwise.
+
+CUDA is located by `CUDA_HOME`, then `CUDA_PATH`, then `nvcc` on `PATH`, then
+`/usr/local/cuda`, `/opt/cuda` and the versioned `/usr/local/cuda-*` directories.
+`PATH` alone is not enough to rely on: DGX OS, environment modules and most CI
+shells leave `nvcc` off a non-login `PATH`, which used to mean a silent CPU-only
+build on a machine with a perfectly good toolkit.
 
 Power users can pass arbitrary CMake flags:
 
@@ -88,12 +112,18 @@ Power users can pass arbitrary CMake flags:
 LLAMA_CMAKE_ARGS="-DGGML_CUDA_FORCE_CUBLAS=ON" mix compile
 ```
 
-Two more build variables:
+Three more build variables:
 
 - `LLAMA_PORTABLE=1` drops `-march=native`. ggml turns it on by default, which
   tunes the binary to the exact CPU it was built on; the release workflow sets
   this so published artifacts run on every machine of that architecture. Leave
   it unset locally, where the native flags are free performance.
+- `LLAMA_CUDA_NCCL=1` builds and links ggml's NCCL collectives, which speed up
+  multi-GPU work. Off by default: ggml would otherwise enable NCCL silently
+  whenever the build host happens to have it, and since the Makefile assembles
+  the link line by hand rather than through cmake, that produced a NIF that
+  failed to load with `undefined symbol: ncclAllReduce`. Turning it on also
+  makes `libnccl.so.2` a load-time requirement.
 - `LLAMA_COMMIT=<sha>` overrides the pinned llama.cpp commit used when
   `vendor/llama.cpp` has to be cloned.
 

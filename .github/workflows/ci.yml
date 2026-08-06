@@ -192,6 +192,103 @@ jobs:
 
       - run: mix dialyzer
 
+  # Nothing in CI ever selected the CUDA backend, which is how a NIF that could
+  # not resolve `cuMemCreate` reached a release. Runners have no GPU, so this
+  # cannot execute a kernel; it proves the two things that were actually broken:
+  # the toolkit is found without nvcc on PATH, and the link line resolves every
+  # CUDA symbol ggml-cuda leaves undefined.
+  cuda-link:
+    name: CUDA link (cu${{ matrix.major }})
+    runs-on: ubuntu-22.04
+    needs: [setup]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - toolkit: '12-9'
+            major: '12'
+          - toolkit: '13-0'
+            major: '13'
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          submodules: recursive
+
+      # Before setup-beam, which installs into the tool cache this would remove.
+      - name: Free disk space for the CUDA toolkit
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/share/boost
+          df -h /
+
+      - uses: erlef/setup-beam@v1
+        with:
+          otp-version: ${{ env.OTP_VERSION }}
+          elixir-version: ${{ env.ELIXIR_VERSION }}
+
+      - name: Install build dependencies
+        run: sudo apt-get update && sudo apt-get install -y cmake libgomp1
+
+      - name: Install the CUDA toolkit
+        run: |
+          curl -fsSLO https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2204/x86_64/cuda-keyring_1.1-1_all.deb
+          sudo dpkg -i cuda-keyring_1.1-1_all.deb
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends cuda-toolkit-${{ matrix.toolkit }}
+          # Deliberately NOT added to PATH. A toolkit that is installed but not
+          # on PATH is the normal case on real machines (DGX OS ships nvcc via
+          # /etc/profile.d, which no non-login shell sources) and it is the case
+          # that used to produce a silent CPU-only build.
+          ls -d /usr/local/cuda-*
+
+      - run: mix deps.get
+
+      - name: Build the NIF against CUDA
+        run: mix compile
+        env:
+          LLAMA_BACKEND: cuda
+          LLAMA_PORTABLE: '1'
+          # One architecture. This job is about finding the toolkit and
+          # resolving the link; compiling the full release architecture list
+          # would add an hour and prove nothing more.
+          LLAMA_CMAKE_ARGS: -DCMAKE_CUDA_ARCHITECTURES=86-real
+
+      - name: The NIF must declare and resolve its CUDA dependencies
+        run: |
+          set -eu
+          # -L is required: mix makes _build/<env>/lib/<app>/priv a symlink to
+          # the project's priv/, and find does not descend into symlinked
+          # directories, so a plain find reports nothing here.
+          so=$(find -L _build -name llama_cpp_ex_nif.so | head -1)
+          test -n "$so" || { echo "::error::no NIF was built"; exit 1; }
+          readelf -d "$so" | grep NEEDED
+
+          for lib in libcudart.so.${{ matrix.major }} libcublas.so.${{ matrix.major }} libcuda.so.1; do
+            readelf -d "$so" | grep -q "\[$lib\]" \
+              || { echo "::error::$so does not link $lib"; exit 1; }
+          done
+
+          # Full symbol resolution, which is the check that catches this class of
+          # bug. `ldd -r` needs libcuda.so.1 and a runner has no driver to supply
+          # it -- but the toolkit stub exports exactly the driver API under that
+          # same soname, so pointing the loader at it resolves the real symbols
+          # rather than faking them.
+          stub=$(find /usr/local -path '*/lib64/stubs/libcuda.so' | head -1)
+          test -n "$stub" || { echo "::error::no libcuda stub in the toolkit"; exit 1; }
+          mkdir -p /tmp/driver
+          ln -sf "$stub" /tmp/driver/libcuda.so.1
+          LD_LIBRARY_PATH=/tmp/driver ldd -r "$so" > /tmp/ldd.txt 2>&1 || true
+          cat /tmp/ldd.txt
+
+          # enif_* is the NIF API. The BEAM exports it from the running emulator
+          # and resolves it when it dlopens the library, so it is undefined here
+          # by design and is the one thing this gate must ignore. Everything else
+          # unresolved is a library the link line forgot -- how `cuMemCreate` and
+          # then `ncclAllReduce` each shipped a NIF that could not load.
+          if grep -iE 'undefined symbol|not found' /tmp/ldd.txt | grep -v 'undefined symbol: enif_'; then
+            echo "::error::the NIF has unresolved non-BEAM symbols; see above"
+            exit 1
+          fi
+
   inference:
     name: Inference smoke
     runs-on: ubuntu-22.04

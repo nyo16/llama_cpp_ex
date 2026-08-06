@@ -1,7 +1,39 @@
 defmodule LlamaCppEx.Precompiler do
   @moduledoc false
 
-  @all_targets ["aarch64-apple-darwin", "x86_64-linux-gnu"]
+  # Linux CUDA artifacts are published per CUDA major version because the NIF
+  # links libcudart, libcublas and libcublasLt dynamically and their sonames are
+  # major-versioned: libcudart.so.12 against a CUDA 13 install does not resolve,
+  # and there is no compatibility shim in either direction. So the variant has
+  # to be part of the target name -- one "linux CUDA" artifact cannot exist.
+  #
+  # Newest first: a host with both toolkits installed should get the newer one.
+  @cuda_majors ["13", "12"]
+
+  # Only x86_64 Linux gets CUDA variants today. aarch64 Linux (DGX Spark and
+  # friends) still resolves to no artifact and source-builds, which the
+  # Makefile's toolkit discovery now handles; adding it here is a matrix entry
+  # in .github/workflows/precompile.yml plus this list.
+  @cuda_targets for major <- @cuda_majors, do: "x86_64-linux-gnu-cu#{major}"
+
+  @all_targets ["aarch64-apple-darwin", "x86_64-linux-gnu"] ++ @cuda_targets
+
+  # Set by each CUDA leg of the precompile workflow. Detection below deliberately
+  # refuses to name a CUDA target on a machine with no driver, which is exactly
+  # what a release runner is, so the build has to state its own variant.
+  # Also the escape hatch for a host whose layout defeats the probe: "cu12",
+  # "cu13", or "none" to force the CPU artifact.
+  @variant_env "LLAMA_CUDA_VARIANT"
+
+  # Where a CUDA runtime shows up when ldconfig has nothing to say -- a container
+  # with no ldconfig cache, or an install that was never registered.
+  @cuda_lib_globs [
+    "/usr/local/cuda/lib64",
+    "/usr/local/cuda-*/lib64",
+    "/usr/local/cuda-*/targets/*/lib",
+    "/usr/lib/x86_64-linux-gnu",
+    "/usr/lib64"
+  ]
 
   def all_supported_targets(:fetch), do: @all_targets
 
@@ -17,9 +49,73 @@ defmodule LlamaCppEx.Precompiler do
 
     cond do
       system_arch =~ ~r/aarch64.*apple.*darwin/ -> {:ok, "aarch64-apple-darwin"}
-      system_arch =~ ~r/x86_64.*linux.*gnu/ -> {:ok, "x86_64-linux-gnu"}
+      system_arch =~ ~r/x86_64.*linux.*gnu/ -> {:ok, "x86_64-linux-gnu" <> cuda_suffix()}
       true -> {:error, "unsupported target: #{system_arch}"}
     end
+  end
+
+  @doc false
+  # Exposed for tests: the probe is pure over the two facts it looks up, so the
+  # interesting cases can be exercised without a CUDA install.
+  def cuda_suffix(env \\ &System.get_env/1, present? \\ &library_present?/1) do
+    case env.(@variant_env) do
+      nil -> detect_cuda_suffix(present?)
+      "" -> ""
+      "none" -> ""
+      "cu" <> major when major in @cuda_majors -> "-cu#{major}"
+      other -> raise ArgumentError, bad_variant_message(other)
+    end
+  end
+
+  defp bad_variant_message(value) do
+    allowed = Enum.map_join(@cuda_majors, ", ", &"cu#{&1}")
+    "#{@variant_env}=#{inspect(value)} is not a known CUDA variant (#{allowed}, none)"
+  end
+
+  # Two conditions, both required. The runtime libraries are what the artifact
+  # links against, and the driver is what -lcuda resolves to at load time: a
+  # machine with the toolkit but no driver cannot dlopen a CUDA build at all, so
+  # handing it one would turn a working CPU install into a NIF that fails to
+  # load. nvcc is deliberately not consulted -- running a CUDA build needs no
+  # compiler, and plenty of GPU hosts have no toolkit installed.
+  defp detect_cuda_suffix(present?) do
+    if present?.("libcuda.so.1") do
+      Enum.find_value(@cuda_majors, "", fn major ->
+        if present?.("libcudart.so.#{major}"), do: "-cu#{major}"
+      end)
+    else
+      ""
+    end
+  end
+
+  defp library_present?(soname) do
+    ldconfig_lists?(soname) or on_disk?(soname)
+  end
+
+  defp ldconfig_lists?(soname) do
+    # ldconfig lives in /sbin, which is routinely off a non-root PATH.
+    case Enum.find(
+           ["ldconfig", "/sbin/ldconfig", "/usr/sbin/ldconfig"],
+           &System.find_executable/1
+         ) do
+      nil ->
+        false
+
+      ldconfig ->
+        case System.cmd(ldconfig, ["-p"], stderr_to_stdout: true) do
+          {output, 0} -> String.contains?(output, soname)
+          _ -> false
+        end
+    end
+  catch
+    # An ldconfig that is present but unusable is a "no", never a build failure.
+    _, _ -> false
+  end
+
+  defp on_disk?(soname) do
+    Enum.any?(@cuda_lib_globs, fn glob ->
+      glob |> Path.join(soname) |> Path.wildcard() |> Enum.any?()
+    end)
   end
 
   def build_native(args), do: ElixirMake.Precompiler.mix_compile(args)
@@ -184,7 +280,14 @@ defmodule LlamaCppEx.MixProject do
   #   LLAMA_BACKEND    auto | metal | cuda | vulkan | cpu
   #   LLAMA_CMAKE_ARGS extra flags appended to the llama.cpp cmake invocation
   #   LLAMA_PORTABLE   1 to drop -march=native, set by the precompile workflow
-  @make_env_passthrough ["LLAMA_BACKEND", "LLAMA_CMAKE_ARGS", "LLAMA_PORTABLE"]
+  #   LLAMA_CUDA_NCCL  1 to build and link ggml's NCCL multi-GPU collectives,
+  #                    which also makes libnccl.so.2 a load-time requirement
+  @make_env_passthrough [
+    "LLAMA_BACKEND",
+    "LLAMA_CMAKE_ARGS",
+    "LLAMA_PORTABLE",
+    "LLAMA_CUDA_NCCL"
+  ]
 
   defp make_env do
     base = %{"FINE_INCLUDE_DIR" => Fine.include_dir()}

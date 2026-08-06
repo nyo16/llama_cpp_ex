@@ -54,6 +54,52 @@ LDFLAGS = -shared
 # Platform detection
 UNAME_S := $(shell uname -s)
 
+# --- CUDA toolkit discovery --------------------------------------------------
+# Resolved once, up here, because two separate decisions depend on it: `auto`
+# uses it to decide whether CUDA is available at all, and the Linux link line
+# below needs the library directory.
+#
+# Probing only `which nvcc` was wrong in both places. nvcc is routinely absent
+# from a *non-login* PATH -- DGX OS installs it via /etc/profile.d/nv_paths.sh,
+# which `ssh host make`, systemd units and most CI shells never source -- so on
+# a machine with a complete toolkit `auto` silently produced a CPU-only build,
+# and an explicit LLAMA_BACKEND=cuda produced no -L flags and failed the link on
+# libcudart. Honour CUDA_HOME and CUDA_PATH first (both are conventional and
+# either may be exported by a module system), then nvcc on PATH, then the
+# standard install locations.
+ifeq ($(strip $(CUDA_HOME)),)
+  CUDA_HOME := $(strip $(CUDA_PATH))
+endif
+ifeq ($(strip $(CUDA_HOME)),)
+  CUDA_HOME := $(patsubst %/bin/nvcc,%,$(shell command -v nvcc 2>/dev/null))
+endif
+ifeq ($(strip $(CUDA_HOME)),)
+  CUDA_HOME := $(firstword $(wildcard /usr/local/cuda /opt/cuda) \
+                 $(shell ls -d /usr/local/cuda-* 2>/dev/null | sort -V | tail -1))
+endif
+
+# Presence of the compiler, not of the directory: /usr/local/cuda survives a
+# partial uninstall, and a runtime-only install has libraries but cannot build.
+NVCC := $(wildcard $(CUDA_HOME)/bin/nvcc)
+
+# x86_64 and sbsa toolkits both expose lib64 (a symlink to targets/<triple>/lib
+# on sbsa); Debian's packaged nvidia-cuda-toolkit only has lib.
+CUDA_LIBDIR := $(firstword $(wildcard $(CUDA_HOME)/lib64 $(CUDA_HOME)/lib))
+
+# ggml's own GGML_CUDA_NCCL defaults to ON and quietly links libnccl through
+# cmake whenever NCCL happens to be installed on the build host. cmake's
+# target_link_libraries is invisible to this file -- the link line below is
+# assembled by hand from the static archives ggml leaves behind -- so on a host
+# with NCCL (every DGX, most multi-GPU boxes) ggml-cuda.a came out carrying
+# undefined nccl* symbols and the resulting NIF failed to load with
+# `undefined symbol: ncclAllReduce`.
+#
+# So whether NCCL is used is declared here rather than discovered, and it is off
+# by default. It only accelerates collectives across multiple GPUs, while
+# linking it makes libnccl.so.2 a hard load-time requirement of the artifact --
+# the same trade as -march=native, and the same answer.
+LLAMA_CUDA_NCCL ?= 0
+
 # Backend selection (auto, metal, cuda, vulkan, cpu)
 LLAMA_BACKEND ?= auto
 
@@ -73,7 +119,7 @@ ifeq ($(LLAMA_BACKEND),auto)
   ifeq ($(UNAME_S),Darwin)
     CMAKE_FLAGS += -DGGML_METAL=ON -DGGML_METAL_EMBED_LIBRARY=ON
   else
-    ifneq ($(shell which nvcc 2>/dev/null),)
+    ifneq ($(NVCC),)
       CMAKE_FLAGS += -DGGML_CUDA=ON
     endif
   endif
@@ -85,6 +131,22 @@ else ifeq ($(LLAMA_BACKEND),vulkan)
   CMAKE_FLAGS += -DGGML_VULKAN=ON
 else ifeq ($(LLAMA_BACKEND),cpu)
   CMAKE_FLAGS += -DGGML_METAL=OFF -DGGML_CUDA=OFF -DGGML_VULKAN=OFF
+endif
+
+# cmake locates the toolkit by searching PATH for nvcc, so it has the same blind
+# spot the discovery block above exists to cover: without this, a build that
+# correctly selected CUDA still fails in `find_package(CUDAToolkit)`.
+ifneq (,$(filter -DGGML_CUDA=ON,$(CMAKE_FLAGS)))
+  ifneq ($(NVCC),)
+    CMAKE_FLAGS += -DCMAKE_CUDA_COMPILER=$(NVCC)
+  endif
+  # Always stated, never left to ggml's default, so the archives cmake produces
+  # and the link line assembled below cannot disagree about NCCL.
+  ifneq ($(filter 1 true yes,$(LLAMA_CUDA_NCCL)),)
+    CMAKE_FLAGS += -DGGML_CUDA_NCCL=ON
+  else
+    CMAKE_FLAGS += -DGGML_CUDA_NCCL=OFF
+  endif
 endif
 
 # Portable builds, for artifacts that leave this machine. ggml defaults
@@ -125,15 +187,30 @@ else
   ifneq ($(shell $(CXX) -fopenmp -E - < /dev/null 2>/dev/null && echo yes),)
     LDFLAGS += -lgomp
   endif
-  # ggml-cuda.a leaves the CUDA runtime, cuBLAS, and driver API unresolved.
-  # The stubs dir lets -lcuda link on hosts without a driver (e.g. release CI);
-  # the real libcuda.so.1 is picked up from the driver at load time.
+  # ggml-cuda.a leaves the CUDA runtime, cuBLAS/cuBLASLt and the CUDA driver API
+  # unresolved, but this line only ever added -lstdc++ -lm -lpthread. The .so
+  # then linked and failed at load with `undefined symbol: cuMemCreate`, a
+  # driver-API symbol ggml-cuda's VMM pool calls.
   ifneq (,$(filter -DGGML_CUDA=ON,$(CMAKE_FLAGS)))
-    CUDA_HOME ?= $(patsubst %/bin/nvcc,%,$(shell which nvcc 2>/dev/null))
-    ifneq ($(CUDA_HOME),)
-      LDFLAGS += -L$(CUDA_HOME)/lib64 -L$(CUDA_HOME)/lib64/stubs
+    ifeq ($(strip $(CUDA_LIBDIR)),)
+      $(error CUDA backend selected but no CUDA toolkit libraries were found. \
+        Set CUDA_HOME to the toolkit root, the directory holding bin/nvcc.)
+    endif
+    LDFLAGS += -L$(CUDA_LIBDIR)
+    # -lcuda is the driver API, which is shipped by the driver and not by the
+    # toolkit, so it is missing on every GPU-less build host including the
+    # release runners. The stub carries SONAME libcuda.so.1, so linking against
+    # it resolves the symbols at build time and still loads the real driver
+    # library at run time.
+    ifneq ($(wildcard $(CUDA_LIBDIR)/stubs),)
+      LDFLAGS += -L$(CUDA_LIBDIR)/stubs
     endif
     LDFLAGS += -lcudart -lcublas -lcublasLt -lcuda
+    # Matches the -DGGML_CUDA_NCCL above. Opting in without this pairing is the
+    # `undefined symbol: ncclAllReduce` load failure.
+    ifneq ($(filter 1 true yes,$(LLAMA_CUDA_NCCL)),)
+      LDFLAGS += -lnccl
+    endif
   endif
 endif
 

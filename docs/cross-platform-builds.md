@@ -11,11 +11,23 @@ with.
 |---|---|---|---|
 | macOS (Apple Silicon) | Yes — Metal | Metal | Tested |
 | macOS (Intel) | No | CPU | Supported, source build |
-| Linux (x86_64, glibc) | Yes — **CPU only** | CUDA if `nvcc` found, else CPU | Supported |
-| Linux (x86_64) + NVIDIA | No | CUDA if `nvcc` found | Supported via `LLAMA_BACKEND=cuda` |
+| Linux (x86_64, glibc) | Yes — CPU | CUDA if a toolkit is found, else CPU | Supported |
+| Linux (x86_64) + NVIDIA, CUDA 12 | Yes — **CUDA** (`-cu12`) | CUDA | Supported |
+| Linux (x86_64) + NVIDIA, CUDA 13 | Yes — **CUDA** (`-cu13`) | CUDA | Supported |
 | Linux (x86_64) + AMD | No | CPU | Supported via `LLAMA_BACKEND=vulkan` |
+| Linux (aarch64) + NVIDIA | No | CUDA if a toolkit is found | Tested on DGX Spark (GB10), source build |
 | Linux (aarch64), musl | No | as above | Supported, source build |
 | Windows (WSL2) | No | Same as Linux | Supported, source build |
+
+### Why CUDA is split by major version
+
+The NIF links `libcudart`, `libcublas` and `libcublasLt` dynamically, and those
+sonames are major-versioned — `libcudart.so.12` and `libcudart.so.13` are
+different files with no compatibility shim in either direction. One "Linux CUDA"
+artifact therefore cannot exist; each CUDA major gets its own target name.
+
+Running one needs the CUDA **runtime** libraries, not the toolkit: no `nvcc`
+required.
 
 Artifacts are published for NIF 2.17 and 2.18, which means Erlang/OTP 26 or
 newer. Anything else — including OTP 25, which reports NIF 2.16 — falls back to a
@@ -32,18 +44,43 @@ entry is declared even though OTP 25 works.
 mix compile
 ```
 
-If a precompiled artifact matches this OS, architecture and NIF version,
-`mix compile` downloads it and stops. **The Makefile does not run, so nothing is
-auto-detected**, and the artifact's backend is whatever it was built with: Metal
-on Apple Silicon, CPU on `x86_64-linux-gnu`. A Linux user with a working CUDA
-toolkit still gets a CPU-only binary from this path.
+If a precompiled artifact matches this OS, architecture, NIF version and CUDA
+variant, `mix compile` downloads it and stops. **The Makefile does not run, so
+nothing is auto-detected** — the artifact's backend is whatever it was built
+with.
+
+On `x86_64-linux-gnu` the choice between the CPU artifact and a CUDA one is made
+by `LlamaCppEx.Precompiler` in `mix.exs`, which looks for two things and needs
+both:
+
+1. a driver, `libcuda.so.1`, and
+2. a CUDA runtime, `libcudart.so.13` then `libcudart.so.12`, newest first.
+
+The driver half is not belt-and-braces. A CUDA build links `-lcuda`, so on a
+machine with a toolkit and no driver it cannot be `dlopen`ed at all — handing
+that machine a CUDA artifact would turn a working CPU install into a NIF that
+fails to load. Absent either half, the CPU artifact is chosen.
+
+Both are looked up through `ldconfig -p` and, failing that, on disk under
+`/usr/local/cuda*/lib64`, `/usr/local/cuda-*/targets/*/lib`,
+`/usr/lib/x86_64-linux-gnu` and `/usr/lib64`.
+
+`LLAMA_CUDA_VARIANT` overrides the result: `cu12`, `cu13`, or `none` to force the
+CPU artifact.
 
 Only when no artifact matches does the Makefile run, and only then is a backend
 detected:
 
 1. **macOS** → Metal
-2. **Linux with `nvcc` in PATH** → CUDA
+2. **Linux with a CUDA toolkit** → CUDA
 3. **Otherwise** → CPU
+
+"With a CUDA toolkit" means the Makefile found one, which is a wider test than
+`nvcc` being on `PATH`: `CUDA_HOME`, then `CUDA_PATH`, then `nvcc` on `PATH`,
+then `/usr/local/cuda`, `/opt/cuda`, then the newest `/usr/local/cuda-*`. DGX OS
+puts `nvcc` on the login `PATH` only, via `/etc/profile.d/nv_paths.sh`, which
+`ssh host mix compile`, systemd units and most CI shells never source — probing
+`PATH` alone silently produced CPU-only builds on machines with a full toolkit.
 
 ### Explicit Backend
 
@@ -142,28 +179,45 @@ mix compile
 
 ### Linux (NVIDIA CUDA)
 
-**A plain `mix compile` will not give you CUDA.** The published
-`x86_64-linux-gnu` artifact is a CPU build, and downloading it skips the Makefile
-entirely, so `nvcc` is never looked for. CUDA requires an explicit source build:
+On x86_64 a plain `mix compile` now does give you CUDA, provided the machine has
+a driver and a CUDA 12 or CUDA 13 runtime. No toolkit and no build tools are
+needed for that path — the `-cu12`/`-cu13` artifact is downloaded like any other:
+
+```bash
+mix deps.get
+mix compile
+```
+
+Confirm what you got:
+
+```elixir
+LlamaCppEx.devices()   # backend "CUDA" on a CUDA artifact
+```
+
+A source build is still required for aarch64 Linux, for a CUDA major with no
+published artifact, and any time you want flags of your own:
 
 ```bash
 # Prerequisites
 sudo apt-get install build-essential cmake git
 # Install CUDA toolkit: https://developer.nvidia.com/cuda-downloads
-nvcc --version
 
 mix deps.get
 LLAMA_BACKEND=cuda mix compile
 ```
 
 `LLAMA_BACKEND=cuda` forces the source build and selects CUDA explicitly. The
-Makefile's `nvcc` auto-detection only ever applies to a source build that ran for
-some other reason, so do not rely on it.
+toolkit does not have to be on `PATH`; see the discovery order above, or set
+`CUDA_HOME` to the directory holding `bin/nvcc`. If nothing is found the build
+fails with that message rather than quietly linking against nothing.
 
 **CUDA version compatibility:**
-- CUDA 11.7+ recommended
-- CUDA 12.x preferred for latest GPU architectures
-- The build uses static CUDA libraries by default
+- CUDA 12 and CUDA 13 have published artifacts. Older majors build from source.
+- Architectures come from ggml's portable default list under `LLAMA_PORTABLE=1`,
+  which covers Turing through Blackwell and includes `sm_121a` for GB10; a local
+  build without it compiles for the GPU actually present.
+- NCCL is off unless `LLAMA_CUDA_NCCL=1`. See the README's build variables for
+  why the default is not ggml's.
 
 ### Linux (Vulkan)
 
@@ -257,26 +311,57 @@ cmake --version
 
 ### CUDA Not Detected
 
-First check whether a source build ran at all. If `mix compile` downloaded a
-precompiled artifact then the Makefile never executed and `nvcc` was never
-consulted — the binary is CPU-only by construction. Force a source build:
+Find out which binary you are running before changing anything:
+
+```elixir
+LlamaCppEx.devices()   # backend "CUDA", or "CPU" if this is a CPU build
+```
+
+If it says CPU on a CUDA machine, the artifact probe declined. It requires both
+a driver and a CUDA runtime:
+
+```bash
+ldconfig -p | grep -E 'libcuda\.so\.1|libcudart\.so\.(12|13)'
+```
+
+A missing `libcuda.so.1` means no driver, and a CUDA build could not have been
+loaded anyway. A missing `libcudart.so.N` means no CUDA runtime for a published
+major. Name the variant directly if your layout defeats the probe:
+
+```bash
+LLAMA_CUDA_VARIANT=cu13 mix deps.compile llama_cpp_ex --force
+```
+
+To build from source instead:
 
 ```bash
 LLAMA_BACKEND=cuda mix compile
 ```
 
-Then verify `nvcc` is in your PATH:
+That fails loudly when no toolkit is found. `nvcc` does **not** need to be on
+`PATH` — `CUDA_HOME`, `CUDA_PATH`, `/usr/local/cuda`, `/opt/cuda` and
+`/usr/local/cuda-*` are all checked — but if the toolkit lives somewhere else:
 
 ```bash
-which nvcc
-nvcc --version
+CUDA_HOME=/opt/nvidia/cuda-13.0 LLAMA_BACKEND=cuda mix compile
 ```
 
-If using a non-standard CUDA installation path:
+### `undefined symbol` when the NIF loads
+
+A CUDA build that compiles and links but dies at load is a missing library on
+the link line, not a broken toolkit. Two have bitten this project:
+`cuMemCreate` (the driver API, fixed by linking `-lcuda`) and `ncclAllReduce`
+(ggml enabling NCCL behind cmake's back, fixed by stating `-DGGML_CUDA_NCCL`
+explicitly). Reproduce the diagnosis with:
 
 ```bash
-LLAMA_CMAKE_ARGS="-DCMAKE_CUDA_COMPILER=/usr/local/cuda-12/bin/nvcc" mix compile
+ldd -r _build/dev/lib/llama_cpp_ex/priv/llama_cpp_ex_nif.so | grep undefined
 ```
+
+Ignore `enif_*`: those are the NIF API and the BEAM resolves them when it loads
+the library. Anything else unresolved is a real missing dependency. The
+`cuda-link` job in `.github/workflows/ci.yml` runs exactly this check on every
+pull request for both CUDA majors.
 
 ### Metal Errors on macOS
 
