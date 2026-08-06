@@ -1,5 +1,102 @@
 # Changelog
 
+## Unreleased
+
+CUDA is a first-class target: the NIF now links correctly against it, and the
+release publishes prebuilt CUDA artifacts for CUDA 12 and CUDA 13.
+
+Verified on 2x NVIDIA DGX Spark (GB10, `sm_121a`, aarch64, CUDA 13.0.2) against
+this base (llama.cpp b10280) — a source build with `LLAMA_BACKEND=cuda` loads,
+reports `backend: "CUDA"` from `LlamaCppEx.devices()`, offloads 31/31 layers to
+the GPU, and passes the smoke suite: **528 tests, 0 failures**.
+
+### Fixed
+
+- **MTP hybrid rollback corrupted the KV cache after a partial accept.** This is
+  a different bug from the `load_mtp` one fixed in v0.8.42, and the two are
+  complementary: that one stopped the MTP layers being read off disk at all,
+  this one silently misplaces context once they are working.
+
+  The verification batch is `[sampled, drafts...]` at positions starting at
+  `n_past`, so `sampled` occupies batch element 0. When only some drafts are
+  accepted the target's KV is rolled back to `n_past` and re-decoded — but the
+  re-decode started at the first *accepted* token rather than at `sampled`.
+  Every token therefore landed one position early, and the last accepted token
+  was written into the context even though it becomes the next iteration's
+  `sampled` and is decoded again there, duplicating it. Reading the slice from
+  `prompt[size - n_accepted_total - 1]` restores `sampled, accepted[0..k-2]`
+  across `[n_past, n_past + k)`, which is exactly the span `n_past` then
+  advances over.
+
+  Only reachable on a partial accept, which is why a working MTP setup can still
+  post plausible acceptance rates while quietly drifting.
+- **The CUDA NIF could not be loaded** — `ggml-cuda.a` leaves the CUDA runtime,
+  cuBLAS/cuBLASLt and the CUDA driver API unresolved, but the Linux link line
+  only ever added `-lstdc++ -lm -lpthread`. The resulting `.so` linked and then
+  died at load with `undefined symbol: cuMemCreate`, a driver-API symbol
+  ggml-cuda's VMM pool calls.
+- **The toolkit was only ever looked for on `PATH`** — and that is the one place
+  it frequently is not. DGX OS installs `nvcc` via `/etc/profile.d/nv_paths.sh`,
+  which `ssh host mix compile`, systemd units and most CI shells never source;
+  environment modules behave the same way. The two consequences were both
+  silent: `LLAMA_BACKEND=auto` produced a CPU-only build on a machine with a
+  complete toolkit, and `LLAMA_BACKEND=cuda` produced a link line with no `-L`
+  at all. Discovery now tries `CUDA_HOME`, `CUDA_PATH`, `nvcc` on `PATH`,
+  `/usr/local/cuda`, `/opt/cuda`, then the newest `/usr/local/cuda-*`, is shared
+  between backend auto-detection and the link line so they cannot disagree, and
+  passes `-DCMAKE_CUDA_COMPILER` so cmake's own `find_package(CUDAToolkit)`
+  does not repeat the mistake. Selecting CUDA with no toolkit present is now an
+  error naming `CUDA_HOME`, not `cannot find -lcudart`.
+- **`undefined symbol: ncclAllReduce`** — ggml's `GGML_CUDA_NCCL` defaults to ON
+  and links libnccl through cmake whenever the build host happens to have NCCL,
+  which every DGX and most multi-GPU boxes do. The Makefile assembles its link
+  line by hand from ggml's static archives, so cmake's `target_link_libraries`
+  is invisible to it and the symbols went unresolved. The flag is now always
+  stated explicitly rather than inherited, defaulting to OFF; `LLAMA_CUDA_NCCL=1`
+  turns it on and adds the matching `-lnccl`.
+- **Library path assumed `lib64`** — Debian's packaged `nvidia-cuda-toolkit`
+  only has `lib`, and the stubs directory is now probed rather than assumed.
+
+### Added
+
+- **`LlamaCppEx.MTP.init/2` now says when a checkpoint has no MTP head**, via a
+  new `LlamaCppEx.NIF.model_n_layer_nextn/1` wrapping upstream's
+  `llama_model_n_layer_nextn`. Previously this surfaced as
+  `{:error, "failed to create context"}`, with the real reason — llama.cpp's
+  `context type MTP requested but model doesn't contain MTP layers` — buried in
+  engine output the caller may not be showing.
+
+  This is not the `load_mtp` case and no flag recovers it: most GGUF conversions
+  of an MTP-capable model simply drop the head. Unsloth's
+  `Qwen3.6-35B-A3B-UD-Q4_K_XL` reports zero nextn layers; their separate
+  `Qwen3.6-35B-A3B-MTP-GGUF` build of the same model carries them. The message
+  now says so and points at the `-MTP` build.
+
+- **Precompiled CUDA artifacts** — `x86_64-linux-gnu-cu12` and
+  `x86_64-linux-gnu-cu13` join the existing `aarch64-apple-darwin` (Metal) and
+  `x86_64-linux-gnu` (CPU) targets, at NIF 2.17 and 2.18. `mix compile` on an
+  x86_64 Linux box with a driver and a CUDA runtime now downloads a GPU build
+  instead of silently installing a CPU one.
+
+  They are separate artifacts because the NIF links `libcudart`/`libcublas`/
+  `libcublasLt` dynamically and those sonames are major-versioned; one "Linux
+  CUDA" binary cannot serve both. Selection requires **both** a CUDA runtime and
+  a driver (`libcuda.so.1`) — a CUDA build links `-lcuda` and cannot be
+  `dlopen`ed at all without one, so a toolkit-only machine keeps the CPU
+  artifact rather than getting a NIF that fails to load. `LLAMA_CUDA_VARIANT`
+  (`cu12`, `cu13`, `none`) overrides the probe.
+- **`LLAMA_CUDA_NCCL`** build variable, off by default. See above.
+- **A CUDA link gate in CI** — nothing in CI had ever selected the CUDA backend,
+  which is how a NIF that could not resolve `cuMemCreate` reached a release. The
+  new `cuda-link` job builds against both CUDA 12 and CUDA 13 on every pull
+  request with the toolkit deliberately off `PATH`, asserts the `.so` declares
+  `libcudart`, `libcublas` and `libcuda.so.1`, and then resolves every symbol
+  with `ldd -r` — pointing the loader at the toolkit's driver stub, which
+  carries the `libcuda.so.1` soname, so a GPU-less runner can still perform a
+  real resolution. `enif_*` is excluded, being supplied by the BEAM at load.
+- **Precompiler unit tests** — `test/precompiler_test.exs` pins the artifact
+  selection rules, including the case that motivates the driver check.
+
 ## v0.8.42
 
 llama.cpp bump to b10280, on top of b10217 from v0.8.41. Unlike the last two

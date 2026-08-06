@@ -42,6 +42,7 @@ defmodule LlamaCppEx.NIF do
 
   def model_n_ctx_train(_model), do: :erlang.nif_error(:not_loaded)
   def model_n_embd(_model), do: :erlang.nif_error(:not_loaded)
+  def model_n_layer_nextn(_model), do: :erlang.nif_error(:not_loaded)
   def model_desc(_model), do: :erlang.nif_error(:not_loaded)
   def model_size(_model), do: :erlang.nif_error(:not_loaded)
   def model_n_params(_model), do: :erlang.nif_error(:not_loaded)

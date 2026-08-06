@@ -47,14 +47,33 @@ end
 Elixir `~> 1.18`, enforced by `mix.exs`. The Erlang/OTP floor depends on how the
 NIF is obtained:
 
-Precompiled NIFs are published for `aarch64-apple-darwin` (Metal) and
-`x86_64-linux-gnu` (CPU) at NIF versions 2.17 and 2.18 — that is **Erlang/OTP 26
-or newer** (OTP 26, 27 and 28 report NIF 2.17; OTP 29 reports 2.18). On those
-platforms `mix deps.get` and `mix compile` download a binary and none of the
-build tooling below is needed.
+Precompiled NIFs are published at NIF versions 2.17 and 2.18 — that is
+**Erlang/OTP 26 or newer** (OTP 26, 27 and 28 report NIF 2.17; OTP 29 reports
+2.18) — for:
 
-Everything else builds from source: OTP 25 (NIF 2.16), other architectures,
-musl, Windows, and every GPU backend except Metal. A source build needs
+| Target | Backend | Selected when |
+|---|---|---|
+| `aarch64-apple-darwin` | Metal | Apple Silicon |
+| `x86_64-linux-gnu` | CPU | no usable CUDA install found |
+| `x86_64-linux-gnu-cu12` | CUDA | driver plus a CUDA 12 runtime |
+| `x86_64-linux-gnu-cu13` | CUDA | driver plus a CUDA 13 runtime |
+
+On those platforms `mix deps.get` and `mix compile` download a binary and none
+of the build tooling below is needed.
+
+The CUDA variants are separate artifacts rather than one because the NIF links
+`libcudart`/`libcublas`/`libcublasLt` dynamically and those sonames are
+major-versioned: a cu13 build cannot load against a CUDA 12 install. Selection
+is automatic and deliberately conservative — it requires **both** a CUDA runtime
+and a driver (`libcuda.so.1`), because a CUDA artifact on a machine with no
+driver cannot be loaded at all, and falls back to the CPU artifact otherwise.
+Override with `LLAMA_CUDA_VARIANT=cu12|cu13|none` if the probe gets it wrong.
+
+No CUDA toolkit is needed to *run* these; only the runtime libraries they link.
+
+Everything else builds from source: OTP 25 (NIF 2.16), other architectures
+(including aarch64 Linux — DGX Spark and friends), musl, Windows, Vulkan, and
+any CUDA major version without a published artifact. A source build needs
 
 - a C++17 compiler (GCC, Clang, or MSVC),
 - CMake 3.14+,
@@ -63,10 +82,10 @@ musl, Windows, and every GPU backend except Metal. A source build needs
 
 ### Backend Selection
 
-What the published artifacts actually contain is Metal on Apple Silicon and
-plain CPU on Linux. **There is no CUDA or Vulkan artifact**, and a downloaded
-artifact never runs the Makefile, so nothing is auto-detected at install time.
-GPU acceleration beyond Metal always means an explicit source build:
+A downloaded artifact never runs the Makefile, so nothing is auto-detected at
+install time — the backend is whatever that artifact was built with. Vulkan, and
+CUDA on any platform without a published variant, always mean an explicit source
+build:
 
 ```bash
 mix compile                        # Precompiled artifact when one matches this
@@ -78,9 +97,14 @@ LLAMA_BACKEND=cpu mix compile      # CPU only
 ```
 
 Setting `LLAMA_BACKEND` to anything forces a source build and bypasses the
-precompiled artifact — that is how a CUDA or Vulkan build is obtained. When a
-source build runs with `LLAMA_BACKEND` unset it picks Metal on macOS, CUDA if
-`nvcc` is on `PATH`, and CPU otherwise.
+precompiled artifact. When a source build runs with `LLAMA_BACKEND` unset it
+picks Metal on macOS, CUDA if a toolkit is found, and CPU otherwise.
+
+CUDA is located by `CUDA_HOME`, then `CUDA_PATH`, then `nvcc` on `PATH`, then
+`/usr/local/cuda`, `/opt/cuda` and the versioned `/usr/local/cuda-*` directories.
+`PATH` alone is not enough to rely on: DGX OS, environment modules and most CI
+shells leave `nvcc` off a non-login `PATH`, which used to mean a silent CPU-only
+build on a machine with a perfectly good toolkit.
 
 Power users can pass arbitrary CMake flags:
 
@@ -88,12 +112,18 @@ Power users can pass arbitrary CMake flags:
 LLAMA_CMAKE_ARGS="-DGGML_CUDA_FORCE_CUBLAS=ON" mix compile
 ```
 
-Two more build variables:
+Three more build variables:
 
 - `LLAMA_PORTABLE=1` drops `-march=native`. ggml turns it on by default, which
   tunes the binary to the exact CPU it was built on; the release workflow sets
   this so published artifacts run on every machine of that architecture. Leave
   it unset locally, where the native flags are free performance.
+- `LLAMA_CUDA_NCCL=1` builds and links ggml's NCCL collectives, which speed up
+  multi-GPU work. Off by default: ggml would otherwise enable NCCL silently
+  whenever the build host happens to have it, and since the Makefile assembles
+  the link line by hand rather than through cmake, that produced a NIF that
+  failed to load with `undefined symbol: ncclAllReduce`. Turning it on also
+  makes `libnccl.so.2` a load-time requirement.
 - `LLAMA_COMMIT=<sha>` overrides the pinned llama.cpp commit used when
   `vendor/llama.cpp` has to be cloned.
 
@@ -525,7 +555,41 @@ Multi-Token Prediction speculative decoding (upstream PR [#22673](https://github
 > - Qwen 3.6 35B-A3B-MTP (hybrid MoE): plain 39.5 → MTP **44.0 tok/s (1.11×)**
 > - Qwen 3.6 27B (dense): plain 10.7 → MTP **10.6 tok/s (~1.0×, neutral)**
 >
-> Larger `n_draft` hurts on Metal because verify cost grows faster than acceptance benefit. On NVIDIA, `n_draft: 3` is the right default — that's what the upstream 2× number assumes.
+> Larger `n_draft` hurts on Metal because verify cost grows faster than acceptance benefit.
+
+> **Performance note: NVIDIA GB10 (DGX Spark).** MTP does pay here, but nothing
+> like the upstream 2×, and the best `n_draft` is not 3. Qwen3.6-35B-A3B
+> UD-Q4_K_XL from the `-MTP` build, 128-token greedy generations, plain and MTP
+> interleaved in one process so drift hits both arms equally (n=11 each):
+>
+> | | median tok/s | range | vs plain |
+> |---|---|---|---|
+> | plain | 61.4 | 61.2–62.4 | — |
+> | MTP `n_draft: 2` | **71.2** | 62.5–75.5 | **+16%** |
+>
+> The ranges do not overlap — MTP's slowest run beat plain's fastest — so the
+> gain is real despite MTP being the noisier arm by an order of magnitude.
+>
+> Sweeping `n_draft` on the same model, though, puts the optimum at 2 rather
+> than 3, and the engine's own counters say why:
+>
+> | `n_draft` | acceptance | tokens/iteration | tok/s |
+> |---|---|---|---|
+> | 2 | 68.5% | 2.38 | 63.0 |
+> | 3 | 57.2% | 2.73 | 52.8 |
+>
+> Going from 2 to 3 buys 15% more tokens per iteration and pays 31% more drafting
+> plus 10% more verify for them, because the third draft position is the one
+> least likely to be accepted. Marginal acceptance decays faster than marginal
+> cost, so the extra draft loses money. In a five-run sweep `n_draft: 3` came out
+> 2% *below* plain and `n_draft: 4` 14% below.
+>
+> So the shape matches Apple Silicon even though the cause differs: on Metal the
+> wide verify is expensive, while GB10 is a unified-memory part whose MoE decode
+> is memory-bandwidth bound, and a wider verify reads more expert weights per
+> step. Both end up wanting a narrower draft than a datacenter GPU does. Treat
+> `n_draft: 3` as the datacenter default the upstream 2× assumes, not as a value
+> that transfers.
 
 ### Other speculative types (EAGLE-3, DFlash, n-gram)
 
@@ -663,7 +727,10 @@ end)
 
 `LlamaCppEx.MTP.init/2`:
 
-  * `:n_draft` — draft tokens proposed per iteration (default `3`). On NVIDIA, 2–4 is the sweet spot. On Apple Silicon, set this to `1` — see the Apple Silicon performance note above.
+  * `:n_draft` — draft tokens proposed per iteration (default `3`). The optimum
+    is hardware-specific and worth measuring rather than assuming: `1` on Apple
+    Silicon, `2` on GB10 (where `3` measured *slower* than no speculation at
+    all), `2–4` on datacenter NVIDIA. See the two performance notes above.
   * `:n_ctx`, `:n_threads`, `:flash_attn`, `:type_k`/`:type_v`, `:offload_kqv`, … — any `LlamaCppEx.Context` option; applied to both target and draft contexts.
 
 `LlamaCppEx.MTP.stream/3`:
@@ -680,9 +747,13 @@ See [`examples/mtp_speculative.exs`](examples/mtp_speculative.exs) for a runnabl
 
 ## Benchmarks
 
-Measured on Apple M4 Max (64 GB), Metal backend (`n_gpu_layers: -1`).
+Each subsection names its own hardware and backend — the numbers below span
+Apple Silicon (Metal) and NVIDIA (CUDA) and are not comparable across sections
+unless they say so. Unless noted otherwise, `n_gpu_layers: -1`.
 
 ### Single-model generation speed
+
+Apple M4 Max (64 GB), Metal backend.
 
 | Model | Quantization | Tokens/sec |
 |-------|-------------|------------|
@@ -702,6 +773,48 @@ New `qwen35moe` architecture with Gated Delta Net (hybrid linear/full attention)
 | Qwen3.6-35B-A3B | Q4_K_XL | 43.8 |
 
 128-token generation, `temp: 0.0`, 3-run average (43.3 / 44.1 / 44.0 t/s).
+
+### CUDA: NVIDIA DGX Spark (GB10)
+
+Same model and quantization as the M1 Max row above, so the two are directly
+comparable. GB10 (`sm_121a`, aarch64, 128 GB unified), CUDA 13.0.2, driver
+580.173.02, llama.cpp b10280, source build with `LLAMA_BACKEND=cuda`.
+
+| Model | Quantization | Tokens/sec (GB10) | Tokens/sec (M1 Max) |
+|-------|-------------|-------------------|---------------------|
+| Qwen3.6-35B-A3B | UD-Q4_K_XL | **62.1** | 43.8 |
+
+128-token generation, `temp: 0.0`, `n_gpu_layers: -1`. Median of 5 runs after a
+discarded warm-up: 61.7 / 62.0 / 62.1 / 62.2 / 62.2 t/s — a 0.9% spread, so the
+1.42x over M1 Max is well outside the noise. All 41 layers offload; the model
+takes 20 799 MiB of device memory.
+
+Two notes on method, both learned the hard way:
+
+- **Each run uses a distinct prompt.** Repeating one prompt hits the context
+  reuse path and reports a throughput the engine never achieved.
+- **Tokens are counted by re-encoding the output**, not by counting stream
+  chunks — a chunk is not a token, and under speculative decoding it can carry
+  several.
+
+The first call after load is discarded: it pays CUDA graph capture and the
+allocator's first-touch layout, and is not representative of steady state.
+
+With MTP speculative decoding, using the separate `-MTP` build of the same model
+(the plain UD-Q4_K_XL carries no MTP head — `MTP.init/2` now says so rather than
+failing with a bare context error):
+
+| | median tok/s | vs plain |
+|---|---|---|
+| plain | 61.4 | — |
+| `n_draft: 2` | **71.2** | +16% |
+| `n_draft: 3` | 61.1 | −2% |
+| `n_draft: 4` | 53.8 | −14% |
+
+`n_draft: 2` is the optimum on this hardware, not the documented default of 3.
+See the GB10 performance note under [Speculative decoding
+(MTP)](#speculative-decoding-mtp) for the acceptance and timing counters behind
+that.
 
 ### Single-sequence generation (Qwen3-4B Q4_K_M)
 

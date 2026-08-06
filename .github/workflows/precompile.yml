@@ -47,11 +47,18 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          # `toolkit` and `variant` are spelled out on every leg, empty where
+          # there is no CUDA. An absent matrix key is null, and `null != ''` in a
+          # GitHub expression resolves through numeric coercion rather than
+          # string comparison; being explicit keeps the `if:` guards below from
+          # depending on that.
           - os: macos-14
             target: aarch64-apple-darwin
             otp: '27.0'
             elixir: '1.18'
             backend: metal
+            toolkit: ''
+            variant: ''
           # OTP 25 reports NIF 2.16, OTP 26/27/28 all report 2.17, and OTP 29 is
           # the first release to report 2.18 (verified against
           # erts/emulator/beam/erl_nif.h in the OTP source). So OTP 27 and OTP 29
@@ -62,16 +69,55 @@ jobs:
             otp: '29.0'
             elixir: '1.20'
             backend: metal
+            toolkit: ''
+            variant: ''
           - os: ubuntu-22.04
             target: x86_64-linux-gnu
             otp: '27.0'
             elixir: '1.18'
             backend: cpu
+            toolkit: ''
+            variant: ''
           - os: ubuntu-22.04
             target: x86_64-linux-gnu
             otp: '29.0'
             elixir: '1.20'
             backend: cpu
+            toolkit: ''
+            variant: ''
+          # CUDA artifacts are per major version because the NIF links
+          # libcudart/libcublas/libcublasLt dynamically and those sonames are
+          # major-versioned: one Linux CUDA build cannot serve both. 22.04 is
+          # kept for the same reason as the CPU legs -- it is the oldest glibc
+          # these artifacts have to load against.
+          - os: ubuntu-22.04
+            target: x86_64-linux-gnu-cu12
+            otp: '27.0'
+            elixir: '1.18'
+            backend: cuda
+            toolkit: '12-9'
+            variant: cu12
+          - os: ubuntu-22.04
+            target: x86_64-linux-gnu-cu12
+            otp: '29.0'
+            elixir: '1.20'
+            backend: cuda
+            toolkit: '12-9'
+            variant: cu12
+          - os: ubuntu-22.04
+            target: x86_64-linux-gnu-cu13
+            otp: '27.0'
+            elixir: '1.18'
+            backend: cuda
+            toolkit: '13-0'
+            variant: cu13
+          - os: ubuntu-22.04
+            target: x86_64-linux-gnu-cu13
+            otp: '29.0'
+            elixir: '1.20'
+            backend: cuda
+            toolkit: '13-0'
+            variant: cu13
 
     runs-on: ${{ matrix.os }}
     permissions:
@@ -80,6 +126,12 @@ jobs:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           submodules: recursive
+      # Before setup-beam, which installs into the tool cache this would remove.
+      - name: Free disk space for the CUDA toolkit
+        if: matrix.toolkit != ''
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/share/boost
+          df -h /
       - uses: erlef/setup-beam@54075bcc5e249e4758d363f27d099f55d843f124 # v1
         with:
           otp-version: ${{ matrix.otp }}
@@ -87,6 +139,17 @@ jobs:
       - name: Install cmake (Linux)
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y cmake
+      - name: Install the CUDA toolkit
+        if: matrix.toolkit != ''
+        run: |
+          curl -fsSLO https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2204/x86_64/cuda-keyring_1.1-1_all.deb
+          sudo dpkg -i cuda-keyring_1.1-1_all.deb
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends cuda-toolkit-${{ matrix.toolkit }}
+          # Not added to PATH on purpose: the Makefile resolves the toolkit
+          # itself, and leaving nvcc off PATH keeps this leg honest about the
+          # discovery path most real machines take.
+          ls -d /usr/local/cuda-*
       - name: Set version from tag
         run: |
           TAG_VERSION="${GITHUB_REF#refs/tags/v}"
@@ -125,6 +188,24 @@ jobs:
           # artifact to whatever CPU the runner happened to have and hand users a
           # SIGILL on older hardware.
           LLAMA_PORTABLE: '1'
+          # Names the artifact. Detection cannot be trusted here: it requires a
+          # driver before it will claim a CUDA target, and a release runner has
+          # a toolkit and no driver, so an unset variant would silently publish
+          # a CUDA build under the CPU name. Empty on the CPU legs, which pins
+          # them to the CPU name even on a runner that happens to have CUDA.
+          LLAMA_CUDA_VARIANT: ${{ matrix.variant }}
+      - name: The artifact must be named for the target this leg builds
+        run: |
+          set -eu
+          # A mismatch here means the matrix and the precompiler disagree about
+          # what this leg produced. Left unchecked it surfaces as the `checksum`
+          # job failing on a missing artifact, long after the build that could
+          # have explained it.
+          ls cache/
+          # Anchored on the version, so it cannot pass on a neighbouring name:
+          # `*-x86_64-linux-gnu-*` alone would happily match the cu12 artifact.
+          ls cache/*-${{ matrix.target }}-"${TAG_VERSION}".tar.gz >/dev/null \
+            || { echo "::error::this leg produced no artifact named for ${{ matrix.target }}"; exit 1; }
       - name: Upload artifacts to the draft release
         env:
           GH_TOKEN: ${{ github.token }}
