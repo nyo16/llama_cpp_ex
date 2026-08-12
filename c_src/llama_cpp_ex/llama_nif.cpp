@@ -2128,7 +2128,18 @@ fine::Ok<> generate_mtp_tokens(
         bool eog = false;
         bool send_failed = false;
 
-        for (int i = 0; i < n_verify; i++) {
+        // `n_emitted < max_tokens` is re-checked here and not just by the outer
+        // `while`: this loop emits up to n_verify (= 1 + n_draft) tokens per
+        // iteration, so gating only on entry overshoots the caller's budget by
+        // up to n_draft - 1. Worse, the overshoot is not even constant --- how
+        // many tokens the final iteration emits depends on how many drafts the
+        // target accepts, which varies between runs on a reused session. That
+        // made `max_tokens: 16` return 16, 17 or 18 tokens for the same prompt
+        // under greedy decoding: the token *sequence* was deterministic, the
+        // stopping point was not. Breaking mid-iteration leaves
+        // n_accepted_total < n_verify, so the rollback below discards the
+        // positions that were decoded but never emitted.
+        for (int i = 0; i < n_verify && n_emitted < max_tokens; i++) {
             auto t0 = std::chrono::steady_clock::now();
             sp.us_other.fetch_add(
                 std::chrono::duration_cast<std::chrono::microseconds>(t0 - t_anchor).count(),

@@ -603,6 +603,16 @@ Upstream llama.cpp implements more speculative types behind the same `common_spe
 - [`ggml-org/Qwen3.6-27B-MTP-GGUF`](https://huggingface.co/ggml-org/Qwen3.6-27B-MTP-GGUF)
 - [`unsloth/Qwen3.6-35B-A3B-MTP-GGUF`](https://huggingface.co/unsloth/Qwen3.6-35B-A3B-MTP-GGUF)
 
+For trying MTP out, or for running the `:mtp` test suite, the small Qwen 3.5 MTP
+builds are far cheaper than any of the above and carry the same `nextn` layers:
+
+- [`unsloth/Qwen3.5-0.8B-MTP-GGUF`](https://huggingface.co/unsloth/Qwen3.5-0.8B-MTP-GGUF) (`Q8_0`, ~0.8 GB — what this repo's MTP suite runs against)
+- [`unsloth/Qwen3.5-4B-MTP-GGUF`](https://huggingface.co/unsloth/Qwen3.5-4B-MTP-GGUF)
+
+Acceptance on a 0.8B target is not representative of production throughput —
+drafting is nearly as expensive as decoding at that size — so use these to
+exercise the path, not to measure it.
+
 A regular (non-MTP) Qwen 3.6 quant will fail at `LlamaCppEx.MTP.init/2` — the GGUF must contain the MTP head's tensors. To check a file before loading it, look for a `*.nextn_predict_layers` key and `blk.N.nextn.*` tensors in its metadata.
 
 The model must also be loaded with `load_mtp: true` (see below). Upstream gates those tensors behind a load-time flag that defaults to off, and they cannot be attached afterwards, so `MTP.init/2` refuses a model loaded without it rather than letting the omission surface later as `verify decode failed: code=-1`.

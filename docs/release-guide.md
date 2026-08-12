@@ -89,7 +89,7 @@ git -C "$d"/vendor/llama.cpp rev-parse HEAD   # must equal the submodule SHA
 
 ## 4. Update version and changelog
 
-1. **`mix.exs`** line 40: bump `@version` (e.g. `"0.6.5"` → `"0.6.6"`)
+1. **`mix.exs`**: bump `@version` on `LlamaCppEx.MixProject` (e.g. `"0.8.42"` → `"0.8.43"`)
 2. **`CHANGELOG.md`**: add a new `## vX.Y.Z` section at the top with:
    - The submodule commit range and count
    - Notable changes categorized by subsystem (follow existing format)

@@ -1,17 +1,60 @@
 # Changelog
 
-## Unreleased
+## v0.8.43
 
-CUDA is a first-class target: the NIF now links correctly against it, and the
-release publishes prebuilt CUDA artifacts for CUDA 12 and CUDA 13.
+llama.cpp bump to b10362, on top of b10280 from v0.8.42, plus the CUDA work that
+had been sitting unreleased: CUDA is now a first-class target — the NIF links
+correctly against it, and the release publishes prebuilt CUDA artifacts for
+CUDA 12 and CUDA 13.
 
-Verified on 2x NVIDIA DGX Spark (GB10, `sm_121a`, aarch64, CUDA 13.0.2) against
-this base (llama.cpp b10280) — a source build with `LLAMA_BACKEND=cuda` loads,
-reports `backend: "CUDA"` from `LlamaCppEx.devices()`, offloads 31/31 layers to
-the GPU, and passes the smoke suite: **528 tests, 0 failures**.
+Unlike the v0.8.42 range, this one does **not** break the upstream C API. Every
+change in it is additive, and no NIF source change was required. One of those
+additions is a near miss worth naming rather than glossing over, because it has
+the exact shape of the `load_mtp` trap that broke MTP in v0.8.41 — a new
+`llama_context_params` field whose default is restrictive. See **Changed** for
+why the conclusion differs this time, and why it was checked by running MTP
+rather than only by reading the diff.
+
+Verified at this base (b10362) on an M1 Max, source builds with both
+`LLAMA_BACKEND=metal` and `LLAMA_BACKEND=cpu`, each running the generation,
+embedding and MTP suites against real GGUFs: **520 passed, 11 excluded** on both
+(the exclusions are `:slow` and the known-broken `:mtp_cancel`). `mix credo
+--strict`, `mix dialyzer` and `mix format --check-formatted` are clean, and a
+source build from the Hex tarball resolves the pinned llama.cpp commit and links.
+
+The CUDA work in this release was verified separately on 2x NVIDIA DGX Spark
+(GB10, `sm_121a`, aarch64, CUDA 13.0.2) against the previous base (llama.cpp
+b10280) — a source build with `LLAMA_BACKEND=cuda` loads, reports
+`backend: "CUDA"` from `LlamaCppEx.devices()`, offloads 31/31 layers to the GPU,
+and passes the smoke suite: **528 tests, 0 failures**.
 
 ### Fixed
 
+- **`max_tokens` was not an upper bound under MTP.** The verify loop emits up to
+  `1 + n_draft` tokens per iteration but checked the caller's budget only on
+  iteration entry, so the last iteration could run past it. `max_tokens: 16`
+  returned 16, 17 or 18 tokens for the same prompt under greedy decoding —
+  measured across six successive `generate/3` calls on one session.
+
+  The overshoot is not constant because it is a function of how many drafts the
+  target accepts in the final iteration, and acceptance varies between runs on a
+  reused session (11, 10, 12, 11, 10, 12 accepted of 15 drafted, same prompt and
+  seed). The token *sequence* was deterministic throughout; only the stopping
+  point moved. That is what made it visible: `stream/3` and `generate/3` are the
+  same code path — `generate/3` is `stream_events/3` joined — yet they returned
+  different-length prefixes of the same continuation, which reads as a streaming
+  bug and is not one.
+
+  The loop now re-checks the budget per token. Breaking mid-iteration leaves
+  positions decoded but not emitted, which the existing partial-accept rollback
+  already discards, so nothing else moved. `max_tokens: 16` now returns exactly
+  16 tokens on every run, and a test pins the bound at 1, 4 and 16 rather than
+  only comparing the two entry points against each other.
+
+  Pre-existing, not from this bump — the loop last changed in #79 (v0.8.39). It
+  survived because the `:mtp` suite has only ever run against one model, and the
+  boundary happened to land consistently there; a 0.8B MTP model with a
+  different acceptance profile exposes it on the first run.
 - **MTP hybrid rollback corrupted the KV cache after a partial accept.** This is
   a different bug from the `load_mtp` one fixed in v0.8.42, and the two are
   complementary: that one stopped the MTP layers being read off disk at all,
@@ -116,6 +159,79 @@ the GPU, and passes the smoke suite: **528 tests, 0 failures**.
   keyed on `run_id` for master so every landed commit keeps its own verdict.
 - **Precompiler unit tests** — `test/precompiler_test.exs` pins the artifact
   selection rules, including the case that motivates the driver check.
+
+### Changed
+
+- **llama.cpp submodule** — Updated from 61881b1f7 to 4801e3c56 (82 commits, tag
+  b10280 to b10362). No NIF source change was required: every API change in the
+  range is additive, and the binding builds all of its params from
+  `llama_*_default_params()` and uses only the public `llama_sampler_init_*`
+  constructors.
+
+  - **`llama_context_params` gained `n_outputs_max_per_seq`** (#25532, multi-output
+    backend sampling), and its default in `llama_context_default_params()` is `1`,
+    not `0`. `llama_decode` enforces it and returns `-1` with
+    `backend sampling supports at most %u outputs per sequence` when a batch
+    exceeds it.
+
+    This is the same shape as the `load_mtp` field that broke MTP in v0.8.41 — a
+    new restrictive default picked up silently from the defaults struct — and the
+    binding does request logits at every position of a sequence during MTP
+    prefill, which is exactly the pattern the limit forbids. It is nonetheless
+    inert here, for a reason worth writing down rather than rediscovering: the
+    check is gated on `!sampling.samplers.empty()`
+    (`src/llama-context.cpp:1664`), i.e. on *backend* samplers registered through
+    `llama_context_params.samplers`. This binding never sets that field — it
+    samples host-side via `llama_sampler_chain` and `llama_sampler_sample` — so
+    the map is empty and the limit is never applied. Because reading the diff is
+    how v0.8.41 got this wrong, it was also checked by running MTP end-to-end
+    against a real MTP GGUF rather than by inspection alone.
+
+    If backend sampling is ever adopted here, `n_outputs_max_per_seq` becomes
+    load-bearing and must be set from `common_speculative_get_output_limits`
+    (new in this range) the way upstream's server and `speculative-simple` now do.
+  - **`llama_sampler_i` gained `backend_reset` and `copy_state`**, and
+    `backend_init` gained an `n_outputs_max_per_seq` parameter. This only affects
+    code that implements the sampler vtable itself; the NIF implements no custom
+    sampler.
+  - **New upstream entry points**, none currently used: `llama_sampler_copy`,
+    `common_sampler_copy`, `common_speculative_get_output_limits`,
+    `ggml_build_forward_order`.
+  - **Grammar semantics**: a repetition bound of `>= 2000` now degrades to
+    unbounded instead of raising (#26613). Reachable from `LlamaCppEx.Schema` and
+    `LlamaCppEx.Grammar` — a schema whose `maxItems` exceeded the threshold used
+    to fail grammar compilation with `number of repetitions exceeds sane
+    defaults` and now compiles. A `minItems` over the threshold still raises.
+  - **MTP/speculative upstream fixes**: memory allocation for MTP layers (#26605)
+    and MTP support for Nemotron (#26725). `common/speculative.h` is otherwise
+    additive and `common/chat.h` and `common/json-schema-to-grammar.h` are
+    untouched in this range.
+  - **Metal**: `NORM`/`RMS_NORM` fixed for row lengths that leave a partial
+    simdgroup (#26708), a `threadgroup` matrix instantiation removed from
+    `kernel_lightning_indexer` (#26646), and `ROLL` now requires a contiguous src
+    (#25928). All three are correctness fixes on the backend that ships in the
+    `aarch64-apple-darwin` artifact.
+  - **CPU/aarch64**: HWCAP fallbacks and fp16 variant detection (#25554), which
+    matters to the `LLAMA_PORTABLE=1` artifacts, plus a missing Q5_0 dispatch
+    (#26792) and an Android CPU-affinity fix (#26838).
+  - **CUDA**: `rms_norm + mul + rope` fusion (#26767) and a thread/block count
+    fix in the quantized cpy kernel launches (#26731).
+  - **ggml** version moved 0.18.1 to 0.19.0. No cmake option this Makefile passes
+    was renamed or removed, so the build configuration is unchanged.
+  - New architectures: Granite-Switch (#25107), Muse Glimmer (#26841), plus an
+    EXAONE 4.5 SWA fix (#26848).
+
+### Tests
+
+- **The `:mtp` and `:embeddings` suites now run against real models on Apple
+  Silicon**, not just the CPU-only generation model. `unsloth/Qwen3.5-0.8B-MTP-GGUF`
+  makes the MTP suite cheap enough to run per-release — the previously
+  recommended MTP GGUFs start at ~21 GB, which is why that suite had only ever
+  been exercised against a single model, which is how the `max_tokens` bound
+  above stayed broken.
+- **`max_tokens` is pinned as an exact bound** at 1, 4 and 16 tokens, instead of
+  being covered only indirectly by a `stream/3`-versus-`generate/3` comparison
+  that could not distinguish a streaming bug from a budget bug.
 
 ## v0.8.42
 

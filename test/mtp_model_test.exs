@@ -71,6 +71,28 @@ defmodule LlamaCppEx.MTPModelTest do
     assert {:ok, ^streamed} = MTP.generate(mtp, "Count to five:", opts)
   end
 
+  # Regression: the verify loop emits up to `1 + n_draft` tokens per iteration,
+  # and used to check the caller's budget only on iteration entry — so a request
+  # for 16 tokens came back with 16, 17 or 18 of them depending on how many
+  # drafts the target accepted in the final iteration. Acceptance varies between
+  # runs on a reused session, so this was observable as `stream/3` and
+  # `generate/3` returning different-length prefixes of the same greedy
+  # continuation. `max_tokens` is a bound, not a hint.
+  test "max_tokens is an exact upper bound regardless of draft acceptance", %{
+    model: model,
+    session: mtp
+  } do
+    for max_tokens <- [1, 4, 16] do
+      assert {:ok, text} =
+               MTP.generate(mtp, "Count to twenty:", max_tokens: max_tokens, temp: 0.0)
+
+      assert {:ok, tokens} = LlamaCppEx.Tokenizer.encode(model, text, add_special: false)
+
+      assert length(tokens) <= max_tokens,
+             "max_tokens: #{max_tokens} produced #{length(tokens)} tokens: #{inspect(text)}"
+    end
+  end
+
   test "stream_events/3 emits only documented events, ending with a terminal one", %{session: mtp} do
     events =
       mtp
