@@ -25,26 +25,67 @@ defmodule Bench.Helpers do
 
   def start_server(opts \\ []) do
     model_path = System.get_env("LLAMA_MODEL_PATH") || raise "Set LLAMA_MODEL_PATH"
-    n_parallel = Keyword.get(opts, :n_parallel, 4)
 
-    server_opts = [
+    defaults = [
       model_path: model_path,
-      n_gpu_layers: Keyword.get(opts, :n_gpu_layers, -1),
-      n_parallel: n_parallel,
-      n_ctx: Keyword.get(opts, :n_ctx, 4096),
+      n_gpu_layers: -1,
+      n_parallel: 4,
+      n_ctx: 4096,
       temp: 0.0
     ]
 
-    # Pass through new options
-    server_opts =
-      server_opts
-      |> maybe_add(opts, :cache_prompt)
-      |> maybe_add(opts, :batch_strategy)
-      |> maybe_add(opts, :kv_unified)
-      |> maybe_add(opts, :prompt_cache_ram_mb)
+    # Anything the server declares is forwardable. The list used to be four
+    # hand-maintained `maybe_add` calls, which meant every new tuning knob was
+    # silently dropped here until someone noticed — and a benchmark that ignores
+    # the option it is measuring is worse than no benchmark.
+    forwardable = LlamaCppEx.Server.start_option_keys()
+    {passthrough, unknown} = Keyword.split(opts, forwardable)
 
-    {:ok, server} = LlamaCppEx.Server.start_link(server_opts)
+    unknown = Keyword.drop(unknown, [:model_path])
+
+    if unknown != [] do
+      raise ArgumentError,
+            "Bench.Helpers.start_server/1 got options the server does not accept: " <>
+              "#{inspect(Keyword.keys(unknown))}"
+    end
+
+    {:ok, server} = LlamaCppEx.Server.start_link(Keyword.merge(defaults, passthrough))
     server
+  end
+
+  @doc """
+  Blocks until a server has finished loading, and returns the model.
+
+  `Server.start_link/1` returns *before* the load: `init/1` stays cheap and
+  `handle_continue/2` does the work. `Server.get_model/1` is not a wait — it
+  raises `ArgumentError` as soon as one blocking timeout elapses, which a 63 GB
+  model on a cold page cache comfortably outlives. A benchmark that used it
+  instead lost the caller mid-load and took the VM down with
+  `CUDA error: driver shutting down`.
+
+  Timing a load therefore means timing this call, not `start_link/1`.
+  """
+  def await_model(server, timeout_ms \\ 900_000) do
+    deadline = System.monotonic_time(:millisecond) + timeout_ms
+    do_await_model(server, deadline)
+  end
+
+  defp do_await_model(server, deadline) do
+    case LlamaCppEx.Server.fetch_model(server) do
+      {:ok, model} ->
+        model
+
+      {:error, :not_ready} ->
+        if System.monotonic_time(:millisecond) < deadline do
+          Process.sleep(200)
+          do_await_model(server, deadline)
+        else
+          raise "model still loading after the deadline"
+        end
+
+      {:error, reason} ->
+        raise "server failed to load its model: #{inspect(reason)}"
+    end
   end
 
   @doc """
@@ -137,12 +178,5 @@ defmodule Bench.Helpers do
     |> Stream.cycle()
     |> Enum.take(div(n_tokens, 4) + 16)
     |> IO.iodata_to_binary()
-  end
-
-  defp maybe_add(server_opts, source_opts, key) do
-    case Keyword.fetch(source_opts, key) do
-      {:ok, val} -> Keyword.put(server_opts, key, val)
-      :error -> server_opts
-    end
   end
 end

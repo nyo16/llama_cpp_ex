@@ -312,9 +312,12 @@ defmodule LlamaCppEx.Server do
       from the options above and cannot be overridden here.
     * Model loading options are forwarded to `LlamaCppEx.Model.load/2` —
       `:main_gpu`, `:split_mode`, `:tensor_split`, `:use_mmap`, `:use_mlock`,
-      `:use_direct_io` and `:check_tensors`. The three load flags collapse into
-      llama.cpp's single `load_mode`: `:use_direct_io` wins outright, otherwise
-      `:use_mlock` and `:use_mmap` combine; see `LlamaCppEx.Model.load/2`.
+      `:use_direct_io`, `:check_tensors` and `:rpc_servers`. The three load flags
+      collapse into llama.cpp's single `load_mode`: `:use_direct_io` wins
+      outright, otherwise `:use_mlock` and `:use_mmap` combine; see
+      `LlamaCppEx.Model.load/2`. `:rpc_servers` registers remote endpoints before
+      the load so their devices can hold part of the model — see
+      `LlamaCppEx.RPC`, including the caveat that a peer failure aborts the VM.
     * GenServer options like `:name`.
 
   """

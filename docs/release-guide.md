@@ -36,14 +36,37 @@ git -C vendor/llama.cpp rev-parse HEAD
 
 Before building, verify the llama.cpp APIs used by the NIF haven't changed:
 
-```bash
-# Diff the public header between old and new commits
-git -C vendor/llama.cpp diff <old-commit>..<new-commit> -- include/llama.h
+Re-derive the header list if you add an include -- a hand-kept list drifts, and
+that is exactly how the `common/speculative.h` break below reached a build:
 
-# Diff common headers used by the NIF
-git -C vendor/llama.cpp diff <old-commit>..<new-commit> -- common/chat.h
-git -C vendor/llama.cpp diff <old-commit>..<new-commit> -- common/json-schema-to-grammar.h
+```bash
+grep -hoE '^#include [<"](llama|ggml|chat|json-schema|speculative)[^">]*' \
+  c_src/llama_cpp_ex/*.cpp c_src/llama_cpp_ex/*.h | sort -u
 ```
+
+```bash
+for h in include/llama.h \
+         ggml/include/ggml-backend.h ggml/include/ggml-rpc.h \
+         common/chat.h common/json-schema-to-grammar.h common/speculative.h; do
+  echo "##### $h"
+  git -C vendor/llama.cpp diff <old-commit>..<new-commit> -- "$h"
+done
+```
+
+A signature change is the easy case -- it fails to compile with a clear message.
+Watch for two harder ones:
+
+- **A function removed outright.** The compiler's "did you mean" is actively
+  misleading: when `common_speculative_need_embd` was deleted in `f785fc9ea`,
+  both GCC and clang suggested the unrelated `common_speculative_n_max`, whose
+  first parameter happens to be a different pointer type. Check the header diff
+  for `-` lines before believing the suggestion.
+- **A default value changed** with the signature intact. Nothing fails to
+  compile. `llama_model_default_params()` moved `load_mode` from
+  `LLAMA_LOAD_MODE_MMAP` to `LLAMA_LOAD_MODE_AUTO`; because the NIF always sets
+  that field explicitly, behaviour did not change -- but a field we left at its
+  default would have shifted silently. Diff
+  `llama_model_default_params` / `llama_context_default_params` on every bump.
 
 The NIF uses these key APIs (grep `llama_nif.cpp` for the full list):
 - `llama_model_*`, `llama_context_*`, `llama_vocab_*` — model/context/vocab management
@@ -55,8 +78,42 @@ The NIF uses these key APIs (grep `llama_nif.cpp` for the full list):
 - `llama_chat_apply_template` — legacy chat templates
 - `common_chat_templates_init`, `common_chat_templates_apply` — Jinja chat templates
 - `json_schema_to_grammar` — grammar generation
+- `common_speculative_*` — speculative decoding and MTP draft models
+- `ggml_backend_dev_*`, `ggml_backend_reg_*` — device enumeration for `:devices`
+- `ggml_backend_rpc_add_server`, `ggml_backend_rpc_start_server` — RPC backend
 
 If any signatures changed, update `c_src/llama_cpp_ex/llama_nif.cpp` and/or `llama_nif.h`.
+
+### Upstream defects we work around
+
+Three known llama.cpp defects have workarounds in this repo. A bump is the only
+time anyone looks at them, so check each one here — if upstream has fixed it, the
+workaround should come out rather than quietly accumulate.
+
+Each was measured against `4801e3c567d5` (b10362) on NVIDIA DGX Spark (GB10,
+aarch64, GCC 13.3, CUDA 13.0). Full reports, with reproductions and suggested
+upstream fixes, are drafted in
+`.claude/plans/dgx-spark-2node/upstream-issues.md` — not yet filed, so there are
+no issue URLs to link. **When they are filed, put the URLs in this table.**
+
+Re-checked at `a94d563ed801` (61 commits later): all three still stand. That
+check was a source diff, not a re-measurement — the files each defect lives in
+(`ggml/src/ggml-cpu/CMakeLists.txt`, `ggml_backend_cuda_comm_init`, and
+`ggml_backend_rpc_start_server`) were untouched by the bump. A source diff is
+enough to say a defect is *still there*; it is not enough to say it is *gone*,
+so if a diff ever shows movement, run the command in the last column.
+
+| # | Upstream defect | Our workaround | Still needed? |
+|---|---|---|---|
+| 1 | `GGML_NATIVE=ON` makes ggml's `-mcpu=native` probe resolve to **base ARMv8-A** on Cortex-X925/A725 with GCC 13.3 — silently, with a soft CMake warning and exit 0. Costs every `sdot`/`smmla`/SVE kernel. | `LLAMA_CPU_ARM_ARCH` + `LLAMA_CUDA_ARCH` in the `Makefile`, which must be set together. See [DGX Spark](dgx-spark.md) and [Cross-Platform Builds](cross-platform-builds.md). | `scripts/spark/verify-build-flags.sh` on an aarch64 host. If a default build (no `LLAMA_CPU_ARM_ARCH`) now reports non-zero `sdot`/`smmla`, upstream fixed the probe. |
+| 2 | `-sm tensor` with a non-CUDA device in the set **runs and is correct but ~2.7× slower on decode**: `ggml_backend_cuda_comm_init` returns `nullptr` on any non-CUDA member, so the generic meta-backend butterfly runs instead, and the RPC backend's `NULL` 2-D tensor hooks degrade it to a loop of 1-D transfers. | Documented, not coded around: `Model.load/2` maps `:tensor` to its upstream value and the docs say to use `:layer` across hosts. See the tp=2 verdict in [DGX Spark](dgx-spark.md). | `mix run bench/spark_tensor_split.exs remote`. If `:tensor` comes within range of `:layer`, upstream implemented the 2-D hooks or the all-reduce — update the verdict section. |
+| 3 | `ggml_backend_rpc_start_server` returns `void`, never returns on success, and prints failures to stderr, so an **embedded** caller cannot tell "listening" from "port in use". | `rpc_start_server` in `llama_nif.cpp` pre-`bind()`s the endpoint for a real `errno`, then polls `connect()` until something accepts. A TOCTOU window and one wasted connection per start. | Check whether the signature gained a return value or a listening callback. If so, delete `rpc_preflight_bind` and `rpc_wait_until_listening` and drop the poll. |
+
+Not a defect and not going away: `RPC_STATUS_ASSERT` is `GGML_ABORT`
+(`ggml-rpc.cpp:30`), so a peer failure terminates the client process — the BEAM
+included. That is upstream's deliberate design. `LlamaCppEx.RPC` documents it;
+see also the `:row` split mode, which throws on CUDA at this version and which we
+deliberately do not work around.
 
 ## 3. Build and test
 

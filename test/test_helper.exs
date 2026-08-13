@@ -11,6 +11,16 @@
 #                 loop over shared contexts. See test/mtp_model_test.exs.
 #   :slow       — long-running comparison matrices (F16 vs Q8_0 KV cache);
 #                 needs LLAMA_SMOKE_GEN_MODEL
+#   :rpc_live   — needs a *reachable RPC worker*, not just a model: set
+#                 LLAMA_RPC_ENDPOINT to "host:port". Excluded automatically when
+#                 that variable is unset, so `--include rpc_live` without a
+#                 worker is a no-op rather than a failure.
+#
+#                 There is deliberately no tag for "needs an RPC build". Those
+#                 tests run on every build and assert the exact behaviour of the
+#                 build they are on, via LlamaCppEx.RPC.supported?/0 — accepting
+#                 either refusal used to hide the stale-artifact bug the
+#                 Makefile's link marker exists to catch.
 #
 # `--include` beats `--exclude` in ExUnit, so the tags are independent: opt into
 # exactly the ones whose model you have. The helper `LlamaCppEx.TestModels`
@@ -28,6 +38,9 @@
 #   GGML_METAL_NO_RESIDENCY=1 \
 #   LLAMA_SMOKE_MTP_MODEL=/path/to/mtp-model.gguf \
 #     mix test --include mtp
+#
+#   LLAMA_RPC=1 mix compile
+#   LLAMA_RPC_ENDPOINT=10.100.64.2:50052 mix test --include rpc_live
 #
 # `GGML_METAL_NO_RESIDENCY=1` is only needed on Metal, and only to keep the VM
 # from aborting *after* the suite has passed:
@@ -50,4 +63,8 @@
 Code.require_file("support/test_models.exs", __DIR__)
 Code.require_file("support/test_slots.exs", __DIR__)
 
-ExUnit.start(exclude: [:smoke, :embeddings, :slow, :mtp, :mtp_cancel])
+# `:rpc_live` needs a reachable worker, so it is excluded here to keep the
+# default run quiet, and rpc_test.exs additionally carries a compile-time `skip:`
+# so an explicit `--include rpc_live` without a worker skips rather than fails
+# (`--include` beats `--exclude`, so the exclusion alone cannot do that).
+ExUnit.start(exclude: [:smoke, :embeddings, :slow, :mtp, :mtp_cancel, :rpc_live])

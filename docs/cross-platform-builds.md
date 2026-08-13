@@ -15,7 +15,7 @@ with.
 | Linux (x86_64) + NVIDIA, CUDA 12 | Yes — **CUDA** (`-cu12`) | CUDA | Supported |
 | Linux (x86_64) + NVIDIA, CUDA 13 | Yes — **CUDA** (`-cu13`) | CUDA | Supported |
 | Linux (x86_64) + AMD | No | CPU | Supported via `LLAMA_BACKEND=vulkan` |
-| Linux (aarch64) + NVIDIA | No | CUDA if a toolkit is found | Tested on DGX Spark (GB10), source build |
+| Linux (aarch64) + NVIDIA | No | CUDA if a toolkit is found | Tested on DGX Spark (GB10), source build — see [DGX Spark](dgx-spark.md) |
 | Linux (aarch64), musl | No | as above | Supported, source build |
 | Windows (WSL2) | No | Same as Linux | Supported, source build |
 
@@ -130,6 +130,48 @@ LLAMA_CMAKE_ARGS="-DCMAKE_CUDA_ARCHITECTURES=89" mix compile
 LLAMA_BACKEND=cuda LLAMA_CMAKE_ARGS="-DGGML_CUDA_F16=ON" mix compile
 ```
 
+### CPU and CUDA architecture flags
+
+Two paired variables, for hosts where ggml's `-mcpu=native` probe gives the
+wrong answer:
+
+```bash
+LLAMA_BACKEND=cuda \
+LLAMA_CPU_ARM_ARCH=armv9.2-a+dotprod+i8mm+fp16+bf16+sve2 \
+LLAMA_CUDA_ARCH=121a-real \
+  mix compile
+```
+
+`LLAMA_CPU_ARM_ARCH` names the architecture for ggml's CPU backend instead of
+letting it probe. On a DGX Spark (GB10, Cortex-X925 + A725) with GCC 13.3 the
+probe fails **silently**: the compiler predates those cores, rejects
+`-mcpu=cortex-x925`, and falls back to base ARMv8-A behind a soft CMake warning
+and a zero exit status. The cost is not subtle — `objdump` on the emitted
+`libggml-cpu.a` finds **0 `sdot`, 0 `smmla`, no SVE** either way, versus
+**1134 `sdot`, 370 `smmla`** and SVE once the architecture is named. Those are
+the Q4/Q8 quantized matmul kernels.
+
+`LLAMA_CUDA_ARCH` sets `CMAKE_CUDA_ARCHITECTURES`, and on a CUDA build it is
+**required** whenever `LLAMA_CPU_ARM_ARCH` is set — the Makefile errors out
+otherwise. Reaching the CPU flag requires `GGML_NATIVE=OFF`, and with native off
+ggml-cuda stops compiling for the GPU it can see and produces a seven-architecture
+fat binary instead. That is a roughly 6× build-time regression for no runtime
+benefit, and nothing warns about it, so the two variables move together.
+
+Both are part of the build-directory key, so toggling either lands in a fresh
+cmake tree rather than silently reusing a stale `CMakeCache.txt`. Switching back
+is still a cache hit.
+
+To check that the flags survived cmake all the way into the machine code:
+
+```bash
+scripts/spark/verify-build-flags.sh
+```
+
+`LLAMA_PORTABLE=1` also sets `GGML_NATIVE=OFF`, for the different reason above.
+The two never double-emit it, and portable builds still need no CUDA
+architecture — the release runners have no GPU to pin one for.
+
 ## Platform-Specific Instructions
 
 ### macOS (Apple Silicon)
@@ -218,6 +260,10 @@ fails with that message rather than quietly linking against nothing.
   build without it compiles for the GPU actually present.
 - NCCL is off unless `LLAMA_CUDA_NCCL=1`. See the README's build variables for
   why the default is not ggml's.
+- On **aarch64** (DGX Spark and friends) also set `LLAMA_CPU_ARM_ARCH` and
+  `LLAMA_CUDA_ARCH` — see "CPU and CUDA architecture flags" above, and
+  [DGX Spark](dgx-spark.md) for the measured values. Without them the CPU
+  backend is built at base ARMv8-A with no quantized matmul kernels, silently.
 
 ### Linux (Vulkan)
 
