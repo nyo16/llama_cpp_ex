@@ -15,7 +15,9 @@ defmodule LlamaCppEx.Model do
     :use_mmap,
     :use_mlock,
     :use_direct_io,
-    :check_tensors
+    :check_tensors,
+    :rpc_servers,
+    :devices
   ]
 
   @structural_option_keys [:n_gpu_layers, :vocab_only, :load_mtp]
@@ -47,8 +49,9 @@ defmodule LlamaCppEx.Model do
       Defaults to `99` (offload all layers).
     * `:use_mmap` - Whether to memory-map the model file. Defaults to `true`.
     * `:main_gpu` - GPU device index for single-GPU mode. Defaults to `0`.
-    * `:split_mode` - How to split the model across GPUs: `:none`, `:layer`, or `:row`.
-      Defaults to `:none`.
+    * `:split_mode` - How to split the model across devices: `:none`, `:layer`,
+      `:row` or `:tensor`. Defaults to `:none`. Only `:none` and `:layer` are
+      generally usable at this llama.cpp version — see the note below.
     * `:tensor_split` - List of floats specifying the proportion of work per GPU
       (e.g. `[0.5, 0.5]` for two GPUs). Defaults to `[]`.
     * `:use_mlock` - Pin model memory in RAM to prevent swapping. Implies `:use_mmap`.
@@ -63,6 +66,36 @@ defmodule LlamaCppEx.Model do
       who are not doing speculative decoding do not pay for the extra tensors.
       Required for `LlamaCppEx.MTP.init/2`, which refuses a model loaded without
       it — the layers cannot be added after the fact.
+    * `:rpc_servers` - Endpoints (`"host:port"`) to register before loading, so
+      their remote devices can hold part of the model. Defaults to `[]`. Requires
+      a build with `LLAMA_RPC=1`. See `LlamaCppEx.RPC`. Note that llama.cpp puts
+      remote devices **first** in its automatic placement list — which is not the
+      order `LlamaCppEx.devices/0` reports — so `tensor_split: [0.25, 0.75]`
+      gives 25% to the first remote endpoint. Pass `:devices` to avoid guessing.
+    * `:devices` - Device names, e.g. `["CUDA0", "RPC0"]`, used **verbatim** as
+      the placement list: no reordering, no dedup, no CPU filtering. Defaults to
+      `[]`, which lets llama.cpp build the list itself. Set this whenever more
+      than one device is in play, because the automatic list is **not** the order
+      `LlamaCppEx.devices/0` reports — it puts RPC devices first — so
+      `:tensor_split` and `:main_gpu` would index a list you never saw. With
+      `:devices` set, they index this one.
+
+  > #### Split modes at llama.cpp b10362 {: .warning}
+  >
+  > `:layer` splits contiguous layer ranges across devices, one KV cache per
+  > device, and is the only mode that works across hosts.
+  >
+  > `:row` throws at load time on CUDA: ggml-cuda no longer exports
+  > `ggml_backend_split_buffer_type`, so `llama_model_load` raises
+  > `device CUDA0 does not support split buffers`. It is kept mapped to its
+  > upstream value rather than removed, because the enum is upstream's, but do
+  > not build on it. Only SYCL still declares a split buffer type.
+  >
+  > `:tensor` is real tensor parallelism via a Meta device, added in
+  > llama.cpp #19378. It forces flash attention on, refuses some architectures,
+  > disables backend sampling, and its CUDA all-reduce is `ncclCommInitAll` —
+  > a single-process, all-local-GPUs API. **It cannot span hosts**, so it is not
+  > "tp=2 across two machines". See `docs/dgx-spark.md` for the measurements.
 
   > #### Load mode {: .info}
   >
@@ -102,28 +135,59 @@ defmodule LlamaCppEx.Model do
     vocab_only = Keyword.get(opts, :vocab_only, false)
     check_tensors = Keyword.get(opts, :check_tensors, false)
     load_mtp = Keyword.get(opts, :load_mtp, false)
+    # Read here rather than in a private helper: test/option_forwarding_test.exs
+    # checks both that `load/2` accepts the key and that it is one of
+    # `tuning_option_keys/0`, and a helper satisfies only half of that.
+    rpc_servers = Keyword.get(opts, :rpc_servers, [])
+    devices = Keyword.get(opts, :devices, [])
 
-    case LlamaCppEx.NIF.model_load(
-           path,
-           n_gpu_layers,
-           use_mmap,
-           main_gpu,
-           split_mode,
-           tensor_split,
-           use_mlock,
-           use_direct_io,
-           vocab_only,
-           check_tensors,
-           load_mtp
-         ) do
-      {:ok, ref} -> {:ok, %__MODULE__{ref: ref, load_mtp: load_mtp}}
-      {:error, _} = error -> error
+    # Registration has to happen before the load, not during it: tensor
+    # placement is computed from the devices that exist when
+    # llama_model_load_from_file runs. An unreachable endpoint is reported here
+    # rather than silently dropped, because ggml_backend_register no-ops on a
+    # null registration and the model would then load onto the wrong devices.
+    with :ok <- register_rpc_servers(rpc_servers),
+         {:ok, ref} <-
+           LlamaCppEx.NIF.model_load(
+             path,
+             n_gpu_layers,
+             use_mmap,
+             main_gpu,
+             split_mode,
+             tensor_split,
+             use_mlock,
+             use_direct_io,
+             vocab_only,
+             check_tensors,
+             load_mtp,
+             devices
+           ) do
+      {:ok, %__MODULE__{ref: ref, load_mtp: load_mtp}}
     end
   end
 
-  defp encode_split_mode(:none), do: 0
-  defp encode_split_mode(:layer), do: 1
-  defp encode_split_mode(:row), do: 2
+  defp register_rpc_servers([]), do: :ok
+
+  defp register_rpc_servers(endpoints) do
+    case LlamaCppEx.RPC.add_servers(endpoints) do
+      {:ok, _n} -> :ok
+      {:error, {endpoint, reason}} -> {:error, "RPC endpoint #{endpoint}: #{reason}"}
+    end
+  end
+
+  @doc false
+  # Exposed for tests: the mapping is upstream's `llama_split_mode` enum and a
+  # silent drift here would place tensors somewhere nobody asked for.
+  # 0 none, 1 layer, 2 row, 3 tensor (llama.h).
+  def encode_split_mode(:none), do: 0
+  def encode_split_mode(:layer), do: 1
+  def encode_split_mode(:row), do: 2
+  def encode_split_mode(:tensor), do: 3
+
+  def encode_split_mode(other) do
+    raise ArgumentError,
+          "unknown split_mode #{inspect(other)}, expected :none, :layer, :row or :tensor"
+  end
 
   @doc "Returns the training context size of the model."
   @spec n_ctx_train(t()) :: integer()

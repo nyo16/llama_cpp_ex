@@ -26,6 +26,10 @@ llama_cpp_ex-*.tar
 /priv/*.so
 /priv/*.dylib
 /priv/*.dll
+# Names the build configuration that produced llama_cpp_ex_nif.so. Mix symlinks
+# priv/ into every MIX_ENV, so the artifact is shared and its own timestamp
+# cannot tell you which flags built it.
+/priv/.llama_cpp_ex_nif.built
 models/
 
 # Dialyzer PLTs (see :dialyzer plt_local_path in mix.exs).

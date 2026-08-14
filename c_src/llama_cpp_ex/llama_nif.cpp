@@ -11,6 +11,19 @@
 #include <chrono>
 #include <cmath>
 #include <cstring>
+#include <cerrno>
+
+// The ggml RPC backend is opt-in at build time (LLAMA_RPC=1). GGML_USE_RPC is
+// set by the Makefile, not inherited from cmake: ggml puts it on the `ggml`
+// target as a PUBLIC definition, and this translation unit is compiled by hand
+// with only -I flags.
+#ifdef GGML_USE_RPC
+#include <ggml-rpc.h>
+#include <netdb.h>
+#include <sys/socket.h>
+#include <thread>
+#include <unistd.h>
+#endif
 
 using namespace llama_cpp_ex;
 
@@ -31,6 +44,10 @@ inline auto invalid_index   = fine::Atom("invalid_index");
 inline auto invalid_grammar = fine::Atom("invalid_grammar");
 inline auto invalid_state   = fine::Atom("invalid_state");
 inline auto unsupported     = fine::Atom("unsupported");
+inline auto rpc_unsupported = fine::Atom("rpc_unsupported");
+inline auto unreachable     = fine::Atom("unreachable");
+inline auto no_devices      = fine::Atom("no_devices");
+inline auto bind_timeout    = fine::Atom("bind_timeout");
 } // namespace atoms
 
 // --- Input validation at the NIF boundary ---
@@ -252,6 +269,244 @@ fine::Ok<> backend_free(ErlNifEnv* env) {
 }
 FINE_NIF(backend_free, 0);
 
+// --- RPC ---
+//
+// The ggml RPC backend puts a model's layers on another host. It is compiled in
+// only when LLAMA_RPC=1; without it every function here reports
+// {:error, :rpc_unsupported} so a CPU or Metal build keeps loading unchanged.
+//
+// Two upstream properties shape this API and neither is ours to fix:
+//
+//   1. RPC_STATUS_ASSERT is GGML_ABORT (ggml-rpc.cpp:30). Any peer crash,
+//      network failure or malformed response terminates the OS process — the
+//      whole BEAM. There is no error return, no retry, no reconnect.
+//   2. Registration, by contrast, is safe: an unreachable endpoint makes
+//      ggml_backend_rpc_add_server return nullptr. So failures are *detectable
+//      before load* and *fatal during it*, and that asymmetry is why
+//      rpc_add_server reports rather than logs.
+
+#ifdef GGML_USE_RPC
+
+namespace {
+
+// "host:port", where host may be an IPv4 literal or a name. The RPC transport
+// parses the same string itself; this copy exists only for the pre-flight bind.
+bool rpc_split_endpoint(const std::string& endpoint, std::string& host, std::string& port) {
+    auto colon = endpoint.rfind(':');
+    if (colon == std::string::npos || colon == 0 || colon + 1 == endpoint.size()) {
+        return false;
+    }
+    host = endpoint.substr(0, colon);
+    port = endpoint.substr(colon + 1);
+    return true;
+}
+
+// Bind the endpoint, then immediately give it back. ggml_backend_rpc_start_server
+// returns void and never returns at all on success, so it can report neither a
+// bad host nor a port already in use — it prints to stderr and the thread just
+// sits there. Doing the bind here first turns the common failures into an
+// errno we can hand back to Elixir. It is a TOCTOU window, which is why the
+// caller still waits for the real listener afterwards.
+std::string rpc_preflight_bind(const std::string& host, const std::string& port) {
+    addrinfo hints{};
+    hints.ai_family = AF_UNSPEC;
+    hints.ai_socktype = SOCK_STREAM;
+
+    addrinfo* res = nullptr;
+    int rc = getaddrinfo(host.c_str(), port.c_str(), &hints, &res);
+    if (rc != 0) {
+        return std::string("cannot resolve ") + host + ": " + gai_strerror(rc);
+    }
+
+    std::string error = "no usable address for " + host;
+    for (addrinfo* ai = res; ai; ai = ai->ai_next) {
+        int fd = socket(ai->ai_family, ai->ai_socktype, ai->ai_protocol);
+        if (fd < 0) continue;
+        int one = 1;
+        setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+        if (bind(fd, ai->ai_addr, ai->ai_addrlen) == 0) {
+            close(fd);
+            error.clear();
+            break;
+        }
+        error = std::string("cannot bind ") + host + ":" + port + ": " + std::strerror(errno);
+        close(fd);
+    }
+    freeaddrinfo(res);
+    return error;
+}
+
+// Wait for something to accept a connection on the endpoint. The proof that the
+// detached thread actually got as far as listen(), rather than printing to
+// stderr and returning. The probe is closed before any HELLO is sent; the
+// server's read then fails and it loops back to accept, which is harmless.
+bool rpc_wait_until_listening(const std::string& host, const std::string& port, int timeout_ms) {
+    addrinfo hints{};
+    hints.ai_family = AF_UNSPEC;
+    hints.ai_socktype = SOCK_STREAM;
+
+    for (int waited = 0; waited < timeout_ms; waited += 20) {
+        addrinfo* res = nullptr;
+        if (getaddrinfo(host.c_str(), port.c_str(), &hints, &res) == 0) {
+            bool up = false;
+            for (addrinfo* ai = res; ai && !up; ai = ai->ai_next) {
+                int fd = socket(ai->ai_family, ai->ai_socktype, ai->ai_protocol);
+                if (fd < 0) continue;
+                up = connect(fd, ai->ai_addr, ai->ai_addrlen) == 0;
+                close(fd);
+            }
+            freeaddrinfo(res);
+            if (up) return true;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    }
+    return false;
+}
+
+} // namespace
+#endif // GGML_USE_RPC
+
+// Whether this build has the RPC backend compiled in.
+//
+// Exists so a test can assert the *exact* refusal for the build it is running on
+// rather than accepting either atom. Without it, the natural way to write one
+// test for both configurations is to allow {:rpc_unsupported, :unreachable} —
+// which stays green when an RPC build reports :rpc_unsupported, i.e. precisely
+// the stale/shared-artifact failure the Makefile's link marker exists to
+// eliminate. A capability probe turns that into an exact assertion on both
+// builds.
+bool rpc_supported(ErlNifEnv* env) {
+#ifdef GGML_USE_RPC
+    return true;
+#else
+    return false;
+#endif
+}
+FINE_NIF(rpc_supported, 0);
+
+// Registers a remote endpoint's devices in the global ggml device registry.
+//
+// Deliberately a backend-level NIF next to backend_init/device_list rather than
+// a twelfth model_load argument: registration mutates process-global state, not
+// one model, and it has to happen before a load so that tensor placement can see
+// the remote devices.
+//
+// Returns the number of devices the endpoint contributed. Upstream memoizes per
+// endpoint, so a repeat call is a no-op and returns 0 added.
+std::variant<fine::Ok<int64_t>, fine::Error<fine::Atom>>
+rpc_add_server(ErlNifEnv* env, std::string endpoint) {
+#ifndef GGML_USE_RPC
+    (void)endpoint;
+    return fine::Error(atoms::rpc_unsupported);
+#else
+    size_t before = ggml_backend_dev_count();
+
+    ggml_backend_reg_t reg = ggml_backend_rpc_add_server(endpoint.c_str());
+    if (!reg) {
+        // Both an unreachable endpoint and a HELLO major/minor mismatch collapse
+        // to nullptr here, and ggml_backend_register silently no-ops on nullptr
+        // — so without this check a dead or mismatched node simply vanishes and
+        // the model loads onto the wrong devices.
+        return fine::Error(atoms::unreachable);
+    }
+
+    // ggml_backend_rpc_add_server only *builds* the registration. Without this
+    // second call the devices never enter ggml_backend_dev_count() and
+    // device_list will not see them.
+    ggml_backend_register(reg);
+
+    return fine::Ok(static_cast<int64_t>(ggml_backend_dev_count() - before));
+#endif
+}
+// Dirty IO: a blocking TCP connect plus the HELLO round trip.
+FINE_NIF(rpc_add_server, ERL_NIF_DIRTY_JOB_IO_BOUND);
+
+// Starts the worker-side RPC server. `device_names` empty means every non-CPU
+// device, falling back to the CPU device, matching tools/rpc/rpc-server.cpp.
+//
+// Returns the device names actually being served. The server itself runs on a
+// detached std::thread and never comes back: ggml_backend_rpc_start_server's
+// accept loop is `while (true)` and the cleanup after it is dead code.
+//
+// Detaching that thread is exactly what decouples it from the scheduler that
+// called us, so THIS NIF returns normally and the never-returning loop costs no
+// scheduler at all. What the NIF does spend is real though: a blocking
+// getaddrinfo in the pre-flight bind, another per poll iteration, and up to
+// 5000 ms of connect-polling before it can honestly claim to be listening. That
+// is thousands of times the ~1 ms a normal scheduler expects, and
+// RPC.Server.start_link/1 is the sort of call made during application start, so
+// it belongs on a dirty IO scheduler like rpc_add_server.
+std::variant<fine::Ok<std::vector<std::string>>, fine::Error<fine::Atom>,
+             fine::Error<std::string>>
+rpc_start_server(ErlNifEnv* env, std::string endpoint, std::string cache_dir,
+                 int64_t n_threads, std::vector<std::string> device_names) {
+#ifndef GGML_USE_RPC
+    (void)endpoint; (void)cache_dir; (void)n_threads; (void)device_names;
+    return fine::Error(atoms::rpc_unsupported);
+#else
+    std::string host, port;
+    if (!rpc_split_endpoint(endpoint, host, port)) {
+        return fine::Error(std::string("endpoint must be \"host:port\", got: " + endpoint));
+    }
+
+    std::vector<ggml_backend_dev_t> devices;
+    if (!device_names.empty()) {
+        for (const auto& name : device_names) {
+            ggml_backend_dev_t dev = ggml_backend_dev_by_name(name.c_str());
+            if (!dev) {
+                return fine::Error(std::string("unknown device: " + name));
+            }
+            devices.push_back(dev);
+        }
+    } else {
+        for (size_t i = 0; i < ggml_backend_dev_count(); i++) {
+            ggml_backend_dev_t dev = ggml_backend_dev_get(i);
+            if (ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_CPU) {
+                devices.push_back(dev);
+            }
+        }
+        if (devices.empty()) {
+            if (ggml_backend_dev_t cpu = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU)) {
+                devices.push_back(cpu);
+            }
+        }
+    }
+
+    if (devices.empty()) {
+        return fine::Error(atoms::no_devices);
+    }
+
+    if (std::string error = rpc_preflight_bind(host, port); !error.empty()) {
+        return fine::Error(error);
+    }
+
+    std::vector<std::string> served;
+    served.reserve(devices.size());
+    for (auto dev : devices) served.emplace_back(ggml_backend_dev_name(dev));
+
+    // Copied into the thread: the NIF's locals are gone the moment it returns,
+    // and the server outlives every one of them.
+    std::thread([endpoint, cache_dir, n_threads, devices]() mutable {
+        ggml_backend_rpc_start_server(endpoint.c_str(),
+                                      cache_dir.empty() ? nullptr : cache_dir.c_str(),
+                                      static_cast<size_t>(n_threads),
+                                      devices.size(), devices.data());
+    }).detach();
+
+    // Spawning a thread is not the same as serving, and reporting :ok from the
+    // spawn alone would make every misconfiguration look like a success until
+    // the first client hangs.
+    if (!rpc_wait_until_listening(host, port, 5000)) {
+        return fine::Error(atoms::bind_timeout);
+    }
+
+    return fine::Ok(served);
+#endif
+}
+// Dirty IO: a blocking bind, two blocking getaddrinfo calls, and a poll that can
+// run for 5 s. Bounded, but nowhere near a normal scheduler's budget.
+FINE_NIF(rpc_start_server, ERL_NIF_DIRTY_JOB_IO_BOUND);
+
 // --- Devices ---
 
 // Enumerates ggml backend devices for VRAM-aware placement and budgeting.
@@ -326,7 +581,7 @@ std::variant<fine::Ok<fine::ResourcePtr<LlamaModel>>, fine::Error<std::string>>
 model_load(ErlNifEnv* env, std::string path, int64_t n_gpu_layers, bool use_mmap,
            int64_t main_gpu, int64_t split_mode, std::vector<double> tensor_split,
            bool use_mlock, bool use_direct_io, bool vocab_only, bool check_tensors,
-           bool load_mtp) {
+           bool load_mtp, std::vector<std::string> device_names) {
     auto params = llama_model_default_params();
     params.n_gpu_layers = static_cast<int32_t>(n_gpu_layers);
     params.main_gpu = static_cast<int32_t>(main_gpu);
@@ -358,6 +613,34 @@ model_load(ErlNifEnv* env, std::string path, int64_t n_gpu_layers, bool use_mmap
         ts_float.reserve(tensor_split.size());
         for (auto v : tensor_split) ts_float.push_back(static_cast<float>(v));
         params.tensor_split = ts_float.data();
+    }
+
+    // llama_model_params.devices is used verbatim: no reordering, no dedup, no
+    // CPU filtering (src/llama.cpp:152-176). That is the point. The default
+    // path instead rebuilds the list with RPC devices at the FRONT
+    // (src/llama.cpp:263-273), which does not match the ggml registry order
+    // device_list reports — so with a remote device registered, tensor_split
+    // silently indexes a different list than the caller was looking at.
+    // Naming the devices is the only way to make placement deterministic.
+    //
+    // NULL-terminated, so it must outlive the load call.
+    std::vector<ggml_backend_dev_t> devs;
+    if (!device_names.empty()) {
+        devs.reserve(device_names.size() + 1);
+        for (const auto& name : device_names) {
+            ggml_backend_dev_t dev = ggml_backend_dev_by_name(name.c_str());
+            if (!dev) {
+                std::string available;
+                for (size_t i = 0; i < ggml_backend_dev_count(); i++) {
+                    if (i) available += ", ";
+                    available += ggml_backend_dev_name(ggml_backend_dev_get(i));
+                }
+                return fine::Error("unknown device: " + name + " (available: " + available + ")");
+            }
+            devs.push_back(dev);
+        }
+        devs.push_back(nullptr);
+        params.devices = devs.data();
     }
 
     llama_model* model = llama_model_load_from_file(path.c_str(), params);
@@ -1860,16 +2143,18 @@ fine::Ok<> generate_mtp_tokens(
     sp.ctx_tgt->forget_batch();
     sp.ctx_dft->forget_batch();
 
-    // For MTP, hidden states are extracted via set_embeddings_pre_norm on
-    // ctx_tgt (set up in the MTP impl's constructor). We only need to know
-    // that drafts depend on per-position outputs, so logits=true must be
-    // requested for every prefill token.
-    const bool need_embd = common_speculative_need_embd(sp.spec);
-
-    // Prefill the target context with the prompt. For MTP we request logits
-    // at every position so the streaming hook in common_speculative_process
-    // can mirror t_h_pre_norm into ctx_dft (see speculative.cpp). The full
-    // batch is then fed back to the speculative state.
+    // Prefill the target context with the prompt, then hand each decoded batch
+    // to the speculative state.
+    //
+    // Upstream removed common_speculative_need_embd in f785fc9ea: a draft
+    // implementation that needs the target's hidden states now arranges its own
+    // extraction -- the MTP impls call llama_set_embeddings_nextn(ctx_tgt, ...)
+    // in their constructors and read it back through
+    // llama_get_embeddings_nextn, which is a separate path from the per-token
+    // logits flag. So the caller no longer has to request logits on every
+    // prefill position; upstream's examples/speculative-simple now passes false
+    // for the whole prompt. We ask for logits on the final prompt token only,
+    // because we sample the first generated token from them below.
     int n_batch = llama_n_batch(ctx_tgt);
     llama_pos n_past = 0;
     for (size_t i = 0; i < prompt.size(); i += n_batch) {
@@ -1879,9 +2164,7 @@ fine::Ok<> generate_mtp_tokens(
         llama_batch batch = llama_batch_init(n, 0, 1);
         BatchFreeGuard batch_guard(batch);
         for (int j = 0; j < n; j++) {
-            const bool want_logits = need_embd
-                ? true
-                : (is_last_chunk && j == n - 1);
+            const bool want_logits = is_last_chunk && j == n - 1;
             common_batch_add(batch, prompt[i + j], static_cast<llama_pos>(i + j),
                              { seq_id }, want_logits);
         }
@@ -1895,8 +2178,7 @@ fine::Ok<> generate_mtp_tokens(
         if (!proc_ok) {
             fprintf(stderr,
                 "MTP prefill: common_speculative_process returned false "
-                "at chunk i=%zu n=%d need_embd=%d logits_on_each=%d\n",
-                i, n, (int) need_embd, (int) need_embd);
+                "at chunk i=%zu n=%d\n", i, n);
         }
     }
     n_past = static_cast<llama_pos>(prompt.size());

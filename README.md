@@ -112,7 +112,7 @@ Power users can pass arbitrary CMake flags:
 LLAMA_CMAKE_ARGS="-DGGML_CUDA_FORCE_CUBLAS=ON" mix compile
 ```
 
-Three more build variables:
+More build variables:
 
 - `LLAMA_PORTABLE=1` drops `-march=native`. ggml turns it on by default, which
   tunes the binary to the exact CPU it was built on; the release workflow sets
@@ -124,8 +124,27 @@ Three more build variables:
   the link line by hand rather than through cmake, that produced a NIF that
   failed to load with `undefined symbol: ncclAllReduce`. Turning it on also
   makes `libnccl.so.2` a load-time requirement.
+- `LLAMA_CPU_ARM_ARCH=<arch>` names the architecture for ggml's CPU backend
+  instead of letting `-mcpu=native` probe for it. Needed wherever that probe
+  gives the wrong answer *silently* — on DGX Spark (GB10) with GCC 13.3 it
+  degrades to base ARMv8-A behind a soft warning, and the emitted
+  `libggml-cpu.a` loses every `sdot`, `smmla` and SVE instruction, i.e. the Q4/Q8
+  quantized matmul kernels. On a CUDA build this **requires** `LLAMA_CUDA_ARCH`
+  and errors without it.
+- `LLAMA_CUDA_ARCH=<arch>` sets `CMAKE_CUDA_ARCHITECTURES`, e.g. `121a-real` for
+  GB10. Reaching the CPU flag above needs `GGML_NATIVE=OFF`, which otherwise
+  turns one CUDA architecture into a seven-architecture fat binary — a ~6× build
+  with no runtime benefit.
+- `LLAMA_RPC=1` builds the ggml RPC backend, which lets a model's layers live on
+  another machine. Off by default: it is a networked surface and a protocol
+  version coupling. `LLAMA_RPC_RDMA` (default `1` on Linux) declares whether the
+  transport may use RDMA, rather than letting ggml enable it based on whether
+  the build host happens to have `libibverbs`. See `LlamaCppEx.RPC`.
 - `LLAMA_COMMIT=<sha>` overrides the pinned llama.cpp commit used when
   `vendor/llama.cpp` has to be cloned.
+
+On a DGX Spark, all of the above is `scripts/spark/remote.sh spark-1 mix compile`
+— see [docs/dgx-spark.md](docs/dgx-spark.md) for the one- and two-node runbook.
 
 ## Quick Start
 

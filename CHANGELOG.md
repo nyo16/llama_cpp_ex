@@ -1,5 +1,126 @@
 # Changelog
 
+## Unreleased
+
+DGX Spark (GB10) support: a silent ARM code-generation bug fixed, the ggml RPC
+backend wired up so a model can span two machines, and a measured runbook for
+both configurations in [docs/dgx-spark.md](docs/dgx-spark.md).
+
+Verified on macOS (Metal, no RPC): **423 passed, 143 excluded**. On a DGX Spark
+(CUDA 13.0, `sm_121a`): **423 passed**, and **424 with `--include rpc_live`**
+against a live two-node worker.
+
+### Fixed
+
+- **The ggml CPU backend was silently compiled at base ARMv8-A on GB10.** GCC
+  13.3 predates Cortex-X925/A725 and rejects `-mcpu=cortex-x925`, so ggml's
+  `-mcpu=native` probe degraded to the base architecture behind a soft CMake
+  warning and a zero exit status. Measured on the emitted `libggml-cpu.a`:
+  **0 `sdot`, 0 `smmla`, no SVE**, versus 1134 / 370 / present once the
+  architecture is named. Those are the Q4/Q8 quantized matmul kernels. New
+  `LLAMA_CPU_ARM_ARCH` names it explicitly.
+- **The build could ship a NIF that did not match its own flags.** Toggling a
+  build variable changes `CXXFLAGS`, `LDFLAGS` or `CMAKE_FLAGS` while touching no
+  source file, so make kept a stale object, a stale link, or a stale
+  `CMakeCache.txt`. Observed twice as
+  `Function not found 'Elixir.LlamaCppEx.NIF':model_load/11` and once as an RPC
+  build reporting `:rpc_unsupported` at runtime — all silent, all looking like
+  Elixir bugs. The cmake configure, the compile and the link now depend on a
+  configuration stamp whose name hashes all three flag sets.
+- **Every `MIX_ENV` shares one `llama_cpp_ex_nif.so`, and they were overwriting
+  each other.** Mix symlinks `priv/` into each environment's build tree, so dev,
+  test and bench write one artifact while keeping separate objects and separate
+  llama.cpp trees. Building test with `LLAMA_RPC=1` and bench without it left
+  whichever ran last in place, and the artifact's own timestamp then looked
+  current to the other environment — a test suite reported
+  `{:error, :rpc_unsupported}` against a live RPC worker the same tree had just
+  talked to. The same hole let a downloaded precompiled artifact silently
+  replace a source build. The link is now gated on a marker beside the artifact
+  recording what it *is* — the configuration hash plus a digest of the linked
+  bytes — so any replacement, from any source, forces a relink.
+- **`make` outside `mix` wrote to `/obj` and `/priv`.** `elixir_make` always sets
+  `MIX_APP_PATH`; a human running a documented command like
+  `LLAMA_RPC=1 make rpc-server` does not, and an empty value was silently
+  destructive rather than an error — `BUILD` became `/obj`, so cmake configured
+  into the filesystem root (`Unable to (re)create the private pkgRedirects
+  directory: /obj/rpc_server_build/CMakeFiles/pkgRedirects`) and `make clean`
+  would have tried to `rm -rf /obj`. It now falls back to
+  `_build/standalone/lib/llama_cpp_ex`, covering the defined-but-empty case too.
+- **`scripts/spark/rpc-worker.sh start` compiled inside its own readiness
+  window.** The worker unit runs `mix run`, which compiles on demand, and the
+  wait loop cannot distinguish "still compiling" from "never going to listen" —
+  it only sees an active unit and a silent port. After a llama.cpp bump that
+  compile is a multi-minute rebuild, so the 120s budget expired, the script
+  reported a failure, and the worker came up fine on its own minutes later. The
+  build now happens before the unit is created, which also makes a compile error
+  arrive as a compile error.
+
+### Added
+
+- **`LlamaCppEx.RPC`** — register a remote machine's devices into the local
+  device registry so a model's layers can live on another host.
+  `add_server/1`, `add_servers/1`, `devices/0`, `ping/1`, `supported?/0`.
+  Registration reports `{:error, :unreachable}` rather than vanishing, which
+  matters because upstream collapses an unreachable endpoint and a protocol
+  mismatch into a null registration that `ggml_backend_register` silently
+  ignores. `supported?/0` reports whether the backend was compiled in at all, so
+  callers and tests never have to infer a build problem from `:rpc_unsupported`.
+- **`LlamaCppEx.RPC.Server`** — the worker side, a supervised GenServer owning
+  the native server thread. `restart: :temporary`, because a restart could not
+  succeed: the listening socket lives on a detached thread in the same OS
+  process, so it survives the GenServer and the next bind would fail
+  `EADDRINUSE`. It traps exits so its "the native server is still running"
+  warning reaches you on a supervised shutdown, which is the case that matters.
+- **`:rpc_servers`** on `Model.load/2` and `Server.start_link/1` — endpoints to
+  register before the load, in the order tensor placement needs.
+- **`:devices`** on `Model.load/2` and `Server.start_link/1` — device names used
+  **verbatim** as the placement list. Not cosmetic: llama.cpp's automatic list
+  puts RPC devices first, which is *not* the order `LlamaCppEx.devices/0`
+  reports, so `:tensor_split` and `:main_gpu` otherwise index a list the caller
+  never saw. A backwards split still produces correct tokens and merely
+  benchmarks badly.
+- **`split_mode: :tensor`** now encodes to llama.cpp's `LLAMA_SPLIT_MODE_TENSOR`
+  instead of raising `FunctionClauseError`, and an unknown split mode raises
+  `ArgumentError` naming the accepted set.
+- **Build variables** `LLAMA_CPU_ARM_ARCH`, `LLAMA_CUDA_ARCH`, `LLAMA_RPC`,
+  `LLAMA_RPC_RDMA`, and a `make rpc-server` target for upstream's standalone
+  worker. `LLAMA_CPU_ARM_ARCH` without `LLAMA_CUDA_ARCH` on a CUDA build is a
+  hard `$(error)`: reaching the CPU flag needs `GGML_NATIVE=OFF`, which silently
+  turns one CUDA architecture into a seven-architecture fat binary.
+- **`scripts/spark/`** — `bootstrap.sh`, `sync.sh`, `remote.sh`,
+  `verify-build-flags.sh`, `rpc-worker.sh`, `fetch_models.exs`, `rpc_check.exs`,
+  and the cpuidle matrices. No `sudo` anywhere.
+- **Benchmarks** `bench/spark_baseline.exs`, `spark_two_node.exs`,
+  `spark_tuning.exs`, `spark_mtp.exs`, `spark_cpuidle.exs`, with results in
+  `bench/results/v0.8.43-dgx-spark-{baseline,two-node}.md`.
+
+### Changed
+
+- `Bench.Helpers.start_server/1` forwards any option the server declares instead
+  of a hand-maintained list of four, and raises on an option the server would
+  reject. A benchmark that silently drops the option it is measuring is worse
+  than no benchmark.
+- `docs/multi-gpu.md` gains a remote-devices section, including the device
+  ordering trap and a worked `:devices` example.
+- **llama.cpp bumped to `a94d563ed801`**, 61 commits past b10362. Upstream
+  removed `common_speculative_need_embd` in `f785fc9ea`: a draft implementation
+  that wants the target's hidden states now arranges its own extraction, so the
+  MTP prefill no longer requests logits at every prompt position — only at the
+  final token, which is the one we sample from. This is upstream's own migration;
+  `examples/speculative-simple` passes `false` for the whole prompt.
+  Verified by re-measuring rather than by reading: on the dense Qwen3.6-27B pair,
+  draft acceptance is **identical to the decimal** at every depth — 86.9 / 76.4 /
+  68.2 / 57.1 % for `n_draft` 1–4, the same figures recorded at b10362 in
+  `bench/results/v0.8.43-dgx-spark-baseline.md`. Identical acceptance is the
+  claim worth making: it means the drafts themselves are unchanged, which a
+  throughput number alone cannot show. Decode moved 18.65 → 18.54 t/s at the
+  `n_draft: 3` peak, inside that run's recorded 18.4–18.7 range.
+  `llama_model_default_params()` also moved `load_mode` from
+  `LLAMA_LOAD_MODE_MMAP` to the new `LLAMA_LOAD_MODE_AUTO`, which drops mmap when
+  a device reports it cannot support it. The NIF always sets `load_mode`
+  explicitly from `:use_mmap`/`:use_mlock`/`:use_direct_io`, so behaviour is
+  unchanged and `:auto` is not exposed yet.
+
 ## v0.8.43
 
 llama.cpp bump to b10362, on top of b10280 from v0.8.42, plus the CUDA work that

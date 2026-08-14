@@ -233,6 +233,7 @@ defmodule LlamaCppEx.MixProject do
         "LICENSE",
         "docs/architecture.md",
         "docs/cross-platform-builds.md",
+        "docs/dgx-spark.md",
         "docs/adr/001-cpp-nif-over-rustler.md",
         "docs/adr/002-fine-for-nif-ergonomics.md",
         "docs/adr/003-static-linking.md",
@@ -241,7 +242,9 @@ defmodule LlamaCppEx.MixProject do
         "docs/adr/006-continuous-batching.md",
         "docs/adr/007-prefix-caching.md",
         "docs/adr/008-batching-strategies.md",
+        "docs/adr/009-multi-model-manager.md",
         "docs/examples.md",
+        "docs/multi-gpu.md",
         "docs/performance.md",
         "docs/release-guide.md"
       ],
@@ -277,16 +280,38 @@ defmodule LlamaCppEx.MixProject do
   # the inherited environment anyway, but listing them keeps the build's input
   # contract in one place:
   #
-  #   LLAMA_BACKEND    auto | metal | cuda | vulkan | cpu
-  #   LLAMA_CMAKE_ARGS extra flags appended to the llama.cpp cmake invocation
-  #   LLAMA_PORTABLE   1 to drop -march=native, set by the precompile workflow
-  #   LLAMA_CUDA_NCCL  1 to build and link ggml's NCCL multi-GPU collectives,
-  #                    which also makes libnccl.so.2 a load-time requirement
+  #   LLAMA_BACKEND      auto | metal | cuda | vulkan | cpu
+  #   LLAMA_CMAKE_ARGS   extra flags appended to the llama.cpp cmake invocation
+  #   LLAMA_PORTABLE     1 to drop -march=native, set by the precompile workflow
+  #   LLAMA_CUDA_NCCL    1 to build and link ggml's NCCL multi-GPU collectives,
+  #                      which also makes libnccl.so.2 a load-time requirement
+  #   LLAMA_CPU_ARM_ARCH the ARM architecture string for ggml's CPU backend, for
+  #                      hosts where -mcpu=native degrades silently (GB10 on GCC
+  #                      13.3). Requires LLAMA_CUDA_ARCH on a CUDA build; the
+  #                      Makefile errors otherwise, because reaching this flag
+  #                      needs GGML_NATIVE=OFF and that turns one CUDA arch into
+  #                      seven.
+  #   LLAMA_CUDA_ARCH    CMAKE_CUDA_ARCHITECTURES, e.g. 121a-real for GB10
+  #   LLAMA_RPC          1 to build the ggml RPC backend, which lets a model's
+  #                      layers live on another host. Off by default: it is a
+  #                      networked surface and a protocol version coupling.
+  #   LLAMA_RPC_RDMA     1 (default) to use RDMA for the RPC transport on Linux.
+  #                      Declared rather than auto-detected, and paired with
+  #                      -libverbs on the link line.
+  #
+  # None of these need to appear in make_force_build: each is part of the
+  # Makefile's build-directory key, so changing one lands in a different tree
+  # with its own CMakeCache.txt and rebuilds on its own. That is a better answer
+  # than forcing a rebuild, because switching back is still a cache hit.
   @make_env_passthrough [
     "LLAMA_BACKEND",
     "LLAMA_CMAKE_ARGS",
     "LLAMA_PORTABLE",
-    "LLAMA_CUDA_NCCL"
+    "LLAMA_CUDA_NCCL",
+    "LLAMA_CPU_ARM_ARCH",
+    "LLAMA_CUDA_ARCH",
+    "LLAMA_RPC",
+    "LLAMA_RPC_RDMA"
   ]
 
   defp make_env do

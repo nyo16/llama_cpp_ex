@@ -24,6 +24,14 @@ defmodule LlamaCppEx.NIF do
   # Devices
   def device_list, do: :erlang.nif_error(:not_loaded)
 
+  # RPC. Present in every build; they return {:error, :rpc_unsupported} unless
+  # the NIF was compiled with LLAMA_RPC=1.
+  def rpc_supported, do: :erlang.nif_error(:not_loaded)
+  def rpc_add_server(_endpoint), do: :erlang.nif_error(:not_loaded)
+
+  def rpc_start_server(_endpoint, _cache_dir, _n_threads, _device_names),
+    do: :erlang.nif_error(:not_loaded)
+
   # Model
   def model_load(
         _path,
@@ -36,7 +44,8 @@ defmodule LlamaCppEx.NIF do
         _use_direct_io,
         _vocab_only,
         _check_tensors,
-        _load_mtp
+        _load_mtp,
+        _devices
       ),
       do: :erlang.nif_error(:not_loaded)
 
