@@ -1,9 +1,14 @@
 # Tests that load real GGUF models and run inference are excluded by default,
-# behind four opt-in tags. Each tag names the model it needs:
+# behind a set of opt-in tags. Each tag names the model it needs:
 #
 #   :smoke      — generation/chat/grammar/server paths; needs LLAMA_SMOKE_GEN_MODEL
 #   :embeddings — embedding paths;                      needs LLAMA_SMOKE_EMB_MODEL
 #   :mtp        — MTP speculative decoding;             needs LLAMA_SMOKE_MTP_MODEL
+#   :mtp_sidecar — MTP with the head in a *separate* sidecar GGUF (Qwen 3.8's
+#                 shape), so it needs a pair: LLAMA_SMOKE_MTP_MODEL for the
+#                 target and LLAMA_SMOKE_MTP_DRAFT_MODEL for the head. Its own
+#                 tag rather than `:mtp` because that tag's single-file model
+#                 cannot satisfy it.
 #   :mtp_cancel — one known-broken MTP test, excluded on its own tag so that
 #                 `--include mtp` is green. It does not fail, it aborts the VM:
 #                 cancelling an MTP stream is fire-and-forget, so reusing the
@@ -39,6 +44,11 @@
 #   LLAMA_SMOKE_MTP_MODEL=/path/to/mtp-model.gguf \
 #     mix test --include mtp
 #
+#   GGML_METAL_NO_RESIDENCY=1 \
+#   LLAMA_SMOKE_MTP_MODEL=/path/to/Qwen3.8-27B-Q4_K_M.gguf \
+#   LLAMA_SMOKE_MTP_DRAFT_MODEL=/path/to/mtp-Qwen3.8-27B-Q4_0.gguf \
+#     mix test --include mtp_sidecar
+#
 #   LLAMA_RPC=1 mix compile
 #   LLAMA_RPC_ENDPOINT=10.100.64.2:50052 mix test --include rpc_live
 #
@@ -67,4 +77,4 @@ Code.require_file("support/test_slots.exs", __DIR__)
 # default run quiet, and rpc_test.exs additionally carries a compile-time `skip:`
 # so an explicit `--include rpc_live` without a worker skips rather than fails
 # (`--include` beats `--exclude`, so the exclusion alone cannot do that).
-ExUnit.start(exclude: [:smoke, :embeddings, :slow, :mtp, :mtp_cancel, :rpc_live])
+ExUnit.start(exclude: [:smoke, :embeddings, :slow, :mtp, :mtp_cancel, :mtp_sidecar, :rpc_live])

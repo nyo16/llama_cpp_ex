@@ -6,9 +6,13 @@ DGX Spark (GB10) support: a silent ARM code-generation bug fixed, the ggml RPC
 backend wired up so a model can span two machines, and a measured runbook for
 both configurations in [docs/dgx-spark.md](docs/dgx-spark.md).
 
-Verified on macOS (Metal, no RPC): **423 passed, 143 excluded**. On a DGX Spark
-(CUDA 13.0, `sm_121a`): **423 passed**, and **424 with `--include rpc_live`**
-against a live two-node worker.
+llama.cpp bumped to [`b10435`](https://github.com/ggml-org/llama.cpp/releases/tag/b10435)
+(`9e40df63b`), which brings Qwen 3.8 in under the existing `qwen35`
+architecture, and MTP support for its target/sidecar split (see Added).
+
+Verified on macOS (Metal, no RPC): **428 passed, 149 excluded**, plus
+**6 passed** with `--include mtp_sidecar` against Qwen3.8-27B-Q4_K_M and its
+`mtp-*-Q4_0` head. On a DGX Spark (CUDA 13.0, `sm_121a`): **428 passed**.
 
 ### Fixed
 
@@ -56,6 +60,31 @@ against a live two-node worker.
   arrive as a compile error.
 
 ### Added
+
+- **`LlamaCppEx.MTP.init/2` accepts a separate `:draft_model`.** The MTP head no
+  longer has to live inside the target GGUF. Qwen 3.8 is why: `ggml-org/Qwen3.8-27B-GGUF`
+  ships `Qwen3.8-27B-Q4_K_M.gguf` with *zero* nextn layers and the head alone in
+  `mtp-Qwen3.8-27B-Q4_0.gguf`, so the old single-file path refused the pair
+  outright with "this GGUF contains no MTP head". This is the binding's
+  equivalent of upstream's `-hf <target> -hfd <draft> --spec-type draft-mtp`.
+  The NIF already took two independent contexts; only the Elixir side was tying
+  them to one model.
+
+  Mismatched pairings are refused before any context is built, including a
+  target/draft hidden-width mismatch — upstream compares those with a
+  `GGML_ASSERT`, which is an unconditional `ggml_abort` and would take the VM
+  down instead of returning an error.
+- **`stats/1` reports `timing_us.ckpt`.** Recurrent-state save/restore, which
+  only hybrid models pay, was previously folded into `:other` — a bucket whose
+  documented cause is Metal GPU-sync waits. On Qwen 3.8 (48 SSM layers to 16
+  attention ones, ~150 MiB of state snapshotted every iteration) it is the term
+  that decides whether speculation helps at all: 6.9 s of a 16.3 s M1 Max run at
+  `n_draft: 3`. Attributing it correctly dropped `:other` for that run from
+  8.7 s to 0.17 s.
+- **`LlamaCppEx.Model.n_embd_out/1` and `n_layer_nextn/1`** — the two numbers
+  that decide whether a GGUF can serve as an MTP target or head. `n_layer_nextn`
+  wraps a NIF that already existed but was only reachable through
+  `LlamaCppEx.NIF`.
 
 - **`LlamaCppEx.RPC`** — register a remote machine's devices into the local
   device registry so a model's layers can live on another host.

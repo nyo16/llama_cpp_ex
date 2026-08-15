@@ -201,3 +201,126 @@ defmodule LlamaCppEx.MTPCancelTest do
     assert {:ok, _} = MTP.generate(mtp, "2 + 2 =", max_tokens: 4, temp: 0.0)
   end
 end
+
+defmodule LlamaCppEx.MTPSidecarTest do
+  # The target/draft split, which is how Qwen 3.8 ships MTP: the target GGUF
+  # carries zero nextn layers and a separate `mtp-*.gguf` carries the head. This
+  # needs two files rather than one, so it gates on its own tag and its own env
+  # var — `--include mtp` has only the single-file model:
+  #
+  #   GGML_METAL_NO_RESIDENCY=1 LLAMA_BACKEND=auto \
+  #   LLAMA_SMOKE_MTP_MODEL=/path/to/Qwen3.8-27B-Q4_K_M.gguf \
+  #   LLAMA_SMOKE_MTP_DRAFT_MODEL=/path/to/mtp-Qwen3.8-27B-Q4_0.gguf \
+  #     mix test --include mtp_sidecar
+  #
+  # async: false, and one session for the module, for the same reason
+  # MTPModelTest says: one GPU, and each session reserves two contexts.
+  use ExUnit.Case, async: false
+
+  alias LlamaCppEx.MTP
+
+  @moduletag :mtp_sidecar
+  @moduletag timeout: 300_000
+
+  setup_all do
+    :ok = LlamaCppEx.init()
+
+    {:ok, target} =
+      LlamaCppEx.load_model(LlamaCppEx.TestModels.path!(:mtp),
+        n_gpu_layers: -1,
+        load_mtp: true
+      )
+
+    {:ok, draft} =
+      LlamaCppEx.load_model(LlamaCppEx.TestModels.path!(:mtp_draft),
+        n_gpu_layers: -1,
+        load_mtp: true
+      )
+
+    {:ok, session} = MTP.init(target, draft_model: draft, n_ctx: 2048, n_draft: 1)
+
+    %{target: target, draft: draft, session: session}
+  end
+
+  test "the sidecar carries the head and the target does not", %{target: t, draft: d} do
+    # The premise of the whole pairing. If a future conversion moves the head
+    # into the target this test is the thing that notices.
+    assert LlamaCppEx.Model.n_layer_nextn(d) > 0
+    assert LlamaCppEx.Model.n_layer_nextn(t) == 0
+
+    # Upstream compares these two with a GGML_ASSERT, which aborts the VM rather
+    # than failing a call, so the pair must agree before init/2 builds anything.
+    assert LlamaCppEx.Model.n_embd_out(d) == LlamaCppEx.Model.n_embd_out(t)
+  end
+
+  test "init/2 builds a session from the pair", %{session: session} do
+    assert %LlamaCppEx.Context{} = session.main_ctx
+    assert %LlamaCppEx.Context{} = session.mtp_ctx
+    assert is_reference(session.spec_ref)
+  end
+
+  test "the same target is refused without the sidecar", %{target: t} do
+    # Not a redundant restatement of the unit test: there the nextn count comes
+    # from a hand-built struct, here it is read off the real file.
+    assert {:error, message} = MTP.init(t, n_ctx: 512)
+    assert message =~ "no MTP head"
+    assert message =~ "draft_model"
+  end
+
+  test "generate/3 produces text and the head actually drafts", %{session: session} do
+    before = MTP.stats(session)
+
+    assert {:ok, text} = MTP.generate(session, "2 + 2 =", max_tokens: 16, temp: 0.0)
+    assert is_binary(text) and text != ""
+
+    now = MTP.stats(session)
+
+    # Deltas, not absolutes: the session is shared across this module's tests.
+    assert now.drafts_generated > before.drafts_generated,
+           "the sidecar head proposed no drafts at all"
+
+    assert now.tokens_emitted > before.tokens_emitted
+  end
+
+  # A hybrid target (Qwen 3.8: SSM layers beside attention ones) cannot roll back
+  # part of a sequence natively, so the loop snapshots the recurrent state every
+  # iteration. That cost is the difference between speculation paying off and not,
+  # so it gets its own bucket rather than hiding inside :other.
+  test "timing_us reports a ckpt bucket", %{session: session} do
+    assert {:ok, _} = MTP.generate(session, "Count to ten:", max_tokens: 24, temp: 0.0)
+
+    timing = MTP.stats(session).timing_us
+
+    for key <- [:draft, :verify, :sample, :ckpt, :other, :total] do
+      assert Map.has_key?(timing, key), "timing_us is missing #{inspect(key)}"
+    end
+
+    assert timing.ckpt > 0,
+           "a hybrid target should have paid for at least one recurrent-state snapshot"
+
+    # The named buckets are carved out of total, never billed twice on top of it.
+    assert timing.draft + timing.verify + timing.sample + timing.ckpt <= timing.total
+  end
+
+  test "greedy output matches plain greedy decode on the target", %{
+    target: target,
+    session: session
+  } do
+    # Speculation is exactness-preserving in principle. In practice ggml selects
+    # a different matmul kernel by batch row count — ggml-metal-ops.cpp picks the
+    # mul_mv_ext path for Q4_K only at ne11 >= 4, and its r1ptg by ne11 — and the
+    # MTP verify batch is 1 + n_draft rows wide, so at a position where the top
+    # two logits are within rounding error the argmax can differ from a 1-row
+    # plain decode. That is not a bug and it is demonstrable *without* MTP: on
+    # Qwen 3.8 / M1 Max, feeding one fixed prefix to plain greedy decode gives
+    # " computational" at 1-3 rows and " latency" at 4+. So compare a short
+    # continuation, where no such near-tie has come up.
+    prompt = "The capital of France is"
+    opts = [max_tokens: 8, temp: 0.0]
+
+    assert {:ok, spec} = MTP.generate(session, prompt, opts)
+    assert {:ok, plain} = LlamaCppEx.generate(target, prompt, opts ++ [n_ctx: 2048])
+
+    assert spec == plain
+  end
+end

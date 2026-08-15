@@ -610,14 +610,42 @@ Multi-Token Prediction speculative decoding (upstream PR [#22673](https://github
 > `n_draft: 3` as the datacenter default the upstream 2× assumes, not as a value
 > that transfers.
 
+> **Performance note: Qwen 3.8 27B (hybrid SSM, sidecar head).** This one is
+> shaped by a cost the models above do not pay. Qwen 3.8 puts 48 SSM layers
+> beside 16 attention ones, and a recurrent layer cannot be rolled back to an
+> arbitrary position, so every speculative iteration snapshots and restores the
+> whole recurrent state — 150 MiB of it at these sizes. `stats/1` reports that
+> separately as `timing_us.ckpt`. Q4_K_M target + Q4_0 sidecar head, 120-token
+> greedy generations:
+>
+> | `n_draft` | acceptance | M1 Max (Metal) | GB10 (DGX Spark) |
+> |---|---|---|---|
+> | 1 | 75.0% | 0.89× | **1.24×** |
+> | 2 | 54–59% | 0.66× | 1.17× |
+> | 3 | 40–44% | 0.68× | 1.09× |
+> | 4 | 32% | — | 0.96× |
+> | 5 | 30% | 0.56× | — |
+>
+> On Metal MTP is a net loss at every draft length: `ckpt` alone was 1.8 s of a
+> 12.5 s run at `n_draft: 1` and 6.9 s of 16.3 s at `n_draft: 3`. On GB10 the
+> same snapshot is cheap enough that `n_draft: 1` wins, and — unlike the MoE
+> above, whose optimum was 2 — the optimum here is 1, monotonically decreasing
+> after it. Measure `ckpt` against `total` before trusting speculation on any
+> hybrid model.
+>
+> Both arms of the GB10 column are warm-cache numbers. A first run off cold page
+> cache reads ~19 GB and reported a 4.18 tok/s baseline against 10.83 tok/s warm,
+> which inverts the comparison entirely.
+
 ### Other speculative types (EAGLE-3, DFlash, n-gram)
 
-Upstream llama.cpp implements more speculative types behind the same `common_speculative` API — `draft-eagle3`, `draft-dflash` (block-diffusion drafting via a separate drafter GGUF), and several n-gram self-speculation modes. **This binding currently exposes only MTP**: `MTP.init/2` pins `COMMON_SPECULATIVE_TYPE_DRAFT_MTP` and builds both contexts from the same model, so there is no way to load a separate drafter model yet.
+Upstream llama.cpp implements more speculative types behind the same `common_speculative` API — `draft-eagle3`, `draft-dflash` (block-diffusion drafting via a separate drafter GGUF), and several n-gram self-speculation modes, plus `--spec-default`, which stacks n-gram speculation on top of a model-based drafter. **This binding currently exposes only MTP**: `MTP.init/2` pins `COMMON_SPECULATIVE_TYPE_DRAFT_MTP`, so the other types and the combinations are not reachable from here. The draft *model* is no longer tied to the target, though — see `:draft_model` below for the target/sidecar split.
 
 > **DFlash status (July 2026, llama.cpp b9932).** DFlash runs end-to-end on Metal via upstream `llama-cli`/`llama-server`, but we measured it *slower* than plain decoding on Apple Silicon at small target sizes: Qwen3.5-4B target + z-lab 0.6B drafter on M4 Max reached 42 tok/s with DFlash vs 85 tok/s plain (greedy sampling; 30% draft acceptance, mean accepted run 2.8 — and stochastic sampling at `temp 0.8` collapses acceptance to ~7%). The Metal economics are the same as the MTP note above (wide verify batches are expensive), and the community drafter-GGUF conversions are still churning: of three third-party Qwen 4B drafter repos tested, only one loads with current upstream (the others hit the `dflash-draft` arch mismatch [#25116](https://github.com/ggml-org/llama.cpp/issues/25116) or lack the `target_layers` metadata added by the conversion refactor [#25110](https://github.com/ggml-org/llama.cpp/pull/25110)). Worth revisiting when the drafter format settles; the natural entry point is a `spec_type` + drafter-model option on `speculative_init`.
 
 ### Models with MTP heads
 
+- [`ggml-org/Qwen3.8-27B-GGUF`](https://huggingface.co/ggml-org/Qwen3.8-27B-GGUF) — **sidecar layout**: the target (`Qwen3.8-27B-Q4_K_M.gguf`, ~18 GB) carries *no* head, and `mtp-Qwen3.8-27B-Q4_0.gguf` (~1.6 GB) carries nothing else. Load both and pass the head as `draft_model:`.
 - [`ggml-org/Qwen3.6-35B-A3B-MTP-GGUF`](https://huggingface.co/ggml-org/Qwen3.6-35B-A3B-MTP-GGUF) (recommended: `Q4_K_M`, ~21 GB)
 - [`ggml-org/Qwen3.6-27B-MTP-GGUF`](https://huggingface.co/ggml-org/Qwen3.6-27B-MTP-GGUF)
 - [`unsloth/Qwen3.6-35B-A3B-MTP-GGUF`](https://huggingface.co/unsloth/Qwen3.6-35B-A3B-MTP-GGUF)
@@ -632,7 +660,7 @@ Acceptance on a 0.8B target is not representative of production throughput —
 drafting is nearly as expensive as decoding at that size — so use these to
 exercise the path, not to measure it.
 
-A regular (non-MTP) Qwen 3.6 quant will fail at `LlamaCppEx.MTP.init/2` — the GGUF must contain the MTP head's tensors. To check a file before loading it, look for a `*.nextn_predict_layers` key and `blk.N.nextn.*` tensors in its metadata.
+A regular (non-MTP) quant will fail at `LlamaCppEx.MTP.init/2` — some GGUF in the pair must contain the MTP head's tensors. To check a file before loading it, look for a `*.nextn_predict_layers` key and `blk.N.nextn.*` tensors in its metadata. When the publisher ships the head separately (Qwen 3.8), that sidecar is the file with those tensors and the target legitimately has none; pass it as `draft_model:` rather than looking for a combined build.
 
 The model must also be loaded with `load_mtp: true` (see below). Upstream gates those tensors behind a load-time flag that defaults to off, and they cannot be attached afterwards, so `MTP.init/2` refuses a model loaded without it rather than letting the omission surface later as `verify decode failed: code=-1`.
 
@@ -669,6 +697,49 @@ stats = LlamaCppEx.MTP.stats(mtp)
 IO.puts("\nacceptance: #{Float.round(stats.acceptance_rate * 100, 1)}%  " <>
         "throughput: #{Float.round(stats.tokens_per_sec, 1)} tok/s")
 ```
+
+#### Sidecar head: Qwen 3.8 (`-hf` target + `-hfd` draft)
+
+Same session API, two files. This is what upstream's
+`llama serve -hf ggml-org/Qwen3.8-27B-GGUF --spec-type draft-mtp` resolves to
+once it has downloaded the pair — the flag makes upstream fetch the `mtp-*`
+sidecar and build the draft context against it instead of against the target.
+
+```elixir
+:ok = LlamaCppEx.init()
+
+# The target carries no MTP head at all: Model.n_layer_nextn/1 returns 0 for it.
+{:ok, target} =
+  LlamaCppEx.load_model(
+    Path.expand("~/Downloads/Qwen3.8-27B-Q4_K_M.gguf"),
+    n_gpu_layers: 999,
+    load_mtp: true
+  )
+
+# The sidecar carries nothing *but* the head — ~1.6 GB against the target's 18.
+{:ok, head} =
+  LlamaCppEx.load_model(
+    Path.expand("~/Downloads/mtp-Qwen3.8-27B-Q4_0.gguf"),
+    n_gpu_layers: 999,
+    load_mtp: true
+  )
+
+# n_draft: 1 — see the Qwen 3.8 performance note above. Acceptance is 75% here
+# and falls off fast, and every iteration pays a recurrent-state snapshot.
+{:ok, mtp} = LlamaCppEx.MTP.init(target, draft_model: head, n_draft: 1, n_ctx: 8192)
+
+{:ok, text} = LlamaCppEx.MTP.generate(mtp, "Explain MTP in one paragraph.", max_tokens: 200)
+
+stats = LlamaCppEx.MTP.stats(mtp)
+IO.puts("acceptance: #{Float.round(stats.acceptance_rate * 100, 1)}%  " <>
+        "ckpt: #{div(stats.timing_us.ckpt, 1000)}ms of #{div(stats.timing_us.total, 1000)}ms")
+```
+
+`MTP.init/2` refuses the mismatched pairings before building anything: a sidecar
+loaded without `load_mtp: true`, an ordinary model passed as `:draft_model`, and
+a head whose hidden width does not match the target's — that last one because
+upstream compares the two with a `GGML_ASSERT`, which aborts the VM rather than
+failing the call.
 
 #### Synchronous generate (collect to a string)
 

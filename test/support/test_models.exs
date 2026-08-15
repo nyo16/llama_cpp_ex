@@ -10,12 +10,17 @@ defmodule LlamaCppEx.TestModels do
   @vars %{
     gen: {"LLAMA_SMOKE_GEN_MODEL", "a chat/instruct"},
     emb: {"LLAMA_SMOKE_EMB_MODEL", "an embedding"},
-    mtp: {"LLAMA_SMOKE_MTP_MODEL", "an MTP-enabled"}
+    mtp: {"LLAMA_SMOKE_MTP_MODEL", "an MTP-enabled"},
+    # The head-only sidecar half of a target/draft pair, e.g. Qwen 3.8's
+    # mtp-Qwen3.8-27B-Q4_0.gguf. Its own env var rather than a second use of
+    # :mtp because the two files are provisioned independently and the sidecar is
+    # useless without the target it was built for.
+    mtp_draft: {"LLAMA_SMOKE_MTP_DRAFT_MODEL", "an MTP sidecar (head-only)"}
   }
 
   @kinds Map.keys(@vars)
 
-  @type kind :: :gen | :emb | :mtp
+  @type kind :: :gen | :emb | :mtp | :mtp_draft
 
   @doc "Name of the environment variable holding the model path for `kind`."
   @spec var(kind()) :: String.t()

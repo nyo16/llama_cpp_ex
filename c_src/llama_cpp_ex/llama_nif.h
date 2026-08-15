@@ -194,6 +194,13 @@ public:
     std::atomic<uint64_t> us_draft{0};
     std::atomic<uint64_t> us_verify{0};
     std::atomic<uint64_t> us_sample{0};
+    // Recurrent-state save/restore, which only hybrid models pay (needs_ckpt).
+    // Broken out of us_other because on a model like Qwen 3.8 — 48 SSM layers
+    // beside 16 attention ones — the snapshot is over a hundred MiB and taken
+    // every iteration, which is enough on its own to make speculation a net
+    // loss. Attributing it to "other" hid that behind a bucket whose documented
+    // cause is GPU-sync waits.
+    std::atomic<uint64_t> us_ckpt{0};
     // Everything in the speculative iter NOT inside the three hot-path
     // timers above. On Metal this is dominated by implicit GPU-sync waits
     // from the previous iter's async verify decode (llama_decode returns

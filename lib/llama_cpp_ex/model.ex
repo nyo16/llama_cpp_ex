@@ -197,6 +197,24 @@ defmodule LlamaCppEx.Model do
   @spec n_embd(t()) :: integer()
   def n_embd(%__MODULE__{ref: ref}), do: LlamaCppEx.NIF.model_n_embd(ref)
 
+  @doc """
+  Returns the output-side embedding width — the row width an MTP draft head
+  consumes. Equal to `n_embd/1` for every architecture currently in tree; it is
+  a distinct number because `LlamaCppEx.MTP` matches it across the target and a
+  separate drafter GGUF.
+  """
+  @spec n_embd_out(t()) :: integer()
+  def n_embd_out(%__MODULE__{ref: ref}), do: LlamaCppEx.NIF.model_n_embd_out(ref)
+
+  @doc """
+  Returns the number of MTP / "next-N" prediction layers in the checkpoint, or
+  `0` when it carries no MTP head. Note this reports what the *file* contains;
+  the layers are only actually loaded when the model was opened with
+  `load_mtp: true`.
+  """
+  @spec n_layer_nextn(t()) :: non_neg_integer()
+  def n_layer_nextn(%__MODULE__{ref: ref}), do: LlamaCppEx.NIF.model_n_layer_nextn(ref)
+
   @doc "Returns a human-readable description of the model."
   @spec desc(t()) :: String.t()
   def desc(%__MODULE__{ref: ref}), do: LlamaCppEx.NIF.model_desc(ref)
