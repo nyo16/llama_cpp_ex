@@ -58,6 +58,49 @@ defmodule LlamaCppEx.MTPTest do
     end
   end
 
+  # Qwen 3.8 ships the MTP head as a sidecar GGUF: the target carries zero nextn
+  # layers and the head file carries nothing else, so the pair only works if the
+  # draft context can be built from a *different* model than the target. These
+  # guards all run before any context is created, so a nil ref never reaches the
+  # NIF — the ones that must read model metadata (nextn count, hidden width) need
+  # a real file and live in MTPModelTest.
+  describe "init/2 with a separate :draft_model" do
+    @unloaded %LlamaCppEx.Model{ref: nil}
+    @loaded_mtp %LlamaCppEx.Model{ref: nil, load_mtp: true}
+
+    test "refuses a sidecar loaded without load_mtp: true, naming the remedy" do
+      assert {:error, message} = MTP.init(@loaded_mtp, draft_model: @unloaded)
+      assert message =~ "draft_model was loaded without load_mtp: true"
+      assert message =~ "reload it"
+    end
+
+    test "the sidecar's flag is what matters, not the target's" do
+      # The target legitimately has no head of its own in this shape, so its own
+      # load_mtp is not what gates the session — a target without the flag and a
+      # sidecar with it must get past the flag check rather than be refused for
+      # the target's sake. Reaching the metadata read (which a nil ref cannot
+      # survive) is the proof it got that far.
+      assert catch_error(MTP.init(@unloaded, draft_model: @loaded_mtp))
+    end
+
+    test "rejects a :draft_model that is not a Model" do
+      for bad <- ["mtp.gguf", :mtp, 42, %{ref: nil}] do
+        assert {:error, message} = MTP.init(@loaded_mtp, draft_model: bad)
+        assert message =~ ":draft_model must be a LlamaCppEx.Model"
+      end
+    end
+
+    test "nil :draft_model is the in-target-head path, not a bad argument" do
+      # Explicitly passing nil must behave exactly like omitting the option.
+      assert MTP.init(@unloaded, draft_model: nil) == MTP.init(@unloaded)
+    end
+
+    test "n_draft is still validated first, so its error is not masked" do
+      assert MTP.init(@loaded_mtp, draft_model: @unloaded, n_draft: 0) ==
+               {:error, ":n_draft must be a positive integer"}
+    end
+  end
+
   # A checkpoint with no MTP head is a different failure from a model loaded
   # without the flag, and no flag recovers it. Most GGUF conversions of an
   # MTP-capable model drop the head — unsloth's Qwen3.6-35B-A3B-UD-Q4_K_XL has

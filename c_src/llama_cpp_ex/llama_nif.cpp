@@ -662,6 +662,18 @@ int64_t model_n_embd(ErlNifEnv* env, fine::ResourcePtr<LlamaModel> model) {
 }
 FINE_NIF(model_n_embd, 0);
 
+// Output-side embedding width, which is what the MTP draft head consumes. It is
+// `n_embd` for every architecture in tree today, but upstream reads this one
+// (speculative.cpp: "MTP input row width must match the target h_nextn width")
+// and enforces the target/draft match with a GGML_ASSERT — an unconditional
+// ggml_abort that takes the whole VM down rather than failing the call. A
+// separate drafter GGUF is the only way to reach that assert, so MTP.init/2
+// compares this across the two models before it builds anything.
+int64_t model_n_embd_out(ErlNifEnv* env, fine::ResourcePtr<LlamaModel> model) {
+    return llama_model_n_embd_out(model->model);
+}
+FINE_NIF(model_n_embd_out, 0);
+
 // Number of MTP / "next-N" prediction layers the checkpoint carries. Zero means
 // the GGUF has no MTP head at all, which is a different situation from a model
 // loaded with load_mtp: false: no flag can recover it, only a different file.
@@ -2027,28 +2039,31 @@ static ERL_NIF_TERM build_mtp_stats_map(ErlNifEnv* env, const LlamaSpeculative& 
     uint64_t udraft  = s.us_draft.load(std::memory_order_relaxed);
     uint64_t uverify = s.us_verify.load(std::memory_order_relaxed);
     uint64_t usample = s.us_sample.load(std::memory_order_relaxed);
+    uint64_t uckpt   = s.us_ckpt.load(std::memory_order_relaxed);
     uint64_t uother  = s.us_other.load(std::memory_order_relaxed);
     uint64_t utotal  = s.us_total.load(std::memory_order_relaxed);
 
     double acceptance_rate = dgen > 0 ? (double)dacc / (double)dgen : 0.0;
     double tokens_per_sec  = utotal > 0 ? (double)emitted * 1e6 / (double)utotal : 0.0;
 
-    ERL_NIF_TERM tk[5] = {
+    ERL_NIF_TERM tk[6] = {
         enif_make_atom(env, "draft"),
         enif_make_atom(env, "verify"),
         enif_make_atom(env, "sample"),
+        enif_make_atom(env, "ckpt"),
         enif_make_atom(env, "other"),
         enif_make_atom(env, "total"),
     };
-    ERL_NIF_TERM tv[5] = {
+    ERL_NIF_TERM tv[6] = {
         enif_make_uint64(env, udraft),
         enif_make_uint64(env, uverify),
         enif_make_uint64(env, usample),
+        enif_make_uint64(env, uckpt),
         enif_make_uint64(env, uother),
         enif_make_uint64(env, utotal),
     };
     ERL_NIF_TERM timing;
-    enif_make_map_from_arrays(env, tk, tv, 5, &timing);
+    enif_make_map_from_arrays(env, tk, tv, 6, &timing);
 
     ERL_NIF_TERM keys[8] = {
         enif_make_atom(env, "iters"),
@@ -2323,6 +2338,7 @@ fine::Ok<> generate_mtp_tokens(
         // PART at init time, so llama_memory_seq_rm handles partial rejection
         // natively and the checkpoint would be pure overhead.
         if (sp.needs_ckpt) {
+            auto t_ck0 = std::chrono::steady_clock::now();
             size_t sz_tgt = llama_state_seq_get_size_ext(ctx_tgt, seq_id, ckpt_flags);
             ckpt_tgt.resize(sz_tgt);
             if (sz_tgt > 0) {
@@ -2333,6 +2349,13 @@ fine::Ok<> generate_mtp_tokens(
             if (sz_dft > 0) {
                 llama_state_seq_get_data_ext(ctx_dft, ckpt_dft.data(), sz_dft, seq_id, ckpt_flags);
             }
+            // Bill this to us_ckpt, then slide the anchor past it so the same
+            // microseconds are not also counted as unaccounted "other".
+            auto t_ck1 = std::chrono::steady_clock::now();
+            sp.us_ckpt.fetch_add(
+                std::chrono::duration_cast<std::chrono::microseconds>(t_ck1 - t_ck0).count(),
+                std::memory_order_relaxed);
+            t_anchor += (t_ck1 - t_ck0);
         }
 
         // 1. Generate drafts from the MTP head's current state.
@@ -2468,6 +2491,7 @@ fine::Ok<> generate_mtp_tokens(
                 // Hybrid model: partial seq_rm isn't supported, so restore
                 // both contexts from the pre-iteration recurrent-state
                 // snapshot and re-decode just the accepted prefix.
+                auto t_rs0 = std::chrono::steady_clock::now();
                 if (!ckpt_tgt.empty()) {
                     llama_state_seq_set_data_ext(ctx_tgt, ckpt_tgt.data(),
                                                   ckpt_tgt.size(), seq_id, ckpt_flags);
@@ -2479,6 +2503,14 @@ fine::Ok<> generate_mtp_tokens(
                                                   ckpt_dft.size(), seq_id, ckpt_flags);
                 }
                 soft_seq_rm(ctx_dft, seq_id, n_past);
+                auto t_rs1 = std::chrono::steady_clock::now();
+                sp.us_ckpt.fetch_add(
+                    std::chrono::duration_cast<std::chrono::microseconds>(t_rs1 - t_rs0).count(),
+                    std::memory_order_relaxed);
+                // Same anchor slide as the save above: us_other is closed out
+                // from t_anchor at the end of the iter, so without this the
+                // restore would be billed twice.
+                t_anchor += (t_rs1 - t_rs0);
 
                 // Re-decode the accepted tokens on the target so the next
                 // iteration's draft starts from a consistent state.

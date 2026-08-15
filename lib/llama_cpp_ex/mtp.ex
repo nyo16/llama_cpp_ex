@@ -2,9 +2,10 @@ defmodule LlamaCppEx.MTP do
   @moduledoc """
   Multi-Token Prediction (MTP) speculative decoding.
 
-  Drives a target/draft speculative loop where the draft model is the MTP head
-  embedded in the same GGUF as the target. On Qwen 3.6 with `n_draft: 3` this
-  typically yields ~2x token-generation throughput at ~75% draft acceptance.
+  Drives a target/draft speculative loop where the draft model is an MTP head —
+  either embedded in the target GGUF, or shipped beside it as a sidecar file. On
+  Qwen 3.6 with `n_draft: 3` this typically yields ~2x token-generation
+  throughput at ~75% draft acceptance.
 
   ## Usage
 
@@ -22,12 +23,40 @@ defmodule LlamaCppEx.MTP do
       stats = LlamaCppEx.MTP.stats(mtp)
       IO.puts("acceptance: \#{Float.round(stats.acceptance_rate * 100, 1)}%")
 
-  The model GGUF must contain MTP head layers (e.g.
-  `ggml-org/Qwen3.6-35B-A3B-MTP-GGUF`) — look for `*.nextn_predict_layers` in its
-  metadata — **and** must be loaded with `load_mtp: true`. Upstream defaults that
-  flag to `false` so non-speculative callers do not pay for the head's tensors,
-  and the layers cannot be attached afterwards, so `init/2` refuses a model
-  loaded without it.
+  ## Where the MTP head lives
+
+  The head is a set of `*.nextn_predict_layers` and comes in two shapes, and
+  either way the file carrying it must be loaded with `load_mtp: true`. Upstream
+  defaults that flag to `false` so non-speculative callers do not pay for the
+  head's tensors, and the layers cannot be attached afterwards, so `init/2`
+  refuses a model loaded without it.
+
+  **In the target GGUF** (e.g. `ggml-org/Qwen3.6-35B-A3B-MTP-GGUF`) — pass just
+  the model, as above.
+
+  **In a sidecar GGUF** — pass it as `:draft_model`. This is how Qwen 3.8 ships:
+  `Qwen3.8-27B-Q4_K_M.gguf` carries no head at all (`n_layer_nextn == 0`) and
+  `mtp-Qwen3.8-27B-Q4_0.gguf` carries nothing else. It is the binding's
+  equivalent of upstream's `-hf <target> -hfd <draft> --spec-type draft-mtp`.
+
+      {:ok, target} = LlamaCppEx.load_model("Qwen3.8-27B-Q4_K_M.gguf",
+                                            n_gpu_layers: 999, load_mtp: true)
+      {:ok, head}   = LlamaCppEx.load_model("mtp-Qwen3.8-27B-Q4_0.gguf",
+                                            n_gpu_layers: 999, load_mtp: true)
+
+      {:ok, mtp} = LlamaCppEx.MTP.init(target, draft_model: head, n_draft: 1)
+
+  > #### Speculation is not always a win on hybrid models {: .warning}
+  >
+  > A model that mixes recurrent (SSM) layers with attention ones — Qwen 3.8 is
+  > 48 SSM layers to 16 attention layers — cannot roll back part of a sequence
+  > natively, so every speculative iteration snapshots and restores the whole
+  > recurrent state. That state is over 100 MiB at Qwen 3.8's sizes, and the
+  > cost lands in `stats/1`'s `timing_us.ckpt`. Measured on an M1 Max (Metal,
+  > Q4_K_M target + Q4_0 head), MTP was a net *slowdown* at every draft length:
+  > 0.89x at `n_draft: 1` (75% acceptance) falling to 0.56x at `n_draft: 5`
+  > (30%). Check `timing_us.ckpt` against `timing_us.total` before assuming
+  > speculation is helping, and prefer small `n_draft` when it is not.
 
   Upstream currently requires `n_parallel = 1` for MTP. This module reflects
   that — a single MTP session decodes one sequence at a time. Reuse the same
@@ -46,12 +75,12 @@ defmodule LlamaCppEx.MTP do
   > a fresh session with `init/2`, before using the session again.
 
   MTP is the only speculative type this binding exposes. Upstream llama.cpp
-  also implements EAGLE-3, DFlash (block-diffusion drafting via a separate
-  drafter GGUF), and n-gram self-speculation behind the same
-  `common_speculative` API, but the NIF pins the MTP type and both contexts
-  are built from the same model, so a separate drafter model cannot be loaded
-  yet. See the "Speculative decoding" section of the README for the current
-  status of DFlash on Apple Silicon.
+  also implements EAGLE-3, DFlash (block-diffusion drafting), n-gram
+  self-speculation and combinations of them behind the same
+  `common_speculative` API; the NIF pins the MTP type, so `--spec-default`-style
+  stacking of n-gram speculation on top of MTP is not reachable from here. See
+  the "Speculative decoding" section of the README for the current status of
+  DFlash on Apple Silicon.
   """
 
   alias LlamaCppEx.{Context, Model, Sampler, Tokenizer}
@@ -81,6 +110,12 @@ defmodule LlamaCppEx.MTP do
 
   ## Options
 
+    * `:draft_model` - A separate `LlamaCppEx.Model` holding the MTP head, for
+      checkpoints that ship it as a sidecar GGUF rather than inside the target
+      file (Qwen 3.8 is the current example: `Qwen3.8-27B-Q4_K_M.gguf` plus
+      `mtp-Qwen3.8-27B-Q4_0.gguf`). It must be loaded with `load_mtp: true`.
+      Defaults to `nil`, meaning the head is expected inside the target model
+      and the draft context is built against it.
     * `:n_draft` - Max draft tokens generated per iteration. Defaults to `3`.
       Larger values mean fewer model forward passes but lower per-iteration
       acceptance; 2–4 is the sweet spot in practice.
@@ -94,12 +129,23 @@ defmodule LlamaCppEx.MTP do
   @spec init(Model.t(), keyword()) :: {:ok, t()} | {:error, term()}
   def init(%Model{} = model, opts \\ []) do
     n_draft = Keyword.get(opts, :n_draft, 3)
+    draft_model = Keyword.get(opts, :draft_model)
 
+    with :ok <- validate_n_draft(n_draft),
+         {:ok, head_model} <- validate_head(model, draft_model) do
+      do_init(model, head_model, opts, n_draft)
+    end
+  end
+
+  defp validate_n_draft(n) when is_integer(n) and n > 0, do: :ok
+  defp validate_n_draft(_), do: {:error, ":n_draft must be a positive integer"}
+
+  # Which model the draft context is built from, and whether it can actually
+  # serve as one. Two shapes reach this: the head inside the target GGUF (no
+  # `:draft_model`), and the head in a sidecar GGUF alongside it.
+  defp validate_head(%Model{} = target, nil) do
     cond do
-      not (is_integer(n_draft) and n_draft > 0) ->
-        {:error, ":n_draft must be a positive integer"}
-
-      not model.load_mtp ->
+      not target.load_mtp ->
         # Upstream gates the MTP head's tensors behind a load-time flag that
         # defaults to false (#26296), and nothing downstream notices they are
         # missing: both contexts build and `common_speculative_init` returns ok,
@@ -110,25 +156,60 @@ defmodule LlamaCppEx.MTP do
          "model was loaded without load_mtp: true, so its MTP head layers are " <>
            "absent; reload it with LlamaCppEx.load_model(path, load_mtp: true)"}
 
-      LlamaCppEx.NIF.model_n_layer_nextn(model.ref) == 0 ->
+      Model.n_layer_nextn(target) == 0 ->
         # Distinct from the branch above and not fixable by any flag: the
         # checkpoint simply has no MTP head. llama.cpp logs "context type MTP
         # requested but model doesn't contain MTP layers" and returns null, which
         # reaches the caller as a bare "failed to create context" with the real
         # reason buried in engine output the caller may not even be showing.
         # Most GGUF conversions of an MTP-capable model drop the head; the
-        # publisher usually ships it as a separate `-MTP` repository.
+        # publisher usually ships it as a separate repository or sidecar file,
+        # which is what `:draft_model` is for.
         {:error,
          "this GGUF contains no MTP head (0 nextn layers), so MTP speculative " <>
-           "decoding is unavailable for it; use an MTP-preserving conversion of " <>
-           "the model, which publishers typically ship as a separate -MTP build"}
+           "decoding is unavailable for it; either use an MTP-preserving " <>
+           "conversion of the model, or pass the publisher's sidecar MTP GGUF " <>
+           "as draft_model: (loaded with load_mtp: true)"}
 
       true ->
-        do_init(model, opts, n_draft)
+        {:ok, target}
     end
   end
 
-  defp do_init(model, opts, n_draft) do
+  defp validate_head(%Model{} = target, %Model{} = draft) do
+    cond do
+      not draft.load_mtp ->
+        {:error,
+         "draft_model was loaded without load_mtp: true, so the sidecar's MTP " <>
+           "head layers are absent; reload it with " <>
+           "LlamaCppEx.load_model(path, load_mtp: true)"}
+
+      Model.n_layer_nextn(draft) == 0 ->
+        {:error,
+         "draft_model contains no MTP head (0 nextn layers) — it is an ordinary " <>
+           "model, not an MTP sidecar; pass the publisher's mtp-* GGUF instead"}
+
+      # Upstream compares these two widths with a GGML_ASSERT in the draft-mtp
+      # constructor, and GGML_ASSERT is an unconditional ggml_abort: a mismatched
+      # pair would take the VM down instead of returning an error. Only a
+      # separate drafter can be mismatched, so this is checked on this branch
+      # alone, and before any context is built.
+      Model.n_embd_out(draft) != Model.n_embd_out(target) ->
+        {:error,
+         "draft_model hidden width #{Model.n_embd_out(draft)} does not match the " <>
+           "target's #{Model.n_embd_out(target)}; the sidecar belongs to a " <>
+           "different model than the one it was paired with"}
+
+      true ->
+        {:ok, draft}
+    end
+  end
+
+  defp validate_head(_target, other) do
+    {:error, ":draft_model must be a LlamaCppEx.Model, got: #{inspect(other)}"}
+  end
+
+  defp do_init(model, head_model, opts, n_draft) do
     base_ctx_opts = forwardable_context_opts(opts)
     main_opts = Keyword.merge(base_ctx_opts, ctx_type: :default)
     # Match upstream server: MTP draft context is created with n_rs_seq=0.
@@ -137,7 +218,7 @@ defmodule LlamaCppEx.MTP do
     draft_opts = Keyword.merge(base_ctx_opts, ctx_type: :mtp, n_rs_seq: 0)
 
     with {:ok, main_ctx} <- Context.create(model, main_opts),
-         {:ok, mtp_ctx} <- Context.create(model, draft_opts),
+         {:ok, mtp_ctx} <- Context.create(head_model, draft_opts),
          {:ok, spec_ref} <-
            LlamaCppEx.NIF.speculative_init(main_ctx.ref, mtp_ctx.ref, n_draft) do
       {:ok,
@@ -314,7 +395,12 @@ defmodule LlamaCppEx.MTP do
     * `:acceptance_rate` - `drafts_accepted / drafts_generated` (0.0–1.0)
     * `:tokens_emitted` - tokens streamed back to the caller
     * `:tokens_per_sec` - throughput over the active generation window
-    * `:timing_us` - `%{draft: μs, verify: μs, sample: μs, total: μs}`
+    * `:timing_us` - `%{draft: μs, verify: μs, sample: μs, ckpt: μs, other: μs,
+      total: μs}`. `:ckpt` is the recurrent-state save/restore that only hybrid
+      models pay and is zero elsewhere; on Qwen 3.8 it is large enough to decide
+      whether speculation helps at all. `:other` is whatever falls outside the
+      named buckets, dominated on Metal by GPU-sync waits from the previous
+      iteration's async verify decode.
     * `:n_draft` - max draft length configured at init
 
   Counters are cumulative across all `stream/3` / `generate/3` calls on this
