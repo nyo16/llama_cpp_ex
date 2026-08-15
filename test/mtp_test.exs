@@ -102,10 +102,12 @@ defmodule LlamaCppEx.MTPTest do
   end
 
   # A checkpoint with no MTP head is a different failure from a model loaded
-  # without the flag, and no flag recovers it. Most GGUF conversions of an
-  # MTP-capable model drop the head — unsloth's Qwen3.6-35B-A3B-UD-Q4_K_XL has
-  # zero nextn layers while their separate -MTP build of the same model has
-  # them — so this is the case a user actually lands on first.
+  # without the flag, and no flag recovers it — only a different file. There are
+  # two such files, and the message has to name both: an MTP-preserving
+  # conversion of the whole model (unsloth's Qwen3.6-35B-A3B-UD-Q4_K_XL has zero
+  # nextn layers while their separate -MTP build of it has them), or the
+  # publisher's head-only sidecar passed as `:draft_model` (Qwen 3.8 ships only
+  # that shape). This is the case a user actually lands on first.
   #
   # One gate tag (`:smoke`), never `:mtp` as well: the generation model is an
   # ordinary checkpoint, which is exactly what makes it the right fixture here.
@@ -125,7 +127,10 @@ defmodule LlamaCppEx.MTPTest do
     test "refuses with the reason, not 'failed to create context'", %{model: model} do
       assert {:error, message} = MTP.init(model, n_draft: 3)
       assert message =~ "no MTP head"
-      assert message =~ "-MTP"
+      # Naming the remedy is the point of the guard, so assert on both routes out
+      # rather than on any one phrasing of the diagnosis.
+      assert message =~ "MTP-preserving conversion"
+      assert message =~ "draft_model"
       # The bare context error is what this guard exists to replace.
       refute message =~ "failed to create context"
     end
