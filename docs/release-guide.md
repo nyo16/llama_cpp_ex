@@ -96,12 +96,16 @@ upstream fixes, are drafted in
 `.claude/plans/dgx-spark-2node/upstream-issues.md` — not yet filed, so there are
 no issue URLs to link. **When they are filed, put the URLs in this table.**
 
-Re-checked at `a94d563ed801` (61 commits later): all three still stand. That
-check was a source diff, not a re-measurement — the files each defect lives in
-(`ggml/src/ggml-cpu/CMakeLists.txt`, `ggml_backend_cuda_comm_init`, and
-`ggml_backend_rpc_start_server`) were untouched by the bump. A source diff is
-enough to say a defect is *still there*; it is not enough to say it is *gone*,
-so if a diff ever shows movement, run the command in the last column.
+Re-checked at `e85caa81e` (b10582): all three still stand. Every re-check so far
+has been a source diff, not a re-measurement. At `a94d563ed801` the three files
+involved (`ggml/src/ggml-cpu/CMakeLists.txt`, `ggml_backend_cuda_comm_init`,
+`ggml_backend_rpc_start_server`) were untouched. At `e85caa81e` the CUDA and RPC
+ones are still untouched — #26502 moved the tensor-split meta backend and was
+reverted in `f20395dae` — while `ggml-cpu/CMakeLists.txt` did change: OpenMP
+target variables, KleidiAI SME2 GEMV sources, and IntelLLVM fast-math gating,
+none of it near the `-mcpu=native` probe. A source diff is enough to say a defect
+is *still there*; it is not enough to say it is *gone*, so if a diff ever touches
+the probe itself, run the command in the last column.
 
 | # | Upstream defect | Our workaround | Still needed? |
 |---|---|---|---|
@@ -123,10 +127,37 @@ deliberately do not work around.
 # the llama.cpp commit, so the bump from step 1 already forces a rebuild.
 LLAMA_BACKEND=cpu mix compile
 
-# Run full test suite
-LLAMA_MODEL_PATH=~/Downloads/Qwen3.5-0.8B-UD-Q4_K_XL.gguf \
-LLAMA_EMBEDDING_MODEL_PATH=~/Downloads/Qwen3-Embedding-0.6B-f16.gguf \
+# Run the suite. The default run needs no model; each opt-in tag names the env
+# var for the model it loads (see test/test_helper.exs). GGML_METAL_NO_RESIDENCY
+# is Metal-only, and only stops a post-suite assert in llama.cpp's Metal device
+# destructor from aborting the VM after a green run.
 mix test
+
+GGML_METAL_NO_RESIDENCY=1 \
+LLAMA_SMOKE_GEN_MODEL=~/Downloads/Qwen3.5-0.8B-UD-Q4_K_XL.gguf \
+LLAMA_SMOKE_EMB_MODEL=~/Downloads/Qwen3-Embedding-0.6B-f16.gguf \
+LLAMA_SMOKE_MTP_MODEL=~/Downloads/Qwen3.6-35B-A3B-MTP-UD-Q4_K_XL.gguf \
+  mix test --include smoke --include embeddings --include slow --include mtp
+
+GGML_METAL_NO_RESIDENCY=1 \
+LLAMA_SMOKE_MTP_MODEL=~/Downloads/Qwen3.8-27B-Q4_K_M.gguf \
+LLAMA_SMOKE_MTP_DRAFT_MODEL=~/Downloads/mtp-Qwen3.8-27B-Q4_0.gguf \
+  mix test --include mtp_sidecar
+
+# :rpc_live needs an RPC build AND a reachable worker, and must run with no
+# model tag beside it — see test/test_helper.exs for why combining them aborts.
+# The worker can be local: another BEAM running LlamaCppEx.RPC.Server, or
+# `LLAMA_RPC=1 make rpc-server` and upstream's ggml-rpc-server binary.
+LLAMA_RPC=1 LLAMA_BACKEND=metal MIX_ENV=test mix run --no-halt -e \
+  'LlamaCppEx.RPC.Server.start_link(endpoint: "127.0.0.1:50052")' &
+GGML_METAL_NO_RESIDENCY=1 LLAMA_RPC=1 LLAMA_RPC_ENDPOINT=127.0.0.1:50052 \
+  mix test --include rpc_live
+
+# :mtp_cancel is the one tag that is not expected to pass; run it to confirm
+# how it fails, and update test/mtp_model_test.exs if the failure mode moved.
+GGML_METAL_NO_RESIDENCY=1 \
+LLAMA_SMOKE_MTP_MODEL=~/Downloads/Qwen3.6-35B-A3B-MTP-UD-Q4_K_XL.gguf \
+  mix test --only mtp_cancel
 
 # Verify formatting and types
 mix format --check-formatted
