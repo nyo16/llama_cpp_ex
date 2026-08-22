@@ -6,13 +6,18 @@ DGX Spark (GB10) support: a silent ARM code-generation bug fixed, the ggml RPC
 backend wired up so a model can span two machines, and a measured runbook for
 both configurations in [docs/dgx-spark.md](docs/dgx-spark.md).
 
-llama.cpp bumped to [`b10435`](https://github.com/ggml-org/llama.cpp/releases/tag/b10435)
-(`9e40df63b`), which brings Qwen 3.8 in under the existing `qwen35`
-architecture, and MTP support for its target/sidecar split (see Added).
+llama.cpp bumped to [`b10582`](https://github.com/ggml-org/llama.cpp/releases/tag/b10582)
+(`e85caa81e`), by way of b10435, which brought Qwen 3.8 in under the existing
+`qwen35` architecture, and MTP support for its target/sidecar split (see Added).
 
-Verified on macOS (Metal, no RPC): **428 passed, 149 excluded**, plus
-**6 passed** with `--include mtp_sidecar` against Qwen3.8-27B-Q4_K_M and its
-`mtp-*-Q4_0` head. On a DGX Spark (CUDA 13.0, `sm_121a`): **428 passed**.
+Verified on macOS (Metal, no RPC) at `e85caa81e`: **428 passed, 149 excluded**
+for the default run, and with real models from the tags that need them —
+**548 passed** `--include smoke --include embeddings` (Qwen3.5-0.8B-UD-Q4_K_XL,
+Qwen3-Embedding-0.6B-f16), **439 passed** `--include mtp`
+(Qwen3.6-35B-A3B-MTP-UD-Q4_K_XL), **434 passed** `--include mtp_sidecar`
+(Qwen3.8-27B-Q4_K_M plus its `mtp-*-Q4_0` head), **438 passed**
+`--include slow`. On a DGX Spark (CUDA 13.0, `sm_121a`), measured at b10435:
+**428 passed**.
 
 ### Fixed
 
@@ -149,6 +154,27 @@ Verified on macOS (Metal, no RPC): **428 passed, 149 excluded**, plus
   a device reports it cannot support it. The NIF always sets `load_mode`
   explicitly from `:use_mmap`/`:use_mlock`/`:use_direct_io`, so behaviour is
   unchanged and `:auto` is not exposed yet.
+- **llama.cpp bumped to `e85caa81e`** (b10582), 147 commits past b10435, and
+  `LLAMA_COMMIT` moved with the submodule. Nothing in the binding changed:
+  `include/llama.h`, `ggml/include/ggml-backend.h`, `common/chat.h`,
+  `common/json-schema-to-grammar.h` and `common/speculative.h` are byte-identical
+  across the range, so `llama_nif.cpp` needed no edit — the diff that matters for
+  a bump is the header diff, and this one is empty. `ggml-rpc.h` moved only
+  `RPC_PROTO_MINOR_VERSION` 0 → 1 (5.0.0 → 5.1.0), for `use_count` propagation
+  that lets backends fuse ops behind RPC (`af5172627`); same major, no signature
+  change, and nothing in this repo pins the protocol version.
+  Two upstream commits land on the MTP path and both are no-ops for us:
+  `f466cfa38` skips a null `dp.result` when `dp.drafting` is false, and the NIF
+  sets `drafting = true` on every seq immediately before each
+  `common_speculative_draft`; `2c6b141ef` fixes `draft-mtp` under
+  `--embeddings` inside `common_base_params_to_speculative`, which the NIF does
+  not call — it builds both contexts itself.
+  All three defects in [docs/release-guide.md](docs/release-guide.md) still
+  stand, re-checked as a source diff: `ggml_backend_rpc_start_server` still
+  returns `void`, `ggml_backend_cuda_comm_init` was untouched (#26502's
+  tensor-split work was reverted in `f20395dae`), and the `ggml-cpu` CMake diff
+  is OpenMP target variables, KleidiAI SME2 GEMV sources and IntelLLVM
+  fast-math gating — nothing near the `-mcpu=native` probe.
 
 ## v0.8.43
 
