@@ -10,10 +10,12 @@
 #                 tag rather than `:mtp` because that tag's single-file model
 #                 cannot satisfy it.
 #   :mtp_cancel — one known-broken MTP test, excluded on its own tag so that
-#                 `--include mtp` is green. It does not fail, it aborts the VM:
-#                 cancelling an MTP stream is fire-and-forget, so reusing the
-#                 session immediately afterwards races the still-running draft
-#                 loop over shared contexts. See test/mtp_model_test.exs.
+#                 `--include mtp` is green. Cancelling an MTP stream is
+#                 fire-and-forget, so reusing the session immediately afterwards
+#                 races the still-running draft loop over shared contexts. At
+#                 b10435 that aborted the VM; at b10582 it fails racily instead
+#                 (3 of 4 runs) and no longer aborts. Either way it does not
+#                 belong in a green run. See test/mtp_model_test.exs.
 #   :slow       — long-running comparison matrices (F16 vs Q8_0 KV cache);
 #                 needs LLAMA_SMOKE_GEN_MODEL
 #   :rpc_live   — needs a *reachable RPC worker*, not just a model: set
@@ -26,6 +28,18 @@
 #                 build they are on, via LlamaCppEx.RPC.supported?/0 — accepting
 #                 either refusal used to hide the stale-artifact bug the
 #                 Makefile's link marker exists to catch.
+#
+#                 Run `--include rpc_live` on its OWN, with no model tag beside
+#                 it. The live test calls RPC.add_server/1, which mutates the
+#                 process-global ggml device registry, and llama.cpp puts RPC
+#                 devices at the FRONT of the placement list it builds from that
+#                 registry (src/llama.cpp) — so every model a *later* test loads
+#                 with n_gpu_layers: -1 puts layers and KV cache on the worker.
+#                 Combining the tags aborted the VM here at
+#                 ggml-rpc.cpp:576 "Remote RPC server crashed or returned
+#                 malformed response" during llama_kv_cache construction, with
+#                 the worker still listening: an alloc that fails on a peer is
+#                 RPC_STATUS_ASSERT, which is GGML_ABORT.
 #
 # `--include` beats `--exclude` in ExUnit, so the tags are independent: opt into
 # exactly the ones whose model you have. The helper `LlamaCppEx.TestModels`

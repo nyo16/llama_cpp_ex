@@ -10,14 +10,18 @@ llama.cpp bumped to [`b10582`](https://github.com/ggml-org/llama.cpp/releases/ta
 (`e85caa81e`), by way of b10435, which brought Qwen 3.8 in under the existing
 `qwen35` architecture, and MTP support for its target/sidecar split (see Added).
 
-Verified on macOS (Metal, no RPC) at `e85caa81e`: **428 passed, 149 excluded**
-for the default run, and with real models from the tags that need them —
-**548 passed** `--include smoke --include embeddings` (Qwen3.5-0.8B-UD-Q4_K_XL,
-Qwen3-Embedding-0.6B-f16), **439 passed** `--include mtp`
-(Qwen3.6-35B-A3B-MTP-UD-Q4_K_XL), **434 passed** `--include mtp_sidecar`
-(Qwen3.8-27B-Q4_K_M plus its `mtp-*-Q4_0` head), **438 passed**
-`--include slow`. On a DGX Spark (CUDA 13.0, `sm_121a`), measured at b10435:
-**428 passed**.
+Verified on macOS (Metal) at `e85caa81e`, running **every** tag the suite
+excludes by default. Default build: **428 passed, 149 excluded** with no model;
+**569 passed, 8 excluded** for `--include smoke --include embeddings
+--include slow --include mtp` (Qwen3.5-0.8B-UD-Q4_K_XL,
+Qwen3-Embedding-0.6B-f16, Qwen3.6-35B-A3B-MTP-UD-Q4_K_XL); **434 passed**
+for `--include mtp_sidecar` (Qwen3.8-27B-Q4_K_M plus its `mtp-*-Q4_0` head).
+`LLAMA_RPC=1` build against a live local `LlamaCppEx.RPC.Server`:
+**429 passed, 148 excluded** for `--include rpc_live`, and the model tags
+re-run on that build give the same **569** and **434**. On a DGX Spark
+(CUDA 13.0, `sm_121a`), measured at b10435: **428 passed**.
+
+The one tag that is not green is `:mtp_cancel`, and it moved: see Changed.
 
 ### Fixed
 
@@ -175,6 +179,29 @@ Qwen3-Embedding-0.6B-f16), **439 passed** `--include mtp`
   tensor-split work was reverted in `f20395dae`), and the `ggml-cpu` CMake diff
   is OpenMP target variables, KleidiAI SME2 GEMV sources and IntelLLVM
   fast-math gating — nothing near the `-mcpu=native` probe.
+- **The `:mtp_cancel` bug no longer aborts the VM — it returns an error.** The
+  race is unchanged and unfixed: cancellation is fire-and-forget, so reusing an
+  `%MTP{}` session immediately after halting a stream can start decoding on
+  contexts the cancelled loop has not released. What moved is the consequence.
+  Measured on M1 Max / Metal with Qwen3.6-35B-A3B-MTP, four runs per build: at
+  b10435 it aborted **4 of 4** (one exit 134 on
+  `GGML_ASSERT(buf != NULL && "tensor buffer not set")`, three exit 139), at
+  b10582 it aborted **0 of 4** — three runs failed with
+  `{:error, "prompt decode failed: code=-1"}` / `"verify decode failed:
+  code=-1"` and one passed. The decode paths now refuse the half-released
+  context instead of writing through it. The test stays on its own tag: a flaky
+  failure still does not belong in a green run, and the real fix is still an
+  acknowledged-cancellation protocol, not a bump.
+- **`--include rpc_live` must run on its own**, documented in
+  `test/test_helper.exs` after it took the VM down here. The live test calls
+  `RPC.add_server/1`, which mutates the *process-global* ggml device registry,
+  and llama.cpp puts RPC devices at the **front** of the placement list built
+  from that registry — so a model loaded by any *later* test with
+  `n_gpu_layers: -1` puts layers and KV cache on the worker. Combined with the
+  model tags, that reached `ggml-rpc.cpp:576` "Remote RPC server crashed or
+  returned malformed response" inside `llama_kv_cache`'s constructor, with the
+  worker still listening afterwards: a peer-side allocation failure is
+  `RPC_STATUS_ASSERT`, which is `GGML_ABORT`, which takes the BEAM with it.
 
 ## v0.8.43
 

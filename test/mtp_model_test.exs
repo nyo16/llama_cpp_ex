@@ -150,11 +150,21 @@ end
 defmodule LlamaCppEx.MTPCancelTest do
   # KNOWN BUG, kept as an executable record rather than deleted.
   #
-  # This test does not fail — it takes the VM down, with
-  # `GGML_ASSERT(offset + size <= ggml_nbytes(tensor))` or a plain SIGSEGV. So it
-  # lives in its own module carrying only `:mtp_cancel`, and deliberately *not*
-  # `:mtp`: `--include` beats `--exclude` in ExUnit, so a second gate tag would
-  # drag it back into `--include mtp` runs and abort them. Run it on purpose:
+  # At b10435 this test did not fail — it took the VM down, with
+  # `GGML_ASSERT(offset + size <= ggml_nbytes(tensor))` or a plain SIGSEGV.
+  # At b10582 it no longer aborts: it fails, racily, with
+  # `{:error, "prompt decode failed: code=-1"}` or `"verify decode failed:
+  # code=-1"` from the `generate/3` below — and sometimes passes. Measured on
+  # M1 Max / Metal with Qwen3.6-35B-A3B-MTP, four runs each: b10435 aborted 4/4
+  # (one exit 134, three exit 139), b10582 aborted 0/4 (3 failed, 1 passed).
+  # The race is unchanged and unfixed; only its consequence moved from "kills
+  # the BEAM" to "returns an error", so the two decode paths now refuse the
+  # half-released context instead of writing through it.
+  #
+  # It therefore still lives in its own module carrying only `:mtp_cancel`, and
+  # deliberately *not* `:mtp`: `--include` beats `--exclude` in ExUnit, so a
+  # second gate tag would drag a flaky test back into `--include mtp` runs.
+  # Run it on purpose:
   #
   #   GGML_METAL_NO_RESIDENCY=1 LLAMA_BACKEND=auto \
   #   LLAMA_SMOKE_MTP_MODEL=... mix test --include mtp_cancel
