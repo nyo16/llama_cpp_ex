@@ -2,7 +2,6 @@
 #include <fine.hpp>
 #include <llama.h>
 #include <ggml-backend.h>
-#include <nlohmann/json.hpp>
 #include "json-schema-to-grammar.h"
 #include "speculative.h"
 #include <string>
@@ -2820,7 +2819,7 @@ FINE_NIF(generate, ERL_NIF_DIRTY_JOB_CPU_BOUND);
 
 // --- JSON Schema to Grammar ---
 
-// The schema text is untrusted. `nlohmann::json::parse` and
+// The schema text is untrusted. `common_json::parse` (nlohmann underneath) and
 // `json_schema_to_grammar` are both recursive descent, so nesting depth in the
 // text is C-stack depth: a deeply nested schema is a stack overflow (SIGSEGV),
 // which try/catch cannot recover. Bound size and depth before parsing.
@@ -2834,7 +2833,7 @@ json_schema_to_grammar_nif(ErlNifEnv* env, std::string json_str) {
     }
 
     try {
-        auto schema = nlohmann::ordered_json::parse(json_str);
+        auto schema = common_json::parse(json_str);
         std::string grammar = json_schema_to_grammar(schema);
         return fine::Ok(grammar);
     } catch (const std::exception& e) {
