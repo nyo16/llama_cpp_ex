@@ -6,9 +6,10 @@ DGX Spark (GB10) support: a silent ARM code-generation bug fixed, the ggml RPC
 backend wired up so a model can span two machines, and a measured runbook for
 both configurations in [docs/dgx-spark.md](docs/dgx-spark.md).
 
-llama.cpp bumped to [`b10582`](https://github.com/ggml-org/llama.cpp/releases/tag/b10582)
-(`e85caa81e`), by way of b10435, which brought Qwen 3.8 in under the existing
-`qwen35` architecture, and MTP support for its target/sidecar split (see Added).
+llama.cpp bumped to [`b10665`](https://github.com/ggml-org/llama.cpp/releases/tag/b10665)
+(`ca3d5a3e1`), by way of b10435 and b10582, which brought Qwen 3.8 in under the
+existing `qwen35` architecture, and MTP support for its target/sidecar split
+(see Added).
 
 Verified on macOS (Metal) at `e85caa81e`, running **every** tag the suite
 excludes by default. Default build: **428 passed, 149 excluded** with no model;
@@ -20,6 +21,10 @@ for `--include mtp_sidecar` (Qwen3.8-27B-Q4_K_M plus its `mtp-*-Q4_0` head).
 **429 passed, 148 excluded** for `--include rpc_live`, and the model tags
 re-run on that build give the same **569** and **434**. On a DGX Spark
 (CUDA 13.0, `sm_121a`), measured at b10435: **428 passed**.
+
+Re-verified at `ca3d5a3e1` (b10665) on macOS (Metal): default build
+**428 passed, 149 excluded** with no model; **434 passed** for
+`--include mtp_sidecar` (Qwen3.8-27B-Q4_K_M plus its `mtp-*-Q4_0` head).
 
 The one tag that is not green is `:mtp_cancel`, and it moved: see Changed.
 
@@ -179,6 +184,20 @@ The one tag that is not green is `:mtp_cancel`, and it moved: see Changed.
   tensor-split work was reverted in `f20395dae`), and the `ggml-cpu` CMake diff
   is OpenMP target variables, KleidiAI SME2 GEMV sources and IntelLLVM
   fast-math gating — nothing near the `-mcpu=native` probe.
+- **llama.cpp bumped to `ca3d5a3e1`** (b10665), 83 builds past b10582, and
+  `LLAMA_COMMIT` moved with the submodule. One binding edit: upstream replaced
+  `nlohmann::ordered_json` with its own pimpl wrapper `common_json` across
+  `common/chat.h` and `common/json-schema-to-grammar.h` (`common/json.h`), so
+  `json_schema_to_grammar_nif` now parses with `common_json::parse` and the
+  direct `<nlohmann/json.hpp>` include is gone — nlohmann is still the backing
+  parser, just behind upstream's wrapper, and the NIF's size/depth bounds on
+  untrusted schema text are unchanged. `include/llama.h` changes are additive
+  (`llama_tensor_read_lazy` in `llama_model_params`, session/state-seq version
+  bumps 9→10 / 2→3) and the NIF builds its params from
+  `llama_model_default_params()`, so nothing else moved.
+  `common/speculative.h` only gained functions (`common_speculative_n_max`,
+  synthetic-acceptance helpers); every `common_speculative_*` call the NIF
+  makes is signature-identical.
 - **The `:mtp_cancel` bug no longer aborts the VM — it returns an error.** The
   race is unchanged and unfixed: cancellation is fire-and-forget, so reusing an
   `%MTP{}` session immediately after halting a stream can start decoding on
