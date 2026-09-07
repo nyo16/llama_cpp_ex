@@ -6,10 +6,10 @@ DGX Spark (GB10) support: a silent ARM code-generation bug fixed, the ggml RPC
 backend wired up so a model can span two machines, and a measured runbook for
 both configurations in [docs/dgx-spark.md](docs/dgx-spark.md).
 
-llama.cpp bumped to [`b10665`](https://github.com/ggml-org/llama.cpp/releases/tag/b10665)
-(`ca3d5a3e1`), by way of b10435 and b10582, which brought Qwen 3.8 in under the
-existing `qwen35` architecture, and MTP support for its target/sidecar split
-(see Added).
+llama.cpp bumped to [`b10830`](https://github.com/ggml-org/llama.cpp/releases/tag/b10830)
+(`465e49b9c`, upstream v0.4.0), by way of b10435, b10582 and b10665, which
+brought Qwen 3.8 in under the existing `qwen35` architecture, and MTP support
+for its target/sidecar split (see Added).
 
 Verified on macOS (Metal) at `e85caa81e`, running **every** tag the suite
 excludes by default. Default build: **428 passed, 149 excluded** with no model;
@@ -24,6 +24,13 @@ re-run on that build give the same **569** and **434**. On a DGX Spark
 
 Re-verified at `ca3d5a3e1` (b10665) on macOS (Metal): default build
 **428 passed, 149 excluded** with no model; **434 passed** for
+`--include mtp_sidecar` (Qwen3.8-27B-Q4_K_M plus its `mtp-*-Q4_0` head).
+
+Re-verified at `465e49b9c` (b10830) on macOS (Metal), M1 Max: default build
+**428 passed, 149 excluded** with no model; **569 passed, 8 excluded** for
+`--include smoke --include embeddings --include slow --include mtp`
+(Qwen3.5-0.8B-UD-Q4_K_XL, Qwen3-Embedding-0.6B-f16,
+Qwen3.6-35B-A3B-MTP-UD-Q4_K_XL); **434 passed, 143 excluded** for
 `--include mtp_sidecar` (Qwen3.8-27B-Q4_K_M plus its `mtp-*-Q4_0` head).
 
 The one tag that is not green is `:mtp_cancel`, and it moved: see Changed.
@@ -198,6 +205,27 @@ The one tag that is not green is `:mtp_cancel`, and it moved: see Changed.
   `common/speculative.h` only gained functions (`common_speculative_n_max`,
   synthetic-acceptance helpers); every `common_speculative_*` call the NIF
   makes is signature-identical.
+- **llama.cpp bumped to `465e49b9c`** (b10830, upstream v0.4.0), 165 commits
+  past b10665, and `LLAMA_COMMIT` moved with the submodule. No binding edit:
+  the only `include/llama.h` change is the rename `llama_tensor_read_lazy` →
+  `llama_lazy_mode` (`tensor_read_lazy` → `lazy_mode` in
+  `llama_model_params`, #27969), which the NIF neither sets nor reads;
+  `llama_model_default_params()` / `llama_context_default_params()` are
+  otherwise value-identical to b10665, and `ggml-backend.h`, `ggml-rpc.h`,
+  `common/chat.h`, `common/json-schema-to-grammar.h` and
+  `common/speculative.h` did not change. One upstream behaviour change worth
+  knowing: `TENSOR_READ_LAZY` tensors (Gemma 4 per-layer embeddings, Qwen4-exp
+  PLE) now map the file even under a non-mmap `load_mode` (#27837), so
+  `:use_mlock` alone no longer guarantees "no mapping" for those two tensor
+  kinds — every other tensor still behaves as `Model.load/2` documents.
+  All three defects in [docs/release-guide.md](docs/release-guide.md) still
+  stand, re-checked as a source diff: `ggml_backend_rpc_start_server` is
+  unchanged, `ggml_backend_cuda_comm_init` was untouched (the RPC diff is
+  #26500's cross-server buffer serialisation fix and #27960's
+  `ggml_op_alloc_size_may_expand`, with the 2-D tensor hooks still `NULL`),
+  and the `ggml-cpu` CMake diff adds `iqp.cpp` and gates the SpacemiT IME
+  kernels — nothing near the `-mcpu=native` probe. `:row` split mode still
+  throws on CUDA (`ggml-cuda` exports no `ggml_backend_split_buffer_type`).
 - **The `:mtp_cancel` bug no longer aborts the VM — it returns an error.** The
   race is unchanged and unfixed: cancellation is fire-and-forget, so reusing an
   `%MTP{}` session immediately after halting a stream can start decoding on
@@ -207,10 +235,11 @@ The one tag that is not green is `:mtp_cancel`, and it moved: see Changed.
   `GGML_ASSERT(buf != NULL && "tensor buffer not set")`, three exit 139), at
   b10582 it aborted **0 of 4** — three runs failed with
   `{:error, "prompt decode failed: code=-1"}` / `"verify decode failed:
-  code=-1"` and one passed. The decode paths now refuse the half-released
-  context instead of writing through it. The test stays on its own tag: a flaky
-  failure still does not belong in a green run, and the real fix is still an
-  acknowledged-cancellation protocol, not a bump.
+  code=-1"` and one passed; at b10830 one run failed the same way,
+  `"verify decode failed: code=-1"`, without aborting. The decode paths now
+  refuse the half-released context instead of writing through it. The test
+  stays on its own tag: a flaky failure still does not belong in a green run,
+  and the real fix is still an acknowledged-cancellation protocol, not a bump.
 - **`--include rpc_live` must run on its own**, documented in
   `test/test_helper.exs` after it took the VM down here. The live test calls
   `RPC.add_server/1`, which mutates the *process-global* ggml device registry,
