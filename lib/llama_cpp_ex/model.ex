@@ -80,7 +80,7 @@ defmodule LlamaCppEx.Model do
       `:tensor_split` and `:main_gpu` would index a list you never saw. With
       `:devices` set, they index this one.
 
-  > #### Split modes at llama.cpp b10362 {: .warning}
+  > #### Split modes at llama.cpp b10830 (`465e49b9`) {: .warning}
   >
   > `:layer` splits contiguous layer ranges across devices, one KV cache per
   > device, and is the only mode that works across hosts.

@@ -107,6 +107,14 @@ none of it near the `-mcpu=native` probe. A source diff is enough to say a defec
 is *still there*; it is not enough to say it is *gone*, so if a diff ever touches
 the probe itself, run the command in the last column.
 
+Re-checked at `465e49b9c` (b10830), again as a source diff: still all three.
+`ggml_backend_rpc_start_server` and `ggml_backend_cuda_comm_init` are
+untouched — the RPC diff is #26500 (do not serialise buffers that belong to
+another server) and #27960 (`ggml_op_alloc_size_may_expand`), and the RPC
+buffer's `set_tensor_2d`/`get_tensor_2d` hooks are still `NULL`. The
+`ggml-cpu/CMakeLists.txt` diff adds `iqp.cpp` and gates the SpacemiT IME
+kernel sources; the `-mcpu=native` probe is untouched.
+
 | # | Upstream defect | Our workaround | Still needed? |
 |---|---|---|---|
 | 1 | `GGML_NATIVE=ON` makes ggml's `-mcpu=native` probe resolve to **base ARMv8-A** on Cortex-X925/A725 with GCC 13.3 — silently, with a soft CMake warning and exit 0. Costs every `sdot`/`smmla`/SVE kernel. | `LLAMA_CPU_ARM_ARCH` + `LLAMA_CUDA_ARCH` in the `Makefile`, which must be set together. See [DGX Spark](dgx-spark.md) and [Cross-Platform Builds](cross-platform-builds.md). | `scripts/spark/verify-build-flags.sh` on an aarch64 host. If a default build (no `LLAMA_CPU_ARM_ARCH`) now reports non-zero `sdot`/`smmla`, upstream fixed the probe. |
