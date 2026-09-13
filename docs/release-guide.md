@@ -115,6 +115,15 @@ buffer's `set_tensor_2d`/`get_tensor_2d` hooks are still `NULL`. The
 `ggml-cpu/CMakeLists.txt` diff adds `iqp.cpp` and gates the SpacemiT IME
 kernel sources; the `-mcpu=native` probe is untouched.
 
+Re-checked at `b6b003d2c` (b10944), covering the gap from `465e49b9c` in one
+source diff: still all three. `ggml-rpc.cpp` was not touched at all — the RPC
+buffer's `set_tensor_2d`/`get_tensor_2d` hooks are still `NULL` — and the
+`ggml-cuda.cu` diff is #28079 (`GGML_FA_QUANTS`), #28604 (HIP `prop.integrated`
+revert) and #26454 (gfx90c), none of them near `ggml_backend_cuda_comm_init`.
+The `ggml-cpu/CMakeLists.txt` diff is #28091 (PCH and unity build, with GCC PCH
+gated to x86) and #28667 (s390x `repack.cpp`); the `-mcpu=native` probe is
+untouched.
+
 | # | Upstream defect | Our workaround | Still needed? |
 |---|---|---|---|
 | 1 | `GGML_NATIVE=ON` makes ggml's `-mcpu=native` probe resolve to **base ARMv8-A** on Cortex-X925/A725 with GCC 13.3 — silently, with a soft CMake warning and exit 0. Costs every `sdot`/`smmla`/SVE kernel. | `LLAMA_CPU_ARM_ARCH` + `LLAMA_CUDA_ARCH` in the `Makefile`, which must be set together. See [DGX Spark](dgx-spark.md) and [Cross-Platform Builds](cross-platform-builds.md). | `scripts/spark/verify-build-flags.sh` on an aarch64 host. If a default build (no `LLAMA_CPU_ARM_ARCH`) now reports non-zero `sdot`/`smmla`, upstream fixed the probe. |

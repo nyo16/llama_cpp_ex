@@ -35,8 +35,11 @@ defmodule LlamaCppExTest do
       # There used to be a bare `rescue _ -> :ok` after this assert_raise, which
       # swallowed the ExUnit.AssertionError it raises on failure — the test could
       # not fail, in either direction.
+      # Assert on the offending type name, not llama.cpp's phrasing: upstream
+      # reworded this from "Unrecognized schema" to "unrecognized type" in
+      # b10944 and the wording is not part of our contract — naming the culprit is.
       assert_raise ArgumentError,
-                   ~r/failed to convert JSON schema to grammar.*Unrecognized schema/s,
+                   ~r/failed to convert JSON schema to grammar.*invalid_type_that_does_not_exist/s,
                    fn ->
                      LlamaCppEx.Grammar.from_json_schema!(%{
                        "type" => "invalid_type_that_does_not_exist"
@@ -62,12 +65,12 @@ defmodule LlamaCppExTest do
                LlamaCppEx.Grammar.from_json_schema(%{"type" => "not_a_json_schema_type"})
 
       assert is_binary(reason)
-      assert reason =~ "Unrecognized schema"
+      assert reason =~ "not_a_json_schema_type"
 
       assert {:error, ref_error} =
                LlamaCppEx.Grammar.from_json_schema(%{"$ref" => "#/definitions/missing"})
 
-      assert ref_error =~ "Error resolving ref"
+      assert ref_error =~ "#/definitions/missing"
     end
 
     test "from_json_schema refuses schemas that would blow the C++ stack" do

@@ -2368,7 +2368,7 @@ fine::Ok<> generate_mtp_tokens(
             auto& dp = common_speculative_get_draft_params(sp.spec, seq_id);
             dp.drafting = true;
             dp.n_max    = n_draft;
-            dp.n_past   = n_past;
+            dp.pos0     = n_past;
             dp.id_last  = sampled;
             dp.prompt   = &prompt;
             dp.result   = &drafts;

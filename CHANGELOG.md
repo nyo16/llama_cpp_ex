@@ -1,15 +1,20 @@
 # Changelog
 
-## Unreleased
+## v0.8.49
+
+This section also covers v0.8.44 (b10435, PR #86), v0.8.45 (b10582, #87),
+v0.8.46 (b10665, #88), v0.8.47 (b10830, #89) and v0.8.48 (`4b98ab805`, #90),
+which were tagged and published without a heading of their own; everything
+below accumulated since v0.8.43.
 
 DGX Spark (GB10) support: a silent ARM code-generation bug fixed, the ggml RPC
 backend wired up so a model can span two machines, and a measured runbook for
 both configurations in [docs/dgx-spark.md](docs/dgx-spark.md).
 
-llama.cpp bumped to [`b10830`](https://github.com/ggml-org/llama.cpp/releases/tag/b10830)
-(`465e49b9c`, upstream v0.4.0), by way of b10435, b10582 and b10665, which
-brought Qwen 3.8 in under the existing `qwen35` architecture, and MTP support
-for its target/sidecar split (see Added).
+llama.cpp bumped to [`b10944`](https://github.com/ggml-org/llama.cpp/releases/tag/b10944)
+(`b6b003d2c`), by way of b10435, b10582, b10665, b10830 (upstream v0.4.0) and
+`4b98ab805`, which brought Qwen 3.8 in under the existing `qwen35`
+architecture, and MTP support for its target/sidecar split (see Added).
 
 Verified on macOS (Metal) at `e85caa81e`, running **every** tag the suite
 excludes by default. Default build: **428 passed, 149 excluded** with no model;
@@ -32,6 +37,12 @@ Re-verified at `465e49b9c` (b10830) on macOS (Metal), M1 Max: default build
 (Qwen3.5-0.8B-UD-Q4_K_XL, Qwen3-Embedding-0.6B-f16,
 Qwen3.6-35B-A3B-MTP-UD-Q4_K_XL); **434 passed, 143 excluded** for
 `--include mtp_sidecar` (Qwen3.8-27B-Q4_K_M plus its `mtp-*-Q4_0` head).
+
+Re-verified at `b6b003d2c` (b10944) on macOS (Metal), M4 Max: default build
+**428 passed, 149 excluded** with no model; **558 passed, 19 excluded** for
+`--include smoke --include embeddings --include slow`
+(Qwen3.5-0.8B-UD-Q8_K_XL, Qwen3-Embedding-0.6B-f16). The MTP and `rpc_live`
+tags were not re-run at this build.
 
 The one tag that is not green is `:mtp_cancel`, and it moved: see Changed.
 
@@ -226,6 +237,29 @@ The one tag that is not green is `:mtp_cancel`, and it moved: see Changed.
   and the `ggml-cpu` CMake diff adds `iqp.cpp` and gates the SpacemiT IME
   kernels — nothing near the `-mcpu=native` probe. `:row` split mode still
   throws on CUDA (`ggml-cuda` exports no `ggml_backend_split_buffer_type`).
+- **llama.cpp bumped to `b6b003d2c`** (b10944), 114 commits past b10830 by way
+  of `4b98ab805` (b10878+2, PR #90, which changed nothing in the binding), and
+  `LLAMA_COMMIT` moved with the submodule. One binding edit: #28715 renamed
+  `common_speculative_draft_params.n_past` to `pos0`, a pure rename (same
+  `llama_pos`, same meaning — the position `id_last` is decoded at), so the MTP
+  draft loop sets `dp.pos0`. `include/llama.h`, `ggml-backend.h` and
+  `ggml-rpc.h` did not change, and `llama_model_default_params()` /
+  `llama_context_default_params()` are value-identical. #28736 rewrote
+  `common/json-schema-to-grammar.h` around a new `common_chat_schema`
+  representation: `json_schema_to_grammar(const common_json &, bool)` — the
+  overload the NIF calls — is intact, `common_schema_info` (never used here)
+  is gone, and the error text for a rejected schema changed from
+  `Unrecognized schema: {…}` to `JSON schema error at #: unrecognized type
+  <name>` (likewise `Error resolving ref` → `cannot resolve $ref <path>`).
+  Two grammar tests pinned that upstream wording; they now assert the error
+  names the offending type / `$ref`, which is the contract. `common/chat.h`
+  only gained `common_chat_tool_parameters`. All three defects in
+  [docs/release-guide.md](docs/release-guide.md) still stand, re-checked as a
+  source diff. Verified on macOS (Metal), M4 Max: default build **428 passed,
+  149 excluded** with no model; **558 passed, 19 excluded** for
+  `--include smoke --include embeddings --include slow`
+  (Qwen3.5-0.8B-UD-Q8_K_XL, Qwen3-Embedding-0.6B-f16). The `:mtp`,
+  `:mtp_sidecar` and `:rpc_live` tags were not run — no MTP model was on hand.
 - **The `:mtp_cancel` bug no longer aborts the VM — it returns an error.** The
   race is unchanged and unfixed: cancellation is fire-and-forget, so reusing an
   `%MTP{}` session immediately after halting a stream can start decoding on
