@@ -1,6 +1,11 @@
 # Changelog
 
-## Unreleased
+## v0.8.49
+
+This section also covers v0.8.44 (b10435, PR #86), v0.8.45 (b10582, #87),
+v0.8.46 (b10665, #88), v0.8.47 (b10830, #89) and v0.8.48 (`4b98ab805`, #90),
+which were tagged and published without a heading of their own; everything
+below accumulated since v0.8.43.
 
 DGX Spark (GB10) support: a silent ARM code-generation bug fixed, the ggml RPC
 backend wired up so a model can span two machines, and a measured runbook for
@@ -32,6 +37,12 @@ Re-verified at `465e49b9c` (b10830) on macOS (Metal), M1 Max: default build
 (Qwen3.5-0.8B-UD-Q4_K_XL, Qwen3-Embedding-0.6B-f16,
 Qwen3.6-35B-A3B-MTP-UD-Q4_K_XL); **434 passed, 143 excluded** for
 `--include mtp_sidecar` (Qwen3.8-27B-Q4_K_M plus its `mtp-*-Q4_0` head).
+
+Re-verified at `b6b003d2c` (b10944) on macOS (Metal), M4 Max: default build
+**428 passed, 149 excluded** with no model; **558 passed, 19 excluded** for
+`--include smoke --include embeddings --include slow`
+(Qwen3.5-0.8B-UD-Q8_K_XL, Qwen3-Embedding-0.6B-f16). The MTP and `rpc_live`
+tags were not re-run at this build.
 
 The one tag that is not green is `:mtp_cancel`, and it moved: see Changed.
 
