@@ -4,11 +4,14 @@
 #   :smoke      — generation/chat/grammar/server paths; needs LLAMA_SMOKE_GEN_MODEL
 #   :embeddings — embedding paths;                      needs LLAMA_SMOKE_EMB_MODEL
 #   :mtp        — MTP speculative decoding;             needs LLAMA_SMOKE_MTP_MODEL
-#   :mtp_sidecar — MTP with the head in a *separate* sidecar GGUF (Qwen 3.8's
-#                 shape), so it needs a pair: LLAMA_SMOKE_MTP_MODEL for the
-#                 target and LLAMA_SMOKE_MTP_DRAFT_MODEL for the head. Its own
-#                 tag rather than `:mtp` because that tag's single-file model
-#                 cannot satisfy it.
+#   :mtp_sidecar — MTP with the head in a *separate* sidecar GGUF. Qwen 3.8
+#                 (LLAMA_SMOKE_MTP_MODEL + LLAMA_SMOKE_MTP_DRAFT_MODEL) is
+#                 required: MTPSidecarTest has no skip and calls path!/1.
+#                 Gemma4 E4B (LLAMA_SMOKE_MTP_E4B_MODEL +
+#                 LLAMA_SMOKE_MTP_E4B_DRAFT_MODEL) skips when those vars are
+#                 unset, so `--include mtp_sidecar` with only the Qwen pair
+#                 stays green. Its own tag rather than `:mtp` because that
+#                 tag's single-file model cannot satisfy it.
 #   :mtp_cancel — one known-broken MTP test, excluded on its own tag so that
 #                 `--include mtp` is green. Cancelling an MTP stream is
 #                 fire-and-forget, so reusing the session immediately afterwards
@@ -61,6 +64,15 @@
 #   GGML_METAL_NO_RESIDENCY=1 \
 #   LLAMA_SMOKE_MTP_MODEL=/path/to/Qwen3.8-27B-Q4_K_M.gguf \
 #   LLAMA_SMOKE_MTP_DRAFT_MODEL=/path/to/mtp-Qwen3.8-27B-Q4_0.gguf \
+#     mix test --include mtp_sidecar
+#
+#   The Qwen pair is required (MTPSidecarTest has no skip). Add the E4B pair
+#   to also run MTPE4BSidecarTest; omit those two vars and that module skips.
+#   GGML_METAL_NO_RESIDENCY=1 \
+#   LLAMA_SMOKE_MTP_MODEL=/path/to/Qwen3.8-27B-Q4_K_M.gguf \
+#   LLAMA_SMOKE_MTP_DRAFT_MODEL=/path/to/mtp-Qwen3.8-27B-Q4_0.gguf \
+#   LLAMA_SMOKE_MTP_E4B_MODEL=/path/to/gemma-4-E4B-it-Q4_K_M.gguf \
+#   LLAMA_SMOKE_MTP_E4B_DRAFT_MODEL=/path/to/mtp-gemma-4-E4B-it-Q8_0.gguf \
 #     mix test --include mtp_sidecar
 #
 #   LLAMA_RPC=1 mix compile

@@ -646,6 +646,7 @@ Upstream llama.cpp implements more speculative types behind the same `common_spe
 ### Models with MTP heads
 
 - [`ggml-org/Qwen3.8-27B-GGUF`](https://huggingface.co/ggml-org/Qwen3.8-27B-GGUF) — **sidecar layout**: the target (`Qwen3.8-27B-Q4_K_M.gguf`, ~18 GB) carries *no* head, and `mtp-Qwen3.8-27B-Q4_0.gguf` (~1.6 GB) carries nothing else. Load both and pass the head as `draft_model:`.
+- [`ggml-org/gemma-4-E4B-it-GGUF`](https://huggingface.co/ggml-org/gemma-4-E4B-it-GGUF) — **sidecar layout**: the target (`gemma-4-E4B-it-Q4_K_M.gguf`) is `gemma4` with *no* nextn head; `mtp-gemma-4-E4B-it-Q8_0.gguf` is a separate `gemma4-assistant` sidecar. Same `draft_model:` API. llama.cpp requires the target as `ctx_other` for `gemma4-assistant`; `MTP.init/2` always passes it (Qwen's constructor ignores it).
 - [`ggml-org/Qwen3.6-35B-A3B-MTP-GGUF`](https://huggingface.co/ggml-org/Qwen3.6-35B-A3B-MTP-GGUF) (recommended: `Q4_K_M`, ~21 GB)
 - [`ggml-org/Qwen3.6-27B-MTP-GGUF`](https://huggingface.co/ggml-org/Qwen3.6-27B-MTP-GGUF)
 - [`unsloth/Qwen3.6-35B-A3B-MTP-GGUF`](https://huggingface.co/unsloth/Qwen3.6-35B-A3B-MTP-GGUF)
@@ -660,7 +661,7 @@ Acceptance on a 0.8B target is not representative of production throughput —
 drafting is nearly as expensive as decoding at that size — so use these to
 exercise the path, not to measure it.
 
-A regular (non-MTP) quant will fail at `LlamaCppEx.MTP.init/2` — some GGUF in the pair must contain the MTP head's tensors. To check a file before loading it, look for a `*.nextn_predict_layers` key and `blk.N.nextn.*` tensors in its metadata. When the publisher ships the head separately (Qwen 3.8), that sidecar is the file with those tensors and the target legitimately has none; pass it as `draft_model:` rather than looking for a combined build.
+A regular (non-MTP) quant will fail at `LlamaCppEx.MTP.init/2` — some GGUF in the pair must contain the MTP head's tensors. To check a file before loading it, look for a `*.nextn_predict_layers` key and `blk.N.nextn.*` tensors in its metadata. The E4B sidecar also has those, and is additionally a `gemma4-assistant` architecture. When the publisher ships the head separately, that sidecar is the file with the head tensors and the target legitimately has none; pass it as `draft_model:` rather than looking for a combined build.
 
 The model must also be loaded with `load_mtp: true` (see below). Upstream gates those tensors behind a load-time flag that defaults to off, and they cannot be attached afterwards, so `MTP.init/2` refuses a model loaded without it rather than letting the omission surface later as `verify decode failed: code=-1`.
 
@@ -740,6 +741,34 @@ loaded without `load_mtp: true`, an ordinary model passed as `:draft_model`, and
 a head whose hidden width does not match the target's — that last one because
 upstream compares the two with a `GGML_ASSERT`, which aborts the VM rather than
 failing the call.
+
+#### Sidecar head: Gemma4 E4B (`gemma4` target + `gemma4-assistant` draft)
+
+Same `draft_model:` API as Qwen 3.8, two files. llama.cpp requires the target
+as `ctx_other` for `gemma4-assistant`. `MTP.init/2` always passes it.
+
+```elixir
+:ok = LlamaCppEx.init()
+
+{:ok, target} =
+  LlamaCppEx.load_model(
+    Path.expand("~/Downloads/gemma-4-E4B-it-Q4_K_M.gguf"),
+    n_gpu_layers: 999,
+    load_mtp: true
+  )
+
+{:ok, head} =
+  LlamaCppEx.load_model(
+    Path.expand("~/Downloads/mtp-gemma-4-E4B-it-Q8_0.gguf"),
+    n_gpu_layers: 999,
+    load_mtp: true
+  )
+
+{:ok, mtp} = LlamaCppEx.MTP.init(target, draft_model: head, n_draft: 3, n_ctx: 8192)
+
+{:ok, text} = LlamaCppEx.MTP.generate(mtp, "Explain MTP in one paragraph.", max_tokens: 200)
+IO.puts(text)
+```
 
 #### Synchronous generate (collect to a string)
 

@@ -58,6 +58,26 @@ defmodule LlamaCppEx.MTPTest do
     end
   end
 
+  # Type guard for :ctx_other. Must fire before the NIF sees a nil model.
+  describe "Context.create/2 :ctx_other validation" do
+    @unloaded %LlamaCppEx.Model{ref: nil}
+
+    test "rejects a :ctx_other that is not a Context" do
+      for bad <- [:nope, "ctx", 42, %LlamaCppEx.Model{ref: nil}, %{}] do
+        assert {:error, message} = LlamaCppEx.Context.create(@unloaded, ctx_other: bad)
+        assert message =~ ":ctx_other must be a"
+      end
+    end
+
+    test "nil :ctx_other is the omit path, not a bad argument" do
+      # Explicit nil must pass the type guard; a nil model ref then fails in the
+      # NIF — the same failure as omitting the option, not a ctx_other error.
+      assert_raise ArgumentError, ~r/decode failed/, fn ->
+        LlamaCppEx.Context.create(@unloaded, ctx_other: nil)
+      end
+    end
+  end
+
   # Qwen 3.8 ships the MTP head as a sidecar GGUF: the target carries zero nextn
   # layers and the head file carries nothing else, so the pair only works if the
   # draft context can be built from a *different* model than the target. These

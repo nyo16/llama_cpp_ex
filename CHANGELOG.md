@@ -106,6 +106,16 @@ The one tag that is not green is `:mtp_cancel`, and it moved: see Changed.
   target/draft hidden-width mismatch — upstream compares those with a
   `GGML_ASSERT`, which is an unconditional `ggml_abort` and would take the VM
   down instead of returning an error.
+- **`Context.create/2` accepts optional `:ctx_other`.** Pass an existing
+  `%Context{}` and the NIF forwards it as `llama_context_params.ctx_other`.
+  `MTP.init/2` always sets it on the draft. Gemma4 E4B's `gemma4-assistant`
+  sidecar needs that link at construction; Qwen's constructor leaves
+  `cparams.ctx_other` as `nullptr`, so the NIF default (omitted → `nullptr`)
+  still works for them.
+- **`:mtp_sidecar` gained a second fixture pair** behind
+  `LLAMA_SMOKE_MTP_E4B_MODEL` / `LLAMA_SMOKE_MTP_E4B_DRAFT_MODEL`. When those
+  vars are unset the E4B module skips, so `--include mtp_sidecar` with only the
+  Qwen pair stays green.
 - **`stats/1` reports `timing_us.ckpt`.** Recurrent-state save/restore, which
   only hybrid models pay, was previously folded into `:other` — a bucket whose
   documented cause is Metal GPU-sync waits. On Qwen 3.8 (48 SSM layers to 16

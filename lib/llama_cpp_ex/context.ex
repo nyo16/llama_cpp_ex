@@ -25,9 +25,13 @@ defmodule LlamaCppEx.Context do
   """
 
   @enforce_keys [:ref, :model]
-  defstruct [:ref, :model]
+  defstruct [:ref, :model, :ctx_other]
 
-  @type t :: %__MODULE__{ref: reference(), model: LlamaCppEx.Model.t()}
+  @type t :: %__MODULE__{
+          ref: reference(),
+          model: LlamaCppEx.Model.t(),
+          ctx_other: t() | nil
+        }
 
   @tuning_option_keys [
     :n_threads,
@@ -59,7 +63,8 @@ defmodule LlamaCppEx.Context do
     :embeddings,
     :pooling_type,
     :ctx_type,
-    :n_rs_seq
+    :n_rs_seq,
+    :ctx_other
   ]
 
   @doc """
@@ -138,7 +143,13 @@ defmodule LlamaCppEx.Context do
       decoding via `LlamaCppEx.MTP`.
     * `:n_rs_seq` - Number of recurrent-state snapshots per sequence to retain for
       partial rollback of speculative drafts. `0` (default) disables rollback. For an
-      MTP draft context, set this to your intended max draft length (e.g. `3`).
+      MTP draft context, use `0` — the MTP implementation handles rollback
+      internally via cached hidden states (`pending_h` / `verify_h`), not
+      recurrent-state snapshots.
+    * `:ctx_other` - An existing `%Context{}` whose raw pointer is passed as
+      `llama_context_params.ctx_other`. Optional; omitted or `nil` is
+      `nullptr`. `gemma4-assistant` requires it at construction. `MTP.init/2`
+      always sets it on the draft.
 
   """
   @spec create(LlamaCppEx.Model.t(), keyword()) :: {:ok, t()} | {:error, String.t()}
@@ -183,39 +194,50 @@ defmodule LlamaCppEx.Context do
     # Speculative decoding / MTP
     ctx_type = Keyword.get(opts, :ctx_type, :default) |> ctx_type_to_int()
     n_rs_seq = Keyword.get(opts, :n_rs_seq, 0)
+    ctx_other = Keyword.get(opts, :ctx_other)
 
-    case LlamaCppEx.NIF.context_create(
-           model_ref,
-           n_ctx,
-           n_batch,
-           n_ubatch,
-           n_threads,
-           n_threads_batch,
-           embeddings,
-           pooling_type,
-           n_seq_max,
-           type_k,
-           type_v,
-           flash_attn,
-           offload_kqv,
-           op_offload,
-           rope_scaling_type,
-           rope_freq_base,
-           rope_freq_scale,
-           yarn_ext_factor,
-           yarn_attn_factor,
-           yarn_beta_fast,
-           yarn_beta_slow,
-           yarn_orig_ctx,
-           attention_type,
-           no_perf,
-           swa_full,
-           kv_unified,
-           ctx_type,
-           n_rs_seq
-         ) do
-      {:ok, ref} -> {:ok, %__MODULE__{ref: ref, model: model}}
-      {:error, _} = error -> error
+    case ctx_other_for_nif(ctx_other) do
+      {:error, _} = error ->
+        error
+
+      {:ok, ctx_other_ref, ctx_other_struct} ->
+        case LlamaCppEx.NIF.context_create(
+               model_ref,
+               n_ctx,
+               n_batch,
+               n_ubatch,
+               n_threads,
+               n_threads_batch,
+               embeddings,
+               pooling_type,
+               n_seq_max,
+               type_k,
+               type_v,
+               flash_attn,
+               offload_kqv,
+               op_offload,
+               rope_scaling_type,
+               rope_freq_base,
+               rope_freq_scale,
+               yarn_ext_factor,
+               yarn_attn_factor,
+               yarn_beta_fast,
+               yarn_beta_slow,
+               yarn_orig_ctx,
+               attention_type,
+               no_perf,
+               swa_full,
+               kv_unified,
+               ctx_type,
+               n_rs_seq,
+               ctx_other_ref
+             ) do
+          {:ok, ref} ->
+            {:ok, %__MODULE__{ref: ref, model: model, ctx_other: ctx_other_struct}}
+
+          {:error, _} = error ->
+            error
+        end
     end
   end
 
@@ -231,9 +253,9 @@ defmodule LlamaCppEx.Context do
   Returns the number of recurrent-state snapshots per sequence available for
   partial rollback of speculative drafts.
 
-  `0` means the context does not support partial rollback (e.g. a regular target
-  context with `n_rs_seq: 0`). For an MTP draft context created with
-  `n_rs_seq: N`, this returns at most `N`.
+  `0` means the context does not support partial rollback. MTP drafts are
+  created with `n_rs_seq: 0`; rollback is via cached hidden states, not
+  recurrent-state snapshots.
   """
   @spec n_rs_seq(t()) :: non_neg_integer()
   def n_rs_seq(%__MODULE__{ref: ref}), do: LlamaCppEx.NIF.context_n_rs_seq(ref)
@@ -313,4 +335,10 @@ defmodule LlamaCppEx.Context do
   defp ctx_type_to_int(:default), do: 0
   defp ctx_type_to_int(:mtp), do: 1
   defp ctx_type_to_int(n) when is_integer(n), do: n
+
+  defp ctx_other_for_nif(nil), do: {:ok, nil, nil}
+  defp ctx_other_for_nif(%__MODULE__{} = ctx), do: {:ok, ctx.ref, ctx}
+
+  defp ctx_other_for_nif(other),
+    do: {:error, ":ctx_other must be a LlamaCppEx.Context, got: #{inspect(other)}"}
 end

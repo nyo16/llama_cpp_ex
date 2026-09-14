@@ -161,6 +161,16 @@ LLAMA_SMOKE_MTP_MODEL=~/Downloads/Qwen3.8-27B-Q4_K_M.gguf \
 LLAMA_SMOKE_MTP_DRAFT_MODEL=~/Downloads/mtp-Qwen3.8-27B-Q4_0.gguf \
   mix test --include mtp_sidecar
 
+# The Qwen pair is required: MTPSidecarTest has no skip and calls path!/1.
+# Add the E4B pair to also run MTPE4BSidecarTest. Unset E4B vars skip that
+# module, so the Qwen-only command above stays green.
+GGML_METAL_NO_RESIDENCY=1 \
+LLAMA_SMOKE_MTP_MODEL=~/Downloads/Qwen3.8-27B-Q4_K_M.gguf \
+LLAMA_SMOKE_MTP_DRAFT_MODEL=~/Downloads/mtp-Qwen3.8-27B-Q4_0.gguf \
+LLAMA_SMOKE_MTP_E4B_MODEL=~/Downloads/gemma-4-E4B-it-Q4_K_M.gguf \
+LLAMA_SMOKE_MTP_E4B_DRAFT_MODEL=~/Downloads/mtp-gemma-4-E4B-it-Q8_0.gguf \
+  mix test --include mtp_sidecar
+
 # :rpc_live needs an RPC build AND a reachable worker, and must run with no
 # model tag beside it — see test/test_helper.exs for why combining them aborts.
 # The worker can be local: another BEAM running LlamaCppEx.RPC.Server, or

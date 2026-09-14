@@ -46,6 +46,12 @@ defmodule LlamaCppEx.MTP do
 
       {:ok, mtp} = LlamaCppEx.MTP.init(target, draft_model: head, n_draft: 1)
 
+  **Gemma4 E4B sidecar** — same `:draft_model` API: a `gemma4` target plus a
+  `gemma4-assistant` head. `init/2` always passes the target as `:ctx_other`
+  on the draft. `gemma4-assistant` keeps that pointer (shared KV and the
+  target's token embeddings); Qwen's constructor leaves `cparams.ctx_other`
+  as `nullptr`.
+
   > #### Speculation is not always a win on hybrid models {: .warning}
   >
   > A model that mixes recurrent (SSM) layers with attention ones — Qwen 3.8 is
@@ -112,17 +118,18 @@ defmodule LlamaCppEx.MTP do
 
     * `:draft_model` - A separate `LlamaCppEx.Model` holding the MTP head, for
       checkpoints that ship it as a sidecar GGUF rather than inside the target
-      file (Qwen 3.8 is the current example: `Qwen3.8-27B-Q4_K_M.gguf` plus
-      `mtp-Qwen3.8-27B-Q4_0.gguf`). It must be loaded with `load_mtp: true`.
+      file (Qwen 3.8: `Qwen3.8-27B-Q4_K_M.gguf` plus `mtp-Qwen3.8-27B-Q4_0.gguf`;
+      Gemma4 E4B: a `gemma4` target plus a `gemma4-assistant` head). It must be
+      loaded with `load_mtp: true`.
       Defaults to `nil`, meaning the head is expected inside the target model
       and the draft context is built against it.
     * `:n_draft` - Max draft tokens generated per iteration. Defaults to `3`.
       Larger values mean fewer model forward passes but lower per-iteration
       acceptance; 2–4 is the sweet spot in practice.
     * `:n_ctx` - Context size for both contexts. Defaults to `2048`.
-    * Any `LlamaCppEx.Context` option (e.g. `:n_threads`, `:flash_attn`,
-      `:type_k`/`:type_v`, `:offload_kqv`). The same options are applied to
-      both the target and draft contexts.
+    * Any `Context` tuning option (e.g. `:n_threads`, `:flash_attn`,
+      `:type_k`/`:type_v`, `:offload_kqv`). Applied to both contexts.
+      `:ctx_other` is not a caller option; the draft always gets the target.
 
   Returns `{:ok, %MTP{}}` or `{:error, reason}`.
   """
@@ -218,7 +225,8 @@ defmodule LlamaCppEx.MTP do
     draft_opts = Keyword.merge(base_ctx_opts, ctx_type: :mtp, n_rs_seq: 0)
 
     with {:ok, main_ctx} <- Context.create(model, main_opts),
-         {:ok, mtp_ctx} <- Context.create(head_model, draft_opts),
+         {:ok, mtp_ctx} <-
+           Context.create(head_model, Keyword.merge(draft_opts, ctx_other: main_ctx)),
          {:ok, spec_ref} <-
            LlamaCppEx.NIF.speculative_init(main_ctx.ref, mtp_ctx.ref, n_draft) do
       {:ok,

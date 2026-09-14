@@ -199,8 +199,9 @@ defmodule LlamaCppEx.Model do
 
   @doc """
   Returns the output-side embedding width — the row width an MTP draft head
-  consumes. Equal to `n_embd/1` for every architecture currently in tree; it is
-  a distinct number because `LlamaCppEx.MTP` matches it across the target and a
+  consumes. Usually equal to `n_embd/1`; for `gemma4-assistant` the checkpoint
+  has a small `n_embd` but `n_embd_out` is the target's hidden width. It is a
+  distinct number because `LlamaCppEx.MTP` matches it across the target and a
   separate drafter GGUF.
   """
   @spec n_embd_out(t()) :: integer()

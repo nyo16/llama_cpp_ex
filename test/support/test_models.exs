@@ -15,12 +15,21 @@ defmodule LlamaCppEx.TestModels do
     # mtp-Qwen3.8-27B-Q4_0.gguf. Its own env var rather than a second use of
     # :mtp because the two files are provisioned independently and the sidecar is
     # useless without the target it was built for.
-    mtp_draft: {"LLAMA_SMOKE_MTP_DRAFT_MODEL", "an MTP sidecar (head-only)"}
+    mtp_draft: {"LLAMA_SMOKE_MTP_DRAFT_MODEL", "an MTP sidecar (head-only)"},
+    # Gemma4 E4B target half of a gemma4-assistant pair, e.g.
+    # gemma-4-E4B-it-Q4_K_M.gguf. Own env var because the files are provisioned
+    # independently of the Qwen :mtp / :mtp_draft pair. The target has no nextn;
+    # the assistant sidecar does, and also needs ctx_other at context create.
+    mtp_e4b: {"LLAMA_SMOKE_MTP_E4B_MODEL", "a Gemma4 E4B target"},
+    # The assistant sidecar for the same pair — e.g. mtp-gemma-4-E4B-it-Q8_0.gguf.
+    # Its own env var because the two files are provisioned independently.
+    mtp_e4b_draft:
+      {"LLAMA_SMOKE_MTP_E4B_DRAFT_MODEL", "a Gemma4 E4B MTP sidecar (gemma4-assistant)"}
   }
 
   @kinds Map.keys(@vars)
 
-  @type kind :: :gen | :emb | :mtp | :mtp_draft
+  @type kind :: :gen | :emb | :mtp | :mtp_draft | :mtp_e4b | :mtp_e4b_draft
 
   @doc "Name of the environment variable holding the model path for `kind`."
   @spec var(kind()) :: String.t()

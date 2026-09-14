@@ -98,7 +98,8 @@ defmodule LlamaCppEx.NIF do
         _swa_full,
         _kv_unified,
         _ctx_type,
-        _n_rs_seq
+        _n_rs_seq,
+        _ctx_other
       ),
       do: :erlang.nif_error(:not_loaded)
 

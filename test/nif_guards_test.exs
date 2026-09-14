@@ -476,6 +476,37 @@ defmodule LlamaCppEx.NIFGuardsTest do
     end
   end
 
+  # Wiring test for the Elixir field plus the Fine ResourcePtr. The :gen model
+  # is not gemma4-assistant, so llama.cpp drops params.ctx_other and decode/2
+  # does not prove the target resource is still alive.
+  describe "a context keeps its ctx_other alive" do
+    test "%Context{} carries the peer it was built from", %{model: model} do
+      {:ok, target} = Context.create(model, n_ctx: 64)
+      {:ok, other} = Context.create(model, n_ctx: 64, ctx_other: target)
+      assert %Context{} = other.ctx_other
+      assert other.ctx_other.ref == target.ref
+    end
+
+    test "decode/2 works after the caller's target term is gone", %{model: model} do
+      # Nil the Elixir peer so the Fine ResourcePtr is the only keep left.
+      # decode/2 on this arch does not read ctx_other; a crash here still
+      # means create/decode itself broke.
+      other =
+        (fn ->
+           {:ok, target} = Context.create(model, n_ctx: 64)
+           {:ok, other} = Context.create(model, n_ctx: 64, ctx_other: target)
+           %{other | ctx_other: nil}
+         end).()
+
+      :erlang.garbage_collect()
+      Process.sleep(50)
+      :erlang.garbage_collect()
+
+      {:ok, tokens} = Tokenizer.encode(model, "Hi")
+      assert Context.decode(other, tokens) == :ok
+    end
+  end
+
   describe "the VM survives every guard" do
     test "a full generation still works after tripping all of them", %{
       ctx: ctx,

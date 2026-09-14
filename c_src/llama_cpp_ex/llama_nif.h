@@ -44,6 +44,9 @@ class LlamaContext {
 public:
     llama_context* ctx;
     fine::ResourcePtr<LlamaModel> model;
+    // Fine keep for the raw llama_context* passed as params.ctx_other.
+    // gemma4-assistant stores that pointer in cparams; Qwen does not.
+    fine::ResourcePtr<LlamaContext> ctx_other;
 
     // Reusable explicit batch for the decode-side NIFs (batch_eval,
     // batch_eval_sample, decode_token, prefill), allocated once on first use
@@ -112,6 +115,10 @@ public:
     LlamaContext(llama_context* c, fine::ResourcePtr<LlamaModel> m)
         : ctx(c), model(std::move(m)) {}
 
+    LlamaContext(llama_context* c, fine::ResourcePtr<LlamaModel> m,
+                 fine::ResourcePtr<LlamaContext> other)
+        : ctx(c), model(std::move(m)), ctx_other(std::move(other)) {}
+
     // Returns the reusable batch with capacity for at least n tokens
     // (per-token seq-id capacity 1 — all decode builders use single-seq
     // entries). Contents are stale; the caller fills 0..n-1 and n_tokens.
@@ -127,6 +134,10 @@ public:
     ~LlamaContext() {
         if (batch_capacity > 0) llama_batch_free(batch);
         if (ctx) llama_free(ctx);
+        ctx = nullptr;
+        // llama_free the draft first: gemma4-assistant still holds
+        // cparams.ctx_other until that returns. Then drop the Fine keep.
+        ctx_other = {};
     }
 
     LlamaContext(const LlamaContext&) = delete;

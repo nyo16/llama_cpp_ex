@@ -334,3 +334,120 @@ defmodule LlamaCppEx.MTPSidecarTest do
     assert spec == plain
   end
 end
+
+defmodule LlamaCppEx.MTPE4BSidecarTest do
+  # Gemma4 E4B's target/draft split: the target GGUF is `gemma4` with zero nextn
+  # layers, and a separate `mtp-gemma-4-*.gguf` is a `gemma4-assistant` sidecar
+  # (the sidecar itself has nextn layers). Same `:mtp_sidecar` tag, own env pair.
+  # Unset E4B vars skip this module; MTPSidecarTest still needs the Qwen pair.
+  # Add these two vars to the Qwen `--include mtp_sidecar` command:
+  #
+  #   LLAMA_SMOKE_MTP_E4B_MODEL=/path/to/gemma-4-E4B-it-Q4_K_M.gguf \
+  #   LLAMA_SMOKE_MTP_E4B_DRAFT_MODEL=/path/to/mtp-gemma-4-E4B-it-Q8_0.gguf
+  #
+  # async: false, and one session for the module, for the same reason
+  # MTPModelTest says: one GPU, and each session reserves two contexts.
+  use ExUnit.Case, async: false
+
+  alias LlamaCppEx.MTP
+
+  @moduletag :mtp_sidecar
+  @moduletag timeout: 300_000
+
+  if System.get_env("LLAMA_SMOKE_MTP_E4B_MODEL") in [nil, ""] or
+       System.get_env("LLAMA_SMOKE_MTP_E4B_DRAFT_MODEL") in [nil, ""] do
+    @moduletag skip: "set LLAMA_SMOKE_MTP_E4B_MODEL and LLAMA_SMOKE_MTP_E4B_DRAFT_MODEL"
+  end
+
+  setup_all do
+    :ok = LlamaCppEx.init()
+
+    {:ok, target} =
+      LlamaCppEx.load_model(LlamaCppEx.TestModels.path!(:mtp_e4b),
+        n_gpu_layers: -1,
+        load_mtp: true
+      )
+
+    {:ok, draft} =
+      LlamaCppEx.load_model(LlamaCppEx.TestModels.path!(:mtp_e4b_draft),
+        n_gpu_layers: -1,
+        load_mtp: true
+      )
+
+    {:ok, session} = MTP.init(target, draft_model: draft, n_ctx: 2048, n_draft: 3)
+
+    %{target: target, draft: draft, session: session}
+  end
+
+  test "the sidecar carries the head and the target does not", %{target: t, draft: d} do
+    assert LlamaCppEx.Model.n_layer_nextn(d) > 0
+    assert LlamaCppEx.Model.n_layer_nextn(t) == 0
+
+    assert LlamaCppEx.Model.n_embd_out(d) == LlamaCppEx.Model.n_embd_out(t)
+  end
+
+  test "gemma4-assistant has a narrow draft width and a wide output width", %{draft: d} do
+    # gemma4-assistant: n_embd is the assistant width, n_embd_out is the target.
+    assert LlamaCppEx.Model.n_embd(d) != LlamaCppEx.Model.n_embd_out(d)
+  end
+
+  test "init/2 builds a session from the pair", %{session: session} do
+    assert %LlamaCppEx.Context{} = session.main_ctx
+    assert %LlamaCppEx.Context{} = session.mtp_ctx
+    assert is_reference(session.spec_ref)
+
+    # The Elixir peer field is the same %Context{} as main_ctx.
+    assert %LlamaCppEx.Context{} = session.mtp_ctx.ctx_other
+    assert session.mtp_ctx.ctx_other.ref == session.main_ctx.ref
+    assert is_nil(session.main_ctx.ctx_other)
+  end
+
+  test "the same target is refused without the sidecar", %{target: t} do
+    assert {:error, message} = MTP.init(t, n_ctx: 512)
+    assert message =~ "no MTP head"
+    assert message =~ "draft_model"
+  end
+
+  test "generate/3 produces text and the head actually drafts", %{
+    target: target,
+    session: session
+  } do
+    before = MTP.stats(session)
+
+    {:ok, prompt} =
+      LlamaCppEx.Chat.apply_template(target, [%{role: "user", content: "2 + 2 ="}],
+        enable_thinking: false
+      )
+
+    assert {:ok, text} = MTP.generate(session, prompt, max_tokens: 16, temp: 0.0)
+    assert is_binary(text) and text != ""
+
+    now = MTP.stats(session)
+
+    assert now.drafts_generated > before.drafts_generated,
+           "the sidecar head proposed no drafts at all"
+
+    assert now.tokens_emitted > before.tokens_emitted
+  end
+
+  # E4B is dense, not hybrid — ckpt stays 0. The Qwen sidecar test pins
+  # ckpt > 0 for the hybrid case.
+  test "timing_us reports the expected buckets", %{target: target, session: session} do
+    {:ok, prompt} =
+      LlamaCppEx.Chat.apply_template(target, [%{role: "user", content: "Count to ten:"}],
+        enable_thinking: false
+      )
+
+    assert {:ok, _} = MTP.generate(session, prompt, max_tokens: 24, temp: 0.0)
+
+    timing = MTP.stats(session).timing_us
+
+    for key <- [:draft, :verify, :sample, :ckpt, :other, :total] do
+      assert Map.has_key?(timing, key), "timing_us is missing #{inspect(key)}"
+    end
+
+    assert timing.ckpt == 0
+
+    assert timing.draft + timing.verify + timing.sample + timing.ckpt <= timing.total
+  end
+end
