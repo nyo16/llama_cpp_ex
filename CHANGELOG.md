@@ -1,5 +1,35 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+
+- **Gemma 4 MTP sidecars failed at `MTP.init/2` with `"failed to create
+  context"`** (#91, fixed by @dai-yamashita in #92). llama.cpp's
+  `gemma4-assistant` head builds its draft context *over* the target's — it
+  aliases the target's KV cells and reads the target's token embeddings — and
+  throws `Gemma4Assistant requires ctx_other to be set` when
+  `llama_context_params.ctx_other` is null. The NIF never exposed the field, so
+  the Qwen 3.8 sidecar path from v0.8.44 (whose `qwen35` head ignores the
+  pointer) worked while a Gemma 4 pair could not get past context creation.
+  `Context.create/2` now accepts `:ctx_other` (a `%Context{}`, forwarded as
+  `params.ctx_other`; the NIF holds the peer's resource so the target outlives
+  a draft that aliases it), and `MTP.init/2` passes the target as the draft's
+  `:ctx_other` unconditionally — what upstream's
+  `common_speculative_init_result` does, and a no-op for every architecture
+  other than `gemma4-assistant`, `eagle3` and `dflash`. Verified on Metal
+  (M4 Max) with Unsloth `gemma-4-E4B-it-Q4_K_M` + `MTP/mtp-gemma-4-E4B-it-Q8_0`
+  at b10944: the pair loads, drafts at 53% acceptance (`n_draft: 3`, greedy),
+  and greedy output matches plain decoding on the target. Creating a Gemma 4
+  draft context *without* a target still fails; that is llama.cpp's contract.
+
+### Added
+
+- **`:mtp_sidecar` gained a second fixture pair** behind
+  `LLAMA_SMOKE_MTP_E4B_MODEL` / `LLAMA_SMOKE_MTP_E4B_DRAFT_MODEL`
+  (`MTPE4BSidecarTest`). When those vars are unset the module skips, so
+  `--include mtp_sidecar` with only the Qwen pair stays green. Also from #92.
+
 ## v0.8.49
 
 This section also covers v0.8.44 (b10435, PR #86), v0.8.45 (b10582, #87),
@@ -106,16 +136,6 @@ The one tag that is not green is `:mtp_cancel`, and it moved: see Changed.
   target/draft hidden-width mismatch — upstream compares those with a
   `GGML_ASSERT`, which is an unconditional `ggml_abort` and would take the VM
   down instead of returning an error.
-- **`Context.create/2` accepts optional `:ctx_other`.** Pass an existing
-  `%Context{}` and the NIF forwards it as `llama_context_params.ctx_other`.
-  `MTP.init/2` always sets it on the draft. Gemma4 E4B's `gemma4-assistant`
-  sidecar needs that link at construction; Qwen's constructor leaves
-  `cparams.ctx_other` as `nullptr`, so the NIF default (omitted → `nullptr`)
-  still works for them.
-- **`:mtp_sidecar` gained a second fixture pair** behind
-  `LLAMA_SMOKE_MTP_E4B_MODEL` / `LLAMA_SMOKE_MTP_E4B_DRAFT_MODEL`. When those
-  vars are unset the E4B module skips, so `--include mtp_sidecar` with only the
-  Qwen pair stays green.
 - **`stats/1` reports `timing_us.ckpt`.** Recurrent-state save/restore, which
   only hybrid models pay, was previously folded into `:other` — a bucket whose
   documented cause is Metal GPU-sync waits. On Qwen 3.8 (48 SSM layers to 16
