@@ -295,8 +295,12 @@ defmodule LlamaCppEx.MTPSidecarTest do
   # A hybrid target (Qwen 3.8: SSM layers beside attention ones) cannot roll back
   # part of a sequence natively, so the loop snapshots the recurrent state every
   # iteration. That cost is the difference between speculation paying off and not,
-  # so it gets its own bucket rather than hiding inside :other.
-  test "timing_us reports a ckpt bucket", %{session: session} do
+  # so it gets its own bucket rather than hiding inside :other. An attention-only
+  # target (Gemma 4) trims any range natively and must never pay for a snapshot —
+  # the NIF gates the checkpoint on common_context_can_seq_rm == FULL at init.
+  test "timing_us bills ckpt only when the target cannot trim partially", %{
+    session: session
+  } do
     assert {:ok, _} = MTP.generate(session, "Count to ten:", max_tokens: 24, temp: 0.0)
 
     timing = MTP.stats(session).timing_us
@@ -305,8 +309,15 @@ defmodule LlamaCppEx.MTPSidecarTest do
       assert Map.has_key?(timing, key), "timing_us is missing #{inspect(key)}"
     end
 
-    assert timing.ckpt > 0,
-           "a hybrid target should have paid for at least one recurrent-state snapshot"
+    case LlamaCppEx.TestModels.seq_rm_kind(:mtp) do
+      :full ->
+        assert timing.ckpt > 0,
+               "a hybrid target should have paid for at least one recurrent-state snapshot"
+
+      kind ->
+        assert timing.ckpt == 0,
+               "a #{inspect(kind)} target trims natively and must not be billed for snapshots"
+    end
 
     # The named buckets are carved out of total, never billed twice on top of it.
     assert timing.draft + timing.verify + timing.sample + timing.ckpt <= timing.total

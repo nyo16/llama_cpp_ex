@@ -11,6 +11,7 @@
 #include <cmath>
 #include <cstring>
 #include <cerrno>
+#include <optional>
 
 // The ggml RPC backend is opt-in at build time (LLAMA_RPC=1). GGML_USE_RPC is
 // set by the Makefile, not inherited from cmake: ggml puts it on the `ggml`
@@ -845,7 +846,8 @@ context_create(
     bool kv_unified,
     // Speculative decoding / MTP
     int64_t ctx_type,
-    int64_t n_rs_seq)
+    int64_t n_rs_seq,
+    std::optional<fine::ResourcePtr<LlamaContext>> ctx_other)
 {
     auto params = llama_context_default_params();
     params.n_ctx           = static_cast<uint32_t>(n_ctx);
@@ -891,6 +893,12 @@ context_create(
     // Speculative decoding / MTP
     params.ctx_type = static_cast<enum llama_context_type>(ctx_type);
     params.n_rs_seq = static_cast<uint32_t>(n_rs_seq);
+    // Peer context for architectures whose draft shares state with the target.
+    // gemma4-assistant throws at construction without it (llama-context.cpp,
+    // LLM_ARCH_GEMMA4_ASSISTANT); qwen35's constructor ignores it. Upstream's
+    // common_speculative_init_result sets it for every draft context, so the
+    // MTP module always passes the target here.
+    params.ctx_other = ctx_other ? (*ctx_other)->ctx : nullptr;
 
     // For embedding models, n_ubatch must equal n_batch
     if (embeddings) {
@@ -904,6 +912,9 @@ context_create(
 
     auto res = fine::make_resource<LlamaContext>(ctx, model);
     res->kv_unified = kv_unified;
+    if (ctx_other) {
+        res->ctx_other = std::move(*ctx_other);
+    }
     return fine::Ok(std::move(res));
 }
 FINE_NIF(context_create, ERL_NIF_DIRTY_JOB_CPU_BOUND);

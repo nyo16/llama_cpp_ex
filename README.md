@@ -646,6 +646,7 @@ Upstream llama.cpp implements more speculative types behind the same `common_spe
 ### Models with MTP heads
 
 - [`ggml-org/Qwen3.8-27B-GGUF`](https://huggingface.co/ggml-org/Qwen3.8-27B-GGUF) — **sidecar layout**: the target (`Qwen3.8-27B-Q4_K_M.gguf`, ~18 GB) carries *no* head, and `mtp-Qwen3.8-27B-Q4_0.gguf` (~1.6 GB) carries nothing else. Load both and pass the head as `draft_model:`.
+- [`unsloth/gemma-4-E4B-it-GGUF`](https://huggingface.co/unsloth/gemma-4-E4B-it-GGUF) — **sidecar layout**, different head architecture: the target (`gemma-4-E4B-it-Q4_K_M.gguf`, ~5 GB) carries no head and `MTP/mtp-gemma-4-E4B-it-Q8_0.gguf` (~0.1 GB) is a `gemma4-assistant` that shares the target's KV cache. Same `draft_model:` call; `MTP.init/2` wires the target in as the draft's `:ctx_other`, which this architecture requires and Qwen's ignores. 53% greedy acceptance at `n_draft: 3` on M4 Max. Fixed in #91.
 - [`ggml-org/Qwen3.6-35B-A3B-MTP-GGUF`](https://huggingface.co/ggml-org/Qwen3.6-35B-A3B-MTP-GGUF) (recommended: `Q4_K_M`, ~21 GB)
 - [`ggml-org/Qwen3.6-27B-MTP-GGUF`](https://huggingface.co/ggml-org/Qwen3.6-27B-MTP-GGUF)
 - [`unsloth/Qwen3.6-35B-A3B-MTP-GGUF`](https://huggingface.co/unsloth/Qwen3.6-35B-A3B-MTP-GGUF)

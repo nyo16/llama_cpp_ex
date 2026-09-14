@@ -1,5 +1,36 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+
+- **Gemma 4 MTP sidecars failed at `MTP.init/2` with `"failed to create
+  context"`** (#91). llama.cpp's `gemma4-assistant` head builds its draft
+  context *over* the target's — it aliases the target's KV cells and reads the
+  target's token embeddings — and the constructor throws
+  `Gemma4Assistant requires ctx_other to be set` when
+  `llama_context_params.ctx_other` is null. The NIF built every context from
+  `llama_context_default_params()` and never exposed the field, so the Qwen 3.8
+  sidecar path from v0.8.44 (whose `qwen35` head ignores the pointer) worked
+  while a Gemma 4 pair could not get past context creation. Reproduced with
+  Unsloth `gemma-4-E4B-it-Q4_K_M.gguf` + `MTP/mtp-gemma-4-E4B-it-Q8_0.gguf`
+  on Metal: validation passes (head `n_layer_nextn == 4`, widths match at
+  2560), then `llama_init_from_model` fails. `Context.create/2` gains
+  `:ctx_other` (a `%Context{}`, forwarded as `params.ctx_other`; the NIF holds
+  the peer's resource so it outlives the context that aliases it), and
+  `MTP.init/2` passes the target as the draft's `:ctx_other` unconditionally —
+  the same thing upstream's `common_speculative_init_result` does, so the
+  in-file and Qwen sidecar paths are unchanged (the pointer is only read for
+  `gemma4-assistant`, `eagle3` and `dflash`). With the fix the Gemma 4 pair
+  loads, drafts (53% acceptance at `n_draft: 3`, greedy) and the
+  `:mtp_sidecar` suite passes **6/6** against it, including greedy
+  equivalence with plain decoding on the target. One assertion in that suite
+  pinned Qwen 3.8 rather than the binding — `timing_us.ckpt > 0` — and now
+  keys off the target's `seq_rm` kind: `:full` targets must be billed for
+  snapshots, everything else must not. Creating a draft context on a Gemma 4
+  sidecar *without* a target still fails; that is llama.cpp's contract, and
+  `Context.create/2` documents it.
+
 ## v0.8.49
 
 This section also covers v0.8.44 (b10435, PR #86), v0.8.45 (b10582, #87),

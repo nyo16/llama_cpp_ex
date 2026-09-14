@@ -60,6 +60,13 @@ public:
     // side effect, so it must never be called on a live context.
     bool kv_unified = false;
 
+    // The peer context passed as llama_context_params.ctx_other, or null.
+    // Held so the peer outlives this context: architectures that use it
+    // (gemma4-assistant) build this context's KV cache *over* the peer's —
+    // llama_kv_cache aliases `other->v_cells_impl` and shares layer tensors —
+    // so freeing the peer first would leave this context reading freed cells.
+    fine::ResourcePtr<LlamaContext> ctx_other;
+
     // Shape of the last *successful* llama_decode on this context.
     //
     // `sampler_sample_at/3` takes its index straight from Elixir, and

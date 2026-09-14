@@ -161,6 +161,14 @@ LLAMA_SMOKE_MTP_MODEL=~/Downloads/Qwen3.8-27B-Q4_K_M.gguf \
 LLAMA_SMOKE_MTP_DRAFT_MODEL=~/Downloads/mtp-Qwen3.8-27B-Q4_0.gguf \
   mix test --include mtp_sidecar
 
+# Same tag, other head architecture: gemma4-assistant needs the target as the
+# draft's ctx_other (#91), which Qwen's head ignores — so a Qwen pair alone
+# cannot tell you that wiring still works.
+GGML_METAL_NO_RESIDENCY=1 \
+LLAMA_SMOKE_MTP_MODEL=~/Downloads/gemma-4-E4B-it-Q4_K_M.gguf \
+LLAMA_SMOKE_MTP_DRAFT_MODEL=~/Downloads/mtp-gemma-4-E4B-it-Q8_0.gguf \
+  mix test --include mtp_sidecar
+
 # :rpc_live needs an RPC build AND a reachable worker, and must run with no
 # model tag beside it — see test/test_helper.exs for why combining them aborts.
 # The worker can be local: another BEAM running LlamaCppEx.RPC.Server, or

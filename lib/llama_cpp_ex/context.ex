@@ -59,7 +59,8 @@ defmodule LlamaCppEx.Context do
     :embeddings,
     :pooling_type,
     :ctx_type,
-    :n_rs_seq
+    :n_rs_seq,
+    :ctx_other
   ]
 
   @doc """
@@ -139,6 +140,15 @@ defmodule LlamaCppEx.Context do
     * `:n_rs_seq` - Number of recurrent-state snapshots per sequence to retain for
       partial rollback of speculative drafts. `0` (default) disables rollback. For an
       MTP draft context, set this to your intended max draft length (e.g. `3`).
+    * `:ctx_other` - Peer `t:t/0` this context is paired with, forwarded as
+      `llama_context_params.ctx_other`. Some MTP head architectures build the draft
+      context *over* the target's: `gemma4-assistant` shares the target's KV cache
+      and token embeddings and refuses to construct without it, so a draft
+      `Context.create/2` on a Gemma 4 sidecar fails with
+      `"Gemma4Assistant requires ctx_other to be set"` unless the target is passed
+      here. `qwen35` ignores it. `LlamaCppEx.MTP.init/2` always passes the target,
+      matching upstream's `common_speculative_init_result`. The peer is kept alive
+      for as long as this context exists. Defaults to `nil`.
 
   """
   @spec create(LlamaCppEx.Model.t(), keyword()) :: {:ok, t()} | {:error, String.t()}
@@ -183,6 +193,7 @@ defmodule LlamaCppEx.Context do
     # Speculative decoding / MTP
     ctx_type = Keyword.get(opts, :ctx_type, :default) |> ctx_type_to_int()
     n_rs_seq = Keyword.get(opts, :n_rs_seq, 0)
+    ctx_other = Keyword.get(opts, :ctx_other)
 
     case LlamaCppEx.NIF.context_create(
            model_ref,
@@ -212,7 +223,8 @@ defmodule LlamaCppEx.Context do
            swa_full,
            kv_unified,
            ctx_type,
-           n_rs_seq
+           n_rs_seq,
+           ctx_other_ref(ctx_other)
          ) do
       {:ok, ref} -> {:ok, %__MODULE__{ref: ref, model: model}}
       {:error, _} = error -> error
@@ -313,4 +325,10 @@ defmodule LlamaCppEx.Context do
   defp ctx_type_to_int(:default), do: 0
   defp ctx_type_to_int(:mtp), do: 1
   defp ctx_type_to_int(n) when is_integer(n), do: n
+
+  # A bare reference is deliberately not accepted: the peer must be a live
+  # `%Context{}` so the caller cannot hand the NIF a ref whose resource has
+  # already been collected, and so the FunctionClauseError names the option.
+  defp ctx_other_ref(nil), do: nil
+  defp ctx_other_ref(%__MODULE__{ref: ref}), do: ref
 end

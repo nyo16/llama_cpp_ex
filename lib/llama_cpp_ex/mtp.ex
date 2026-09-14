@@ -34,10 +34,12 @@ defmodule LlamaCppEx.MTP do
   **In the target GGUF** (e.g. `ggml-org/Qwen3.6-35B-A3B-MTP-GGUF`) — pass just
   the model, as above.
 
-  **In a sidecar GGUF** — pass it as `:draft_model`. This is how Qwen 3.8 ships:
-  `Qwen3.8-27B-Q4_K_M.gguf` carries no head at all (`n_layer_nextn == 0`) and
-  `mtp-Qwen3.8-27B-Q4_0.gguf` carries nothing else. It is the binding's
-  equivalent of upstream's `-hf <target> -hfd <draft> --spec-type draft-mtp`.
+  **In a sidecar GGUF** — pass it as `:draft_model`. This is how Qwen 3.8 and
+  Gemma 4 ship: `Qwen3.8-27B-Q4_K_M.gguf` carries no head at all
+  (`n_layer_nextn == 0`) and `mtp-Qwen3.8-27B-Q4_0.gguf` carries nothing else;
+  likewise `gemma-4-E4B-it-Q4_K_M.gguf` plus `mtp-gemma-4-E4B-it-Q8_0.gguf`. It
+  is the binding's equivalent of upstream's
+  `-hf <target> -hfd <draft> --spec-type draft-mtp`.
 
       {:ok, target} = LlamaCppEx.load_model("Qwen3.8-27B-Q4_K_M.gguf",
                                             n_gpu_layers: 999, load_mtp: true)
@@ -45,6 +47,16 @@ defmodule LlamaCppEx.MTP do
                                             n_gpu_layers: 999, load_mtp: true)
 
       {:ok, mtp} = LlamaCppEx.MTP.init(target, draft_model: head, n_draft: 1)
+
+  The two head architectures differ in what the draft context needs from the
+  target. Qwen's (`qwen35`) is self-contained. Gemma 4's (`gemma4-assistant`)
+  shares the target's KV cache and token embeddings, so its draft context is
+  built *over* the target's — `init/2` passes the target as the draft's
+  `:ctx_other` (see `LlamaCppEx.Context.create/2`) for both, as upstream does.
+  A consequence worth knowing: a Gemma 4 sidecar cannot be given a context of
+  its own — `Context.create(head)` without `:ctx_other` fails with
+  `"Gemma4Assistant requires ctx_other to be set"`. That is llama.cpp's
+  contract, not a binding limitation.
 
   > #### Speculation is not always a win on hybrid models {: .warning}
   >
@@ -212,12 +224,17 @@ defmodule LlamaCppEx.MTP do
   defp do_init(model, head_model, opts, n_draft) do
     base_ctx_opts = forwardable_context_opts(opts)
     main_opts = Keyword.merge(base_ctx_opts, ctx_type: :default)
-    # Match upstream server: MTP draft context is created with n_rs_seq=0.
-    # The MTP impl handles state rollback internally via cached hidden
-    # states (pending_h / verify_h), not via recurrent-state snapshots.
-    draft_opts = Keyword.merge(base_ctx_opts, ctx_type: :mtp, n_rs_seq: 0)
 
     with {:ok, main_ctx} <- Context.create(model, main_opts),
+         # Match upstream's common_speculative_init_result: the draft context is
+         # created with n_rs_seq=0 (the MTP impl rolls back via cached hidden
+         # states, not recurrent-state snapshots) and with the target as
+         # ctx_other — unconditionally. gemma4-assistant builds its KV cache over
+         # the target's and throws at construction without the peer; qwen35
+         # ignores it. Passing it always is what makes a Gemma 4 sidecar load
+         # through the same path as a Qwen 3.8 one.
+         draft_opts =
+           Keyword.merge(base_ctx_opts, ctx_type: :mtp, n_rs_seq: 0, ctx_other: main_ctx),
          {:ok, mtp_ctx} <- Context.create(head_model, draft_opts),
          {:ok, spec_ref} <-
            LlamaCppEx.NIF.speculative_init(main_ctx.ref, mtp_ctx.ref, n_draft) do
