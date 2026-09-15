@@ -1,5 +1,41 @@
 # Changelog
 
+## v0.8.51
+
+llama.cpp bumped to `72b590d65` (one past
+[`b10989`](https://github.com/ggml-org/llama.cpp/releases/tag/b10989),
+upstream v0.4.1), +46 from `b6b003d2c` (b10944). No change to any header the
+NIF includes (`llama.h`, `ggml-backend.h`, `chat.h`,
+`json-schema-to-grammar.h`, `speculative.h`) and none to
+`llama_model_default_params` / `llama_context_default_params`, so the NIF
+source is untouched.
+
+### Changed
+
+- **RPC protocol is now major version 7** (`ggml-rpc.h`, upstream #28789). The
+  `SET_TENSOR` wire format gained a cache-flag byte, so a worker at this build
+  will refuse a client from v0.8.50 or earlier and vice versa. Rebuild both
+  ends of a two-node split together. With it comes the fix that motivated the
+  bump: `:cache_dir` on `LlamaCppEx.RPC.Server` used to hash and persist every
+  transfer over 10 MiB, including the activations `ggml_backend_sched` copies
+  between backends, which filled the worker's disk during prefill on a split
+  model. The cache now covers weight tensors only, which is what its docs
+  always described.
+- Upstream fixes worth knowing about in this range: a heap overflow in the ggml
+  CPU backend's rope work buffer caused by a `CACHE_LINE_SIZE` mismatch between
+  the C and C++ translation units (#28882 — the precompiled header is now off);
+  `common_speculative` skips the target decode when `llama_n_rs_seq` says it
+  is not needed (#28749); Maple 20B-A1B ternary MoE architecture (CPU only,
+  #27000); Metal flash-attention kernels for MiniCPM3's head sizes (#28599).
+
+Verified on macOS (Metal), M4 Max: default build **430 passed, 157 excluded**
+with no model; **573 passed, 14 excluded** for `--include smoke --include
+embeddings --include slow --include mtp` (Qwen3.5-0.8B-UD-Q8_K_XL,
+Qwen3-Embedding-0.6B-f16, Qwen3.5-0.8B-MTP-Q8_0); **6 passed** for
+`MTPE4BSidecarTest` under `--include mtp_sidecar` (gemma-4-E4B-it-Q4_K_M plus
+mtp-gemma-4-E4B-it-Q8_0). The Qwen 3.8 sidecar pair and `rpc_live` were not
+re-run at this build.
+
 ## v0.8.50
 
 ### Fixed

@@ -23,7 +23,7 @@ defmodule LlamaCppEx.RPC.Server do
 
   ## The tensor cache is worth having
 
-  `:cache_dir` enables upstream's content-addressed cache for tensors over
+  `:cache_dir` enables upstream's content-addressed cache for weight tensors over
   10 MiB. Without it every model load re-pushes the whole remote share across the
   network; with it a warm load is close to free. There is no default — pass a
   path or accept the cost knowingly.
