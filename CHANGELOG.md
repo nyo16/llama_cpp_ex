@@ -1,5 +1,52 @@
 # Changelog
 
+## v0.8.52
+
+llama.cpp bumped to `5b59b83f4` (one past
+[`b11050`](https://github.com/ggml-org/llama.cpp/releases/tag/b11050)),
+61 commits from `72b590d65` (b10989+1). The only NIF-facing header changes are
+additive — `LLAMA_VOCAB_TYPE_TEST` and `llama_adapter_lora_init_from_file_ptr`
+in `llama.h`, `ggml_dsv4_hc_pre_gated` in `ggml.h` — and neither
+`llama_model_default_params` nor `llama_context_default_params` moved, so the
+NIF source is untouched. RPC protocol stays at 7.0.0: a v0.8.51 worker and a
+v0.8.52 client still interoperate.
+
+### Changed
+
+- **RPC worker no longer holds a freed buffer in a cached graph** (upstream
+  #24292). `free_buffer` now discards every stored compute graph, closing a
+  use-after-free in `graph_recompute` when a client freed a buffer that a
+  cached graph's nodes still pointed at. Relevant to any long-lived
+  `LlamaCppEx.RPC.Server` that serves more than one model load.
+- Metal: MoE and `SSM_CONV` fusion (#28948), corrected flash-attention support
+  checks (#29122), and a NaN fix in `mul_mm_id` when activations exceed the
+  f16 range (#26223) — the last one affects MoE models on Apple silicon
+  directly.
+- MTP: the draft context can now run under a CUDA graph (#28549); Nemotron
+  MTP support extended (#29018).
+- Chat parsing: the DeepSeek V3.2/V4 parser gained message delimiters
+  (#29008); the reasoning-budget cutoff now forces `\n</think>` for
+  qwen3-coder (#28869).
+- ggml now reports allocation failures instead of crashing (#28149) and
+  handles graph buffer reservation failure (#26070).
+- New architectures: HrmTextForCausalLM / DFM Mimir 1B (#27625); the
+  `ufakzeka` pre-tokenizer (#29033).
+
+All three upstream defects listed in `docs/release-guide.md` still stand at
+this build (source diff): `ggml-cpu/CMakeLists.txt` is untouched, the
+`ggml-cuda.cu` diff is a `DSV4_HC_POST` `supports_op` tweak nowhere near
+`ggml_backend_cuda_comm_init`, the RPC buffer's `set_tensor_2d`/`get_tensor_2d`
+hooks are still `NULL`, and `ggml_backend_rpc_start_server` still returns
+`void`.
+
+Verified on macOS (Metal), M1 Max: default build **430 passed, 157 excluded**
+with no model; **573 passed, 14 excluded** for `--include smoke --include
+embeddings --include slow --include mtp` (Qwen3.5-0.8B-UD-Q4_K_XL,
+Qwen3-Embedding-0.6B-f16, Qwen3.6-35B-A3B-MTP-UD-Q4_K_XL); **436 passed, 6
+skipped** for `--include mtp_sidecar` with the Qwen 3.8 pair
+(Qwen3.8-27B-Q4_K_M plus mtp-Qwen3.8-27B-Q4_0; the Gemma 4 E4B pair was not on
+disk, so `MTPE4BSidecarTest` skipped). `rpc_live` was not re-run at this build.
+
 ## v0.8.51
 
 llama.cpp bumped to `72b590d65` (one past
