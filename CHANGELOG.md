@@ -1,5 +1,54 @@
 # Changelog
 
+## v0.8.53
+
+llama.cpp bumped to `a894dae93`
+([`b11064`](https://github.com/ggml-org/llama.cpp/releases/tag/b11064)),
+13 commits from `5b59b83f4` (b11050+1). No change to any header the NIF
+includes (`llama.h`, `ggml-backend.h`, `ggml-rpc.h`, `chat.h`,
+`json-schema-to-grammar.h`, `speculative.h`) and none to
+`llama_model_default_params` / `llama_context_default_params`, so the NIF
+source is untouched. RPC protocol stays at 7.0.0.
+
+### Changed
+
+- Chat parsing: a dedicated Ling 3.0 / Bailing V3 parser (#28682) — those
+  templates pre-open the think block, so a tool call arriving before `</think>`
+  used to be classified entirely as reasoning and clients saw empty content
+  with no `tool_calls`; the Gemma 4 required-tool grammar is fixed (#29115);
+  and the PEG parser now handles invalid UTF-8 in model output by returning
+  the maximal subpart per the Unicode recommendation instead of failing the
+  parse (#29161).
+- `json_schema_to_grammar` accepts an escaped hyphen (`\-`) in a regex
+  `pattern`, inside or outside a character class (#29127). A schema such as
+  `"pattern": "^[a-z\\-]+$"` used to come back from
+  `LlamaCppEx.Grammar.from_json_schema/1` as `{:error, _}`; it now yields a
+  grammar.
+- Metal: `dsv4_hc_pre` supports arbitrary `hc` instead of falling back to
+  CPU for anything but 4 (#29169, needed by Kimi-K3's cross-layer residual
+  stack); the FWHT kernel reads F16 input directly (#29094).
+- CUDA: sparse flash attention enabled for Qwen4 (#28770).
+- Mamba: time-step projection input is made contiguous (#28832), a
+  correctness fix for SSM models on backends that require it.
+- Hexagon: `TOP_K`, `GEGLU_QUICK`, and I32 `GET_ROWS` (#29113, #29114,
+  #29116).
+
+All three upstream defects listed in `docs/release-guide.md` still stand at
+this build (source diff): `ggml-cpu/CMakeLists.txt`, `ggml-cuda.cu`, and
+`ggml-rpc.cpp` are all untouched in this range, so the `-mcpu=native` probe,
+`ggml_backend_cuda_comm_init`, the RPC buffer's `NULL` 2-D tensor hooks, and
+the `void` `ggml_backend_rpc_start_server` are exactly as at `5b59b83f4`.
+
+Verified on macOS (Metal), M1 Max: default build **430 passed, 157 excluded**
+with no model; **573 passed, 14 excluded** for `--include smoke --include
+embeddings --include slow --include mtp` (Qwen3.5-0.8B-UD-Q4_K_XL,
+Qwen3-Embedding-0.6B-f16, Qwen3.6-35B-A3B-MTP-UD-Q4_K_XL); **436 passed, 6
+skipped** for `--include mtp_sidecar` with the Qwen 3.8 pair
+(Qwen3.8-27B-Q4_K_M plus mtp-Qwen3.8-27B-Q4_0; the Gemma 4 E4B pair was not on
+disk, so `MTPE4BSidecarTest` skipped). The Hex tarball source build
+(`LLAMA_BACKEND=cpu`) clones `a894dae93` and compiles clean. `rpc_live` was
+not re-run at this build.
+
 ## v0.8.52
 
 llama.cpp bumped to `5b59b83f4` (one past
