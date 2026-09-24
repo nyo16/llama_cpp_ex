@@ -1,5 +1,70 @@
 # Changelog
 
+## v0.8.54
+
+llama.cpp bumped to `308883b33`
+([`b11160`](https://github.com/ggml-org/llama.cpp/releases/tag/b11160)+2),
+98 commits from `a894dae93` (b11064). Upstream's own version moves from 0.4.1
+to 0.5.0 (#29333) and ggml to 0.25.1. No change to any header the NIF
+includes (`llama.h`, `ggml-backend.h`, `ggml-rpc.h`, `chat.h`,
+`json-schema-to-grammar.h`, `speculative.h`) and none to
+`llama_model_default_params` / `llama_context_default_params`, so the NIF
+source is untouched. The only header change on the include path is
+`common/common.h`, where `common_params::hostname` became `hostnames`
+(#28690, multi-address server binding) — a field the NIF never reads. RPC
+protocol stays at 7.0.0.
+
+### Changed
+
+- Chat templates: the Jinja parser accepts unary `+`/`-` before a variable
+  (#29244), so templates that slice with `items[:-n]` (GigaChat's
+  `indent[:-indent_factor]`, for one) now render instead of failing in
+  `LlamaCppEx.Chat.apply_template/3`; the Qwen3-Coder XML tool-call parser is
+  no longer picked for templates that emit `<tool_call><function=…>` without a
+  newline between the tags (MiMo-V2.6, #29257); and the Muse Glimmer parser no
+  longer errors when the response opens with a tool call (#29242).
+- Sampling: the backend-sampler support probe builds its graph over 128K
+  candidates instead of 1M (#29285), shrinking the scratch allocation made when
+  a backend sampler chain is initialised.
+- Metal: the flash-attention block pre-pass now bounds-checks the mask rows as
+  well as the columns (#29220), a correctness fix for batches whose token
+  count is not a multiple of the tile height; missing `f32 x bf16` `mul_mv`
+  variants added (#28741); the fa-vec tuning table is keyed by GPU family
+  rather than SKU (#29075); `mul_mm_id` src1 rescaling is gated behind
+  `ggml_prec` (#29029); and the macOS 27 SDK deprecation warnings are gone
+  (#29136).
+- ggml: `ggml_permute` no longer truncates dimensions and strides to `int`
+  (#29227), a correctness fix for tensors past 2^31 elements or bytes; the
+  meta backend resolves views that span multiple buffers (#29266).
+- Models: Gemma 4 DSpark draft backbones (#29226), DFlash drafting for
+  HunyuanOCR (#28890), and Ling 3.0 VL (#29151).
+- CUDA: conv2d and conv3d via implicit GEMM (#29135, #29137), top-k MoE
+  always fused (#28432), sparse flash attention for DeepSeek V4 prefill
+  (#29298), FA tuned for Gemma 4 on Ampere+ (#29152), and the sm_70 tile
+  compile error fixed (#29224).
+- CPU: ARM repack kernels for `Q1_0` (#23492); IQ1_M builds its prefix sums
+  once per block (#28706).
+- Vulkan, SYCL, OpenCL, Hexagon, WebGPU: backend-specific kernels and tuning
+  (int8 coopmat1 matmul on RDNA3/4, IQ4_XS MMQ/MMV, Intel Xe FA, Adreno coopmat
+  tuning, HMX `GATED_DELTA_NET`, and more).
+
+All three upstream defects listed in `docs/release-guide.md` still stand at
+this build (source diff): `ggml-cpu/CMakeLists.txt` and `ggml-rpc.cpp` are
+untouched in this range, and the `ggml-cuda.cu` diff (#28432, #29137,
+#29317) does not reach `ggml_backend_cuda_comm_init`. The meta-backend change
+(#29266) resolves multi-buffer views and leaves the RPC buffer's `NULL` 2-D
+tensor hooks as they were.
+
+Verified on macOS (Metal), M4 Max: default build **430 passed, 157 excluded**
+with no model; **573 passed, 14 excluded** for `--include smoke --include
+embeddings --include slow --include mtp` (Qwen3.5-0.8B-Q4_K_M,
+Qwen3-Embedding-0.6B-f16, Qwen3.5-0.8B-MTP-Q8_0); **6 passed** for
+`MTPE4BSidecarTest` with the Gemma 4 E4B pair (gemma-4-E4B-it-Q4_K_M plus
+mtp-gemma-4-E4B-it-Q8_0). The Qwen 3.8 sidecar pair was not on disk, so
+`MTPSidecarTest` was not run. The Hex tarball source build
+(`LLAMA_BACKEND=cpu`) clones `308883b33` and compiles clean. `rpc_live` and
+`mtp_cancel` were not re-run at this build.
+
 ## v0.8.53
 
 llama.cpp bumped to `a894dae93`
