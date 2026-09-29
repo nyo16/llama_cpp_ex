@@ -1,5 +1,73 @@
 # Changelog
 
+## v0.8.54
+
+llama.cpp bumped to `c85b92c69`
+([`b11256`](https://github.com/ggml-org/llama.cpp/releases/tag/b11256)),
+192 commits from `a894dae93` (b11064). The header changes the NIF sees are
+additive: `llama.h` gains the extended batch API (`llama_batch_ext_*`,
+`llama_process`, #24669) and `llama_get_causal_attn`; `speculative.h` gains a
+`common_speculative_process(spec, const common_batch &)` overload (#29385) and
+keeps the `llama_batch` one the MTP loop calls, now converted internally via
+`common_batch_from_llama_batch`. `common.h` drops `string_from` and the
+`fs_*` cache-dir helpers, none of which the NIF uses.
+`llama_model_default_params` / `llama_context_default_params` are
+byte-identical, so the NIF source is untouched. RPC protocol stays at 7.0.0.
+
+### Changed
+
+- Speculative decoding / MTP: upstream's speculative, mtmd and server paths
+  moved to `llama_batch_ext` (#29385). The NIF still feeds `llama_batch`
+  through the legacy overload; MTP (single-file and Gemma 4 E4B sidecar) is
+  re-verified below.
+- State restore: a failed `llama_state_seq_set_data` now clears the
+  sequence's K/V, recurrent and MLA state instead of leaving it half-written
+  (#27530). `Context.state_seq_set_data/3` returning `{:error, _}` on a bad
+  blob therefore leaves that sequence empty rather than corrupt.
+- Grammar: `common_json` handles enum values (#28518) and GBNF token-id
+  parsing no longer truncates large ids (#29382).
+- Chat / Jinja: Muse Glimmer tool-call parser and `response_format`
+  `json_schema` fixes (#29242, #29615); Jinja gains the `dict` builtin,
+  `sameas` test, non-call test statements with arguments, and unary `+`/`-`
+  before variables (#29477, #29448, #29443, #29244).
+- Models: Ling 3.0 VL (#29151), Gemma 4 DSpark draft backbone (#29226),
+  DFlash for HunyuanOCR (#28890), fused-QKV tensor split fix for uneven K/V
+  head sizes (#29294), and the model-driven W4A4 `llama_prec_policy` path
+  (#24364).
+- Loading: faster model loading (#29598); the auto-fit max-context change for
+  unified KV is reverted (#29437).
+- Metal: flash-attention mask bounds fix in the block pre-pass (#29220), graph
+  capture / empty-graph fix (#29390), sparse FA optimisation (#29377), FA
+  kernels split into per-dtype libraries (#29329), f32 x bf16 `mul_mv`
+  (#28741), left/circular `GGML_OP_PAD` (#29561), FWHT above 512 and perf
+  work (#29095, #29602), and macOS 27 SDK deprecation fixes (#29136).
+- CUDA: RMS_NORM + SCALE fusion (#29393), implicit-GEMM conv2d/conv3d
+  (#29135, #29137), FA tuning for Gemma 4 on Ampere+ (#29152) and head sizes
+  40-112 (#26289), sparse FA for DSV4 prefill (#29298).
+- CPU: tiled `mul_mat` for k-quants (#27851), tiled FA for non-vector-multiple
+  head dims on x86 (#29423), ARM repack kernels for Q1_0 (#23492).
+- RPC: `get_alloc_size` includes `nb` in its cache key and floors the result
+  at `ggml_nbytes` (#29283), fixing under-sized remote allocations for
+  tensors with strides over 4 GiB; RDMA uses a completion channel instead of
+  spinning (#29440).
+
+All three upstream defects listed in `docs/release-guide.md` still stand at
+this build (source diff). `ggml_backend_rpc_start_server` is untouched and the
+RPC buffer's `set_tensor_2d`/`get_tensor_2d` hooks are still `NULL`; the
+`ggml-cuda.cu` diff does not touch `ggml_backend_cuda_comm_init`. The
+`ggml-cpu/CMakeLists.txt` diff does wrap the `-mcpu=native` probe, but only in
+a new `GGML_ARM_MSVC` guard for Windows ARM64 `cl.exe` (#28362); ignoring
+whitespace, the GCC/clang path is identical, so the probe was not re-measured
+on an aarch64 host.
+
+Verified on macOS (Metal), M4 Max: default build **430 passed, 157 excluded**
+with no model; **573 passed, 14 excluded** for `--include smoke --include
+embeddings --include slow --include mtp` (Qwen3.5-0.8B-UD-Q8_K_XL,
+Qwen3-Embedding-0.6B-f16, Qwen3.5-0.8B-MTP-Q8_0); **6 of 6** Gemma 4 E4B
+sidecar tests (`MTPE4BSidecarTest`, gemma-4-E4B-it-Q4_K_M plus
+mtp-gemma-4-E4B-it-Q8_0). The Qwen 3.8 sidecar pair was not on disk, so
+`MTPSidecarTest` was not run; `rpc_live` was not re-run at this build.
+
 ## v0.8.53
 
 llama.cpp bumped to `a894dae93`
