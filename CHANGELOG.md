@@ -1,5 +1,75 @@
 # Changelog
 
+## v0.8.55
+
+llama.cpp bumped to `e117148a4`
+([`b11424`](https://github.com/ggml-org/llama.cpp/releases/tag/b11424)+1),
+169 commits from `c85b92c69` (b11256). Unlike v0.8.54 this one breaks the
+build: #29601 finishes the `llama_batch_ext` migration in `common/` and removes
+`common_speculative_process(spec, const llama_batch &)`,
+`common_batch_from_llama_batch`, `common_batch_add(llama_batch &, ...)` and
+`common_batch_clear(llama_batch &)`. The MTP loop called all three kinds.
+Other header changes are additive: `speculative.h` gains
+`common_speculative_are_compatible` and opt-in probabilistic-draft fields on
+`common_speculative_draft_params` (`result_q`, `temp`, `seed`, #27694; unset
+leaves drafting greedy, as before), and `ggml-backend.h` gains
+`ggml_backend_buft_alloc_buffer_n` / `ggml_backend_buft_get_alloc_size_n`
+(#23671). `llama_model_default_params` / `llama_context_default_params` are
+unchanged. RPC protocol stays at 7.0.0.
+
+### Changed
+
+- Speculative decoding / MTP: the NIF still decodes the target through
+  `llama_decode`, so the logits-index bounds that `decode_tracked` records stay
+  exact. The batch it just decoded is mirrored into a reused `common_batch` for
+  `common_speculative_process`. A local `batch_push` replaces the removed
+  `common_batch_add` at the prefill, verify and rollback re-decode sites.
+  Behaviour is unchanged; MTP (single-file and Gemma 4 E4B sidecar) is
+  re-verified below. Upstream also stops accepting draft tokens at EOG (#29638)
+  and keeps the original batch order for speculative layer inputs (#29019).
+- State save/restore: `LLAMA_STATE_SEQ_VERSION` 3 → 4 and
+  `LLAMA_SESSION_VERSION` 10 → 11, because saved state now records the exact
+  KV-cache rotation metadata (#28498). Blobs from
+  `Context.state_seq_get_data/2` on an earlier release are rejected by
+  `state_seq_set_data/3`. The server's prompt cache lives in RAM only, so it is
+  unaffected.
+- GGUF hardening: integer-overflow fixes (#29384), tensor sizes that wrap
+  after padding are rejected (#26979), and `get_rows_back` checks row bounds
+  (#29575).
+- Loading: direct-io no longer makes a second full-size copy of each tensor
+  (#29749).
+- Chat / Jinja: LLM-jp-4.1 Harmony dialect (#29681), `json_schema` honoured by
+  the Ling 3.0 parser (#29813), a PEG parser fix that resets `current_tool`
+  (#29942), and Jinja coerced array attributes (#29574).
+- Models: GLM-5.3-Flash (#27773), Qwen4Exp MTP (#29761), LFM2.5-Encoder
+  (#29862), `classifier_pooling` for rerankers (#29627), MiMo DFlash (#29650),
+  and PLaMo-2/3 BOS/EOS handling (#29734, #29580).
+- Metal: tensor-API flash attention for F16 KV (#29570), few-row MMA mat-mul
+  (#29869), bf16 math for MXFP4 mat-mul (#29770), and temporary private
+  transfer buffers are now released (#29777).
+- CUDA: shared experts fused into MMVQ (#29184), MMVF for thin f16/bf16
+  mat-mul (#29633), an MMQ memory-fault fix for `n_expert >> n_ubatch`
+  (#29941), and a fix for transposed `cpy` corrupting a non-contiguous dst
+  (#27663).
+- CPU: BF16 `src1` in `mul_mat` (#28937), BF16/FP16/FP32 K tails in tinyBLAS
+  on x86 (#29806), BF16 unary/GLU/binary/scale ops (#29675), and a fix for
+  `soft_max_back` when dst aliases src1 (#27096).
+
+All three upstream defects listed in `docs/release-guide.md` still stand at
+this build (source diff). `ggml-cpu/CMakeLists.txt` is untouched. The RPC diff
+only adds `NULL` `alloc_buffer_n`/`get_alloc_size_n` slots, so
+`set_tensor_2d`/`get_tensor_2d` are still `NULL` and
+`ggml_backend_rpc_start_server` is unchanged. The `ggml-cuda.cu` diff does not
+touch `ggml_backend_cuda_comm_init`.
+
+Verified on macOS (Metal), M4 Max: default build **430 passed, 157 excluded**
+with no model; **573 passed, 14 excluded** for `--include smoke --include
+embeddings --include slow --include mtp` (Qwen3.5-0.8B-UD-Q8_K_XL,
+Qwen3-Embedding-0.6B-f16, Qwen3.5-0.8B-MTP-Q8_0); **6 of 6** Gemma 4 E4B
+sidecar tests (`MTPE4BSidecarTest`, gemma-4-E4B-it-Q4_K_M plus
+mtp-gemma-4-E4B-it-Q8_0). The Qwen 3.8 sidecar pair was not on disk, so
+`MTPSidecarTest` was not run; `rpc_live` was not re-run at this build.
+
 ## v0.8.54
 
 llama.cpp bumped to `c85b92c69`

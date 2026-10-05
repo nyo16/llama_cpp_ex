@@ -124,6 +124,14 @@ The `ggml-cpu/CMakeLists.txt` diff is #28091 (PCH and unity build, with GCC PCH
 gated to x86) and #28667 (s390x `repack.cpp`); the `-mcpu=native` probe is
 untouched.
 
+Re-checked at `e117148a4` (b11424+1), covering the gap from `c85b92c69` in one
+source diff: still all three. `ggml-cpu/CMakeLists.txt` was not touched. The
+`ggml-rpc.cpp` diff only adds the new `alloc_buffer_n`/`get_alloc_size_n`
+buffer-type slots (#23671), both `NULL`; `ggml_backend_rpc_start_server` and
+the `NULL` `set_tensor_2d`/`get_tensor_2d` hooks are unchanged. The
+`ggml-cuda.cu` diff is MMVQ/MMVF/fusion work plus the same `alloc_buffer_n`
+slots, none of it near `ggml_backend_cuda_comm_init`.
+
 | # | Upstream defect | Our workaround | Still needed? |
 |---|---|---|---|
 | 1 | `GGML_NATIVE=ON` makes ggml's `-mcpu=native` probe resolve to **base ARMv8-A** on Cortex-X925/A725 with GCC 13.3 — silently, with a soft CMake warning and exit 0. Costs every `sdot`/`smmla`/SVE kernel. | `LLAMA_CPU_ARM_ARCH` + `LLAMA_CUDA_ARCH` in the `Makefile`, which must be set together. See [DGX Spark](dgx-spark.md) and [Cross-Platform Builds](cross-platform-builds.md). | `scripts/spark/verify-build-flags.sh` on an aarch64 host. If a default build (no `LLAMA_CPU_ARM_ARCH`) now reports non-zero `sdot`/`smmla`, upstream fixed the probe. |
