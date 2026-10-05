@@ -34,6 +34,7 @@ FINE_RESOURCE(LlamaContext);
 FINE_RESOURCE(LlamaSampler);
 FINE_RESOURCE(LlamaSpeculative);
 FINE_RESOURCE(CancelFlag);
+FINE_RESOURCE(LlamaDecision);
 
 // --- Error atoms ---
 //
@@ -2879,6 +2880,63 @@ json_schema_to_grammar_nif(ErlNifEnv* env, std::string json_str) {
 // Dirty: JSON parsing + grammar construction scale with schema size and can
 // run for milliseconds on real-world schemas.
 FINE_NIF(json_schema_to_grammar_nif, ERL_NIF_DIRTY_JOB_CPU_BOUND);
+
+// --- Decision models (/v1/systemone) ---
+//
+// The engine is a port of upstream's server-decision code, see decision.h.
+
+// The model's "<arch>.decision.type", "" when it is not a decision model.
+// Cheap: two metadata lookups. Elixir needs it before creating the context,
+// whose shape depends on the type.
+std::string decision_model_type(ErlNifEnv* env, fine::ResourcePtr<LlamaModel> model) {
+    return decision::model_type(model->model);
+}
+FINE_NIF(decision_model_type, 0);
+
+std::variant<fine::Ok<fine::ResourcePtr<LlamaDecision>>, fine::Error<std::string>>
+decision_init(ErlNifEnv* env, fine::ResourcePtr<LlamaContext> ctx) {
+    try {
+        return fine::Ok(fine::make_resource<LlamaDecision>(ctx));
+    } catch (const std::exception& e) {
+        return fine::Error(std::string(e.what()));
+    }
+}
+// Dirty: tokenizes up to 702 label codes (lev, nimble) and parses the template.
+FINE_NIF(decision_init, ERL_NIF_DIRTY_JOB_CPU_BOUND);
+
+// The request is untrusted JSON. nlohmann's parser and the port's own
+// sort/replace/render walks all recurse on its nesting, so depth is C-stack
+// depth; bound it before parsing, as json_schema_to_grammar_nif does. The size
+// bound is generous: the prompt has to fit in n_ctx anyway, this only stops a
+// pathological binary before it is copied and parsed.
+static constexpr size_t kMaxDecisionRequestBytes = 16u << 20; // 16 MiB
+static constexpr int    kMaxDecisionRequestDepth = 64;
+
+std::variant<fine::Ok<std::string>, fine::Error<std::string>>
+decision_decide(ErlNifEnv* env, fine::ResourcePtr<LlamaDecision> dec, std::string request) {
+    if (request.size() > kMaxDecisionRequestBytes) {
+        return fine::Error(std::string("request too large"));
+    }
+    if (json_nesting_depth(request) > kMaxDecisionRequestDepth) {
+        return fine::Error(std::string("request nested too deeply"));
+    }
+
+    // The engine decodes on this context through llama_process, not
+    // decode_tracked, so whatever batch shape the context last recorded no
+    // longer describes its logits. Drop it before and after, so
+    // sampler_sample_at/3 on this context raises instead of reading a row the
+    // engine has reused.
+    dec->ctx->forget_batch();
+    try {
+        std::string response = dec->engine.decide(request);
+        dec->ctx->forget_batch();
+        return fine::Ok(std::move(response));
+    } catch (const std::exception& e) {
+        dec->ctx->forget_batch();
+        return fine::Error(std::string(e.what()));
+    }
+}
+FINE_NIF(decision_decide, ERL_NIF_DIRTY_JOB_CPU_BOUND);
 
 // --- Init ---
 

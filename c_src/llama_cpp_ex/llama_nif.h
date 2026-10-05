@@ -4,6 +4,7 @@
 #include <llama.h>
 #include "chat.h"
 #include "speculative.h"
+#include "decision.h"
 #include <atomic>
 #include <vector>
 
@@ -238,6 +239,25 @@ public:
 
     LlamaSpeculative(const LlamaSpeculative&) = delete;
     LlamaSpeculative& operator=(const LlamaSpeculative&) = delete;
+};
+
+// A decision engine bound to the context it evaluates on. The ResourcePtr keeps
+// the context (and through it the model, whose vocab and template the engine
+// holds raw pointers into) alive for as long as the engine is.
+//
+// Same single-process invariant as LlamaContext: decide mutates the context's
+// memory and reusable batch, so one engine must never be driven by two
+// processes at once.
+class LlamaDecision {
+public:
+    fine::ResourcePtr<LlamaContext> ctx;
+    decision::Engine engine;
+
+    explicit LlamaDecision(fine::ResourcePtr<LlamaContext> c)
+        : ctx(std::move(c)), engine(ctx->ctx) {}
+
+    LlamaDecision(const LlamaDecision&) = delete;
+    LlamaDecision& operator=(const LlamaDecision&) = delete;
 };
 
 } // namespace llama_cpp_ex

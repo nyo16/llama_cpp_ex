@@ -260,6 +260,7 @@ defmodule LlamaCppEx.MixProject do
           LlamaCppEx.Tokenizer,
           LlamaCppEx.Chat,
           LlamaCppEx.Embedding,
+          LlamaCppEx.Decision,
           LlamaCppEx.Grammar,
           LlamaCppEx.Schema,
           LlamaCppEx.Server,

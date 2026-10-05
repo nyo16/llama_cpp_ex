@@ -20,6 +20,7 @@ Built with C++ NIFs using [fine](https://github.com/elixir-nx/fine) for ergonomi
 - Grammar-constrained generation (GBNF)
 - Structured output via JSON Schema (auto-converted to GBNF grammar)
 - Optional Ecto schema to JSON Schema conversion
+- **Decision models** — typed choice/score/yes-no answers with probabilities and confidence, in one forward pass (llama.cpp's `/v1/systemone` API, in-process)
 - Continuous batching server for concurrent inference
 - **Multi-model manager** — keep several models resident, route requests by id, with a placement-aware (per-GPU VRAM) memory budget
 - **Device introspection** — `LlamaCppEx.devices/0` lists GPUs/accelerators with per-device VRAM
@@ -296,6 +297,48 @@ schema = LlamaCppEx.Schema.to_json_schema(MyApp.Person)
 ```
 
 Supported Ecto types: `:string`, `:integer`, `:float`, `:decimal`, `:boolean`, `:map`, `{:array, inner}`, `:date`, `:utc_datetime`, `:naive_datetime`, and embedded schemas (`embeds_one`/`embeds_many`). Fields `:id`, `:inserted_at`, and `:updated_at` are excluded automatically.
+
+## Decision Models
+
+A decision model answers typed questions about a `state` in one forward pass, with no token generated: each answer is a probability distribution, so it comes with a confidence instead of free text. `LlamaCppEx.Decision` is llama-server's [`/v1/systemone`](https://github.com/ggml-org/llama.cpp/blob/master/tools/server/README.md#post-v1systemone-typesafe-compatible-system-one-api) endpoint (TypeSafe-compatible System One API) ported into the NIF. It builds the same prompts and returns the same answers; checked against upstream `llama-server` on tinylaya, tinyopenjev, Julia-1 and Clef-Flash, with identical token counts and probabilities equal to 1e-6.
+
+```elixir
+{:ok, model} = LlamaCppEx.load_model("Laya-Q8_0.gguf", n_gpu_layers: -1)
+{:ok, decision} = LlamaCppEx.Decision.new(model)
+
+{:ok, %{answers: answers}} =
+  LlamaCppEx.Decision.decide(
+    decision,
+    "Customer message: I was charged twice for my order last week.",
+    route: [
+      type: :choice,
+      instructions: "Which team should handle this?",
+      criteria: [billing: "payments and refunds", shipping: nil, technical: nil]
+    ],
+    angry: [type: :noul, instructions: "Is the customer angry?"],
+    urgency: [
+      type: :score,
+      instructions: "How urgent is this?",
+      criteria: ["can wait", "this week", "today", "right now"]
+    ]
+  )
+
+# Laya-Q8_0, rounded:
+answers.route
+# => %{type: :choice, choice: :billing, confidence: 0.988,
+#      probabilities: %{billing: 0.992, shipping: 0.005, technical: 0.003}}
+answers.angry   # => %{type: :noul, noul: 0.812}
+answers.urgency # => %{type: :score, score: 1.153, confidence: 0.811,
+                #      legend: %{0 => "can wait", 1 => "this week", ...},
+                #      probabilities: %{0 => 0.018, 1 => 0.888, 2 => 0.018, 3 => 0.077}}
+
+# One-off: creates the decision context for this call only
+{:ok, result} = LlamaCppEx.decide(model, state, questions)
+```
+
+The model file declares its decision type; `LlamaCppEx.Decision.model_type/1` reads it. All six upstream types are supported: `openjev`, `lev`, `nimble` (label logits), `kev` (hidden-state dot product), `laya` (ModernBERT encoder) and `clef` (all questions decided jointly in one prompt). ggml-org publishes them in its "Decision models" Hugging Face collection, e.g. [`ggml-org/Laya-GGUF`](https://huggingface.co/ggml-org/Laya-GGUF), [`ggml-org/Clef-Flash-GGUF`](https://huggingface.co/ggml-org/Clef-Flash-GGUF), [`ggml-org/OpenJev-GGUF`](https://huggingface.co/ggml-org/OpenJev-GGUF).
+
+Limits: text only (upstream's image input needs libmtmd, which this build does not link), laya and clef evaluate the whole prompt in one batch (`:n_batch`, 2048 by default), and a `%Decision{}` is single-process like a `Context`.
 
 ## Lower-level API
 
@@ -1083,7 +1126,8 @@ Elixir API (lib/)
     │
 LlamaCppEx.NIF (@on_load, stubs)
     │
-C++ NIF layer (c_src/) — fine.hpp for RAII + type encoding
+C++ NIF layer (c_src/) — fine.hpp for RAII + type encoding;
+    │                    decision.cpp ports llama-server's /v1/systemone
     │
 llama.cpp static libs (vendor/llama.cpp, built via CMake)
     │

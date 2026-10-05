@@ -17,6 +17,35 @@ leaves drafting greedy, as before), and `ggml-backend.h` gains
 (#23671). `llama_model_default_params` / `llama_context_default_params` are
 unchanged. RPC protocol stays at 7.0.0.
 
+### Added
+
+- **Decision models** (`LlamaCppEx.Decision`, `LlamaCppEx.decide/4`):
+  llama-server's `/v1/systemone` (TypeSafe-compatible System One) endpoint,
+  added upstream in #29818, #29831, #29844 and #29969, ported into the NIF. A
+  decision model answers typed `choice` / `score` / `noul` questions about a
+  state in one forward pass per prompt and returns probabilities and a
+  confidence, not text. All six upstream types work: openjev, lev, nimble
+  (label logits), kev (hidden-state dot product), laya (ModernBERT encoder)
+  and clef (all questions decided jointly through
+  `llama_batch_ext_set_decision_order`). `c_src/llama_cpp_ex/decision.cpp` is
+  a line-for-line port of `tools/server/server-decision.cpp` plus the decision
+  paths of `server-context.cpp`, which this build does not compile. Upstream's
+  slots are replaced by one context, which decodes the questions' shared
+  prompt prefix once on seq 0 and copies it to seq 1 for each question; a
+  whole-sequence copy also works on hybrid models (openjev is Qwen 3.5-based).
+  Not ported: image input, which needs libmtmd.
+
+  Checked against upstream `llama-server` built from the same commit, on the
+  same requests: tinylaya and tinyopenjev (upstream's test models), Julia-1
+  (laya) and Clef-Flash Q4_K_M (clef). Token counts are identical and every
+  probability agrees to within 1e-6, as do the error messages for upstream's
+  invalid-request cases. `test/decision_test.exs` runs on the tiny models under
+  a new `:decision` tag (`LLAMA_SMOKE_DECISION_LAYA_MODEL`,
+  `LLAMA_SMOKE_DECISION_OPENJEV_MODEL`), and CI's inference job now downloads
+  both models (revision-pinned) and runs it. `scripts/decision_compare.exs`
+  repeats the upstream comparison; `docs/release-guide.md` now has a step for
+  re-porting the decision code on a bump.
+
 ### Changed
 
 - Speculative decoding / MTP: the NIF still decodes the target through
@@ -62,13 +91,16 @@ only adds `NULL` `alloc_buffer_n`/`get_alloc_size_n` slots, so
 `ggml_backend_rpc_start_server` is unchanged. The `ggml-cuda.cu` diff does not
 touch `ggml_backend_cuda_comm_init`.
 
-Verified on macOS (Metal), M4 Max: default build **430 passed, 157 excluded**
+Verified on macOS (Metal), M4 Max: default build **430 passed, 169 excluded**
 with no model; **573 passed, 14 excluded** for `--include smoke --include
 embeddings --include slow --include mtp` (Qwen3.5-0.8B-UD-Q8_K_XL,
 Qwen3-Embedding-0.6B-f16, Qwen3.5-0.8B-MTP-Q8_0); **6 of 6** Gemma 4 E4B
 sidecar tests (`MTPE4BSidecarTest`, gemma-4-E4B-it-Q4_K_M plus
 mtp-gemma-4-E4B-it-Q8_0). The Qwen 3.8 sidecar pair was not on disk, so
-`MTPSidecarTest` was not run; `rpc_live` was not re-run at this build.
+`MTPSidecarTest` was not run; `rpc_live` was not re-run at this build. With
+the decision tests: **12 of 12** under `--include decision` (tinylaya,
+tinyopenjev), and **585 passed, 14 excluded** for the model run above plus
+`--include decision`.
 
 ## v0.8.54
 

@@ -21,6 +21,10 @@
 #                 belong in a green run. See test/mtp_model_test.exs.
 #   :slow       — long-running comparison matrices (F16 vs Q8_0 KV cache);
 #                 needs LLAMA_SMOKE_GEN_MODEL
+#   :decision   — decision models (LlamaCppEx.Decision); needs both
+#                 LLAMA_SMOKE_DECISION_LAYA_MODEL and
+#                 LLAMA_SMOKE_DECISION_OPENJEV_MODEL (upstream's tinylaya and
+#                 tinyopenjev test models, one per readout).
 #   :rpc_live   — needs a *reachable RPC worker*, not just a model: set
 #                 LLAMA_RPC_ENDPOINT to "host:port". Excluded automatically when
 #                 that variable is unset, so `--include rpc_live` without a
@@ -78,6 +82,11 @@
 #   LLAMA_RPC=1 mix compile
 #   LLAMA_RPC_ENDPOINT=10.100.64.2:50052 mix test --include rpc_live
 #
+#   GGML_METAL_NO_RESIDENCY=1 \
+#   LLAMA_SMOKE_DECISION_LAYA_MODEL=/path/to/tinylaya-for-testing-Q8_0.gguf \
+#   LLAMA_SMOKE_DECISION_OPENJEV_MODEL=/path/to/tinyopenjev-for-testing-Q8_0.gguf \
+#     mix test --include decision
+#
 # `GGML_METAL_NO_RESIDENCY=1` is only needed on Metal, and only to keep the VM
 # from aborting *after* the suite has passed:
 #
@@ -103,4 +112,6 @@ Code.require_file("support/test_slots.exs", __DIR__)
 # default run quiet, and rpc_test.exs additionally carries a compile-time `skip:`
 # so an explicit `--include rpc_live` without a worker skips rather than fails
 # (`--include` beats `--exclude`, so the exclusion alone cannot do that).
-ExUnit.start(exclude: [:smoke, :embeddings, :slow, :mtp, :mtp_cancel, :mtp_sidecar, :rpc_live])
+ExUnit.start(
+  exclude: [:smoke, :embeddings, :slow, :mtp, :mtp_cancel, :mtp_sidecar, :decision, :rpc_live]
+)
