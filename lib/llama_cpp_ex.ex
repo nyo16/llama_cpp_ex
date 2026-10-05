@@ -24,6 +24,7 @@ defmodule LlamaCppEx do
     * `LlamaCppEx.Sampler` - Token sampling configuration
     * `LlamaCppEx.Tokenizer` - Text tokenization and detokenization
     * `LlamaCppEx.Embedding` - Embedding generation
+    * `LlamaCppEx.Decision` - Typed decisions with a decision model
 
   """
 
@@ -32,6 +33,7 @@ defmodule LlamaCppEx do
     ChatCompletion,
     ChatCompletionChunk,
     Context,
+    Decision,
     Embedding,
     Generator,
     Grammar,
@@ -848,5 +850,22 @@ defmodule LlamaCppEx do
           {:ok, [Embedding.t()]} | {:error, String.t()}
   def embed_batch(%Model{} = model, texts, opts \\ []) do
     Embedding.embed_batch(model, texts, opts)
+  end
+
+  @doc """
+  Answers typed questions about `state` with a decision model.
+
+  Creates a `LlamaCppEx.Decision` (and its context) for this one call. To send
+  several requests, create it once with `LlamaCppEx.Decision.new/2` and call
+  `LlamaCppEx.Decision.decide/3` on it. See `LlamaCppEx.Decision` for the shape
+  of `state`, `questions` and the answers, and `LlamaCppEx.Decision.new/2` for
+  options.
+  """
+  @spec decide(Model.t(), term(), Decision.questions(), keyword()) ::
+          {:ok, Decision.result()} | {:error, String.t()}
+  def decide(%Model{} = model, state, questions, opts \\ []) do
+    with {:ok, decision} <- Decision.new(model, opts) do
+      Decision.decide(decision, state, questions)
+    end
   end
 end

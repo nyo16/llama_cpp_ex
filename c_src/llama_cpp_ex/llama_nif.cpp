@@ -34,6 +34,7 @@ FINE_RESOURCE(LlamaContext);
 FINE_RESOURCE(LlamaSampler);
 FINE_RESOURCE(LlamaSpeculative);
 FINE_RESOURCE(CancelFlag);
+FINE_RESOURCE(LlamaDecision);
 
 // --- Error atoms ---
 //
@@ -122,6 +123,33 @@ static int decode_tracked(LlamaContext& c, const llama_batch& batch) {
         c.record_batch(batch);
     }
     return ret;
+}
+
+// Append one single-sequence entry to a batch from llama_batch_init(n, 0, 1).
+// Stands in for common_batch_add(llama_batch&, ...), which upstream removed in
+// 60e9cf7a7 along with the rest of the legacy-batch helpers in common/.
+static void batch_push(llama_batch& b, llama_token id, llama_pos pos,
+                       llama_seq_id seq_id, bool logits) {
+    const int32_t i = b.n_tokens++;
+    b.token[i]     = id;
+    b.pos[i]       = pos;
+    b.n_seq_id[i]  = 1;
+    b.seq_id[i][0] = seq_id;
+    b.logits[i]    = logits;
+}
+
+// common_speculative_process only takes a common_batch since 60e9cf7a7; the
+// llama_batch overload is gone. The MTP path still decodes the target through
+// decode_tracked (llama_decode), so the spec is fed a mirror of that same batch
+// rather than a second, separately-built one that could drift from it. `mirror`
+// is reused across calls; clear() keeps its allocation.
+static bool speculative_process(common_speculative* spec, common_batch& mirror,
+                                const llama_batch& b) {
+    mirror.clear();
+    for (int32_t i = 0; i < b.n_tokens; i++) {
+        mirror.add(b.token[i], b.pos[i], b.seq_id[i][0], b.logits[i] != 0);
+    }
+    return common_speculative_process(spec, mirror);
 }
 
 // Same rationale as check_seq_id: an out-of-range logits index is a caller bug,
@@ -2179,6 +2207,7 @@ fine::Ok<> generate_mtp_tokens(
     // prefill position; upstream's examples/speculative-simple now passes false
     // for the whole prompt. We ask for logits on the final prompt token only,
     // because we sample the first generated token from them below.
+    common_batch spec_batch(ctx_tgt);
     int n_batch = llama_n_batch(ctx_tgt);
     llama_pos n_past = 0;
     for (size_t i = 0; i < prompt.size(); i += n_batch) {
@@ -2189,8 +2218,8 @@ fine::Ok<> generate_mtp_tokens(
         BatchFreeGuard batch_guard(batch);
         for (int j = 0; j < n; j++) {
             const bool want_logits = is_last_chunk && j == n - 1;
-            common_batch_add(batch, prompt[i + j], static_cast<llama_pos>(i + j),
-                             { seq_id }, want_logits);
+            batch_push(batch, prompt[i + j], static_cast<llama_pos>(i + j),
+                       seq_id, want_logits);
         }
 
         int ret = decode_tracked(*sp.ctx_tgt, batch);
@@ -2198,7 +2227,7 @@ fine::Ok<> generate_mtp_tokens(
             send_error("prompt decode failed: code=" + std::to_string(ret));
             return fine::Ok();
         }
-        bool proc_ok = common_speculative_process(sp.spec, batch);
+        bool proc_ok = speculative_process(sp.spec, spec_batch, batch);
         if (!proc_ok) {
             fprintf(stderr,
                 "MTP prefill: common_speculative_process returned false "
@@ -2395,11 +2424,10 @@ fine::Ok<> generate_mtp_tokens(
         const int n_verify = 1 + static_cast<int>(drafts.size());
         llama_batch batch = llama_batch_init(n_verify, 0, 1);
         BatchFreeGuard batch_guard(batch);
-        common_batch_add(batch, sampled, n_past, { seq_id }, true);
+        batch_push(batch, sampled, n_past, seq_id, true);
         for (size_t i = 0; i < drafts.size(); i++) {
-            common_batch_add(batch, drafts[i],
-                             n_past + 1 + static_cast<llama_pos>(i),
-                             { seq_id }, true);
+            batch_push(batch, drafts[i],
+                       n_past + 1 + static_cast<llama_pos>(i), seq_id, true);
         }
 
         // 2b. Roll the draft ctx back to n_past so common_speculative_process
@@ -2424,7 +2452,7 @@ fine::Ok<> generate_mtp_tokens(
                 send_error("verify decode failed: code=" + std::to_string(ret));
                 return fine::Ok();
             }
-            if (!common_speculative_process(sp.spec, batch)) {
+            if (!speculative_process(sp.spec, spec_batch, batch)) {
                 send_error("common_speculative_process failed");
                 return fine::Ok();
             }
@@ -2537,10 +2565,9 @@ fine::Ok<> generate_mtp_tokens(
                     for (int i = 0; i < n_accepted_total; i++) {
                         llama_token tok =
                             prompt[prompt.size() - n_accepted_total - 1 + i];
-                        common_batch_add(redo, tok,
-                                         n_past + static_cast<llama_pos>(i),
-                                         { seq_id },
-                                         /*logits=*/ i == n_accepted_total - 1);
+                        batch_push(redo, tok,
+                                   n_past + static_cast<llama_pos>(i), seq_id,
+                                   /*logits=*/ i == n_accepted_total - 1);
                     }
                     int ret = decode_tracked(*sp.ctx_tgt, redo);
                     if (ret != 0) {
@@ -2853,6 +2880,63 @@ json_schema_to_grammar_nif(ErlNifEnv* env, std::string json_str) {
 // Dirty: JSON parsing + grammar construction scale with schema size and can
 // run for milliseconds on real-world schemas.
 FINE_NIF(json_schema_to_grammar_nif, ERL_NIF_DIRTY_JOB_CPU_BOUND);
+
+// --- Decision models (/v1/systemone) ---
+//
+// The engine is a port of upstream's server-decision code, see decision.h.
+
+// The model's "<arch>.decision.type", "" when it is not a decision model.
+// Cheap: two metadata lookups. Elixir needs it before creating the context,
+// whose shape depends on the type.
+std::string decision_model_type(ErlNifEnv* env, fine::ResourcePtr<LlamaModel> model) {
+    return decision::model_type(model->model);
+}
+FINE_NIF(decision_model_type, 0);
+
+std::variant<fine::Ok<fine::ResourcePtr<LlamaDecision>>, fine::Error<std::string>>
+decision_init(ErlNifEnv* env, fine::ResourcePtr<LlamaContext> ctx) {
+    try {
+        return fine::Ok(fine::make_resource<LlamaDecision>(ctx));
+    } catch (const std::exception& e) {
+        return fine::Error(std::string(e.what()));
+    }
+}
+// Dirty: tokenizes up to 702 label codes (lev, nimble) and parses the template.
+FINE_NIF(decision_init, ERL_NIF_DIRTY_JOB_CPU_BOUND);
+
+// The request is untrusted JSON. nlohmann's parser and the port's own
+// sort/replace/render walks all recurse on its nesting, so depth is C-stack
+// depth; bound it before parsing, as json_schema_to_grammar_nif does. The size
+// bound is generous: the prompt has to fit in n_ctx anyway, this only stops a
+// pathological binary before it is copied and parsed.
+static constexpr size_t kMaxDecisionRequestBytes = 16u << 20; // 16 MiB
+static constexpr int    kMaxDecisionRequestDepth = 64;
+
+std::variant<fine::Ok<std::string>, fine::Error<std::string>>
+decision_decide(ErlNifEnv* env, fine::ResourcePtr<LlamaDecision> dec, std::string request) {
+    if (request.size() > kMaxDecisionRequestBytes) {
+        return fine::Error(std::string("request too large"));
+    }
+    if (json_nesting_depth(request) > kMaxDecisionRequestDepth) {
+        return fine::Error(std::string("request nested too deeply"));
+    }
+
+    // The engine decodes on this context through llama_process, not
+    // decode_tracked, so whatever batch shape the context last recorded no
+    // longer describes its logits. Drop it before and after, so
+    // sampler_sample_at/3 on this context raises instead of reading a row the
+    // engine has reused.
+    dec->ctx->forget_batch();
+    try {
+        std::string response = dec->engine.decide(request);
+        dec->ctx->forget_batch();
+        return fine::Ok(std::move(response));
+    } catch (const std::exception& e) {
+        dec->ctx->forget_batch();
+        return fine::Error(std::string(e.what()));
+    }
+}
+FINE_NIF(decision_decide, ERL_NIF_DIRTY_JOB_CPU_BOUND);
 
 // --- Init ---
 

@@ -133,7 +133,7 @@ end
 defmodule LlamaCppEx.MixProject do
   use Mix.Project
 
-  @version "0.8.54"
+  @version "0.8.55"
   @source_url "https://github.com/nyo16/llama_cpp_ex"
 
   def project do
@@ -260,6 +260,7 @@ defmodule LlamaCppEx.MixProject do
           LlamaCppEx.Tokenizer,
           LlamaCppEx.Chat,
           LlamaCppEx.Embedding,
+          LlamaCppEx.Decision,
           LlamaCppEx.Grammar,
           LlamaCppEx.Schema,
           LlamaCppEx.Server,

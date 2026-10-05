@@ -40,13 +40,14 @@ Re-derive the header list if you add an include -- a hand-kept list drifts, and
 that is exactly how the `common/speculative.h` break below reached a build:
 
 ```bash
-grep -hoE '^#include [<"](llama|ggml|chat|json-schema|speculative)[^">]*' \
+grep -hoE '^#include [<"](llama|ggml|chat|common|json|speculative|\.\./)[^">]*' \
   c_src/llama_cpp_ex/*.cpp c_src/llama_cpp_ex/*.h | sort -u
 ```
 
 ```bash
-for h in include/llama.h \
+for h in include/llama.h src/llama-ext.h \
          ggml/include/ggml-backend.h ggml/include/ggml-rpc.h \
+         common/common.h common/json.h \
          common/chat.h common/json-schema-to-grammar.h common/speculative.h; do
   echo "##### $h"
   git -C vendor/llama.cpp diff <old-commit>..<new-commit> -- "$h"
@@ -83,6 +84,35 @@ The NIF uses these key APIs (grep `llama_nif.cpp` for the full list):
 - `ggml_backend_rpc_add_server`, `ggml_backend_rpc_start_server` — RPC backend
 
 If any signatures changed, update `c_src/llama_cpp_ex/llama_nif.cpp` and/or `llama_nif.h`.
+
+### Decision engine port
+
+`c_src/llama_cpp_ex/decision.cpp` is a port of upstream code this build does not
+compile: `tools/server/server-decision.{h,cpp}` (parsing, prompts, answers) and
+the decision paths of `tools/server/server-context.cpp` (`send_decision`, the
+"outputs of a decision are read from one batch" rules, the `/v1/systemone`
+handler). It also mirrors the decision branch of `common_init_result` in
+`common/common.cpp`, which decides the context shape, and uses
+`llama_decision_order` from `src/llama-ext.h`, a staging header outside
+`include/`. None of this is a public API, so a bump can change it with no
+header break and the port keeps compiling against the old behaviour. Diff it:
+
+```bash
+git -C vendor/llama.cpp diff <old-commit>..<new-commit> -- \
+  tools/server/server-decision.h tools/server/server-decision.cpp \
+  src/llama-ext.h
+git -C vendor/llama.cpp log --oneline <old-commit>..<new-commit> -- \
+  tools/server/server-context.cpp common/common.cpp | grep -i -E 'decision|systemone'
+```
+
+Ported functions carry their upstream name in a trailing comment
+(`// server_decision_context::format_answer`), so a hunk maps to one function.
+Port every change except image input (libmtmd is not linked), update the
+"Ported at" commit at the top of `decision.cpp`, then check the result against
+upstream's own server with `scripts/decision_compare.exs` (its header has the
+build and serve commands) on tinylaya, tinyopenjev and any decision model on
+disk. A new decision *type* is a new branch in `init`, in `@types` in
+`lib/llama_cpp_ex/decision.ex`, and in the two type lists beside it.
 
 ### Upstream defects we work around
 
@@ -123,6 +153,14 @@ revert) and #26454 (gfx90c), none of them near `ggml_backend_cuda_comm_init`.
 The `ggml-cpu/CMakeLists.txt` diff is #28091 (PCH and unity build, with GCC PCH
 gated to x86) and #28667 (s390x `repack.cpp`); the `-mcpu=native` probe is
 untouched.
+
+Re-checked at `e117148a4` (b11424+1), covering the gap from `c85b92c69` in one
+source diff: still all three. `ggml-cpu/CMakeLists.txt` was not touched. The
+`ggml-rpc.cpp` diff only adds the new `alloc_buffer_n`/`get_alloc_size_n`
+buffer-type slots (#23671), both `NULL`; `ggml_backend_rpc_start_server` and
+the `NULL` `set_tensor_2d`/`get_tensor_2d` hooks are unchanged. The
+`ggml-cuda.cu` diff is MMVQ/MMVF/fusion work plus the same `alloc_buffer_n`
+slots, none of it near `ggml_backend_cuda_comm_init`.
 
 | # | Upstream defect | Our workaround | Still needed? |
 |---|---|---|---|

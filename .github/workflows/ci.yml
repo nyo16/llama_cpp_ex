@@ -33,6 +33,14 @@ env:
   EMB_MODEL_REPO: ggml-org/bge-small-en-v1.5-Q8_0-GGUF
   EMB_MODEL_REV: f2068edd9b54f2a369549ccc71f70ed273a2a801
   EMB_MODEL_FILE: bge-small-en-v1.5-q8_0.gguf
+  # Upstream's own decision test models (93 MB + 44 MB), one per readout:
+  # tinylaya reads the embeddings output, tinyopenjev reads label logits.
+  DECISION_LAYA_REPO: ggml-org/tinylaya-for-testing-gguf
+  DECISION_LAYA_REV: db8373bdf1621f95b7db9eb0444539e1facbec96
+  DECISION_LAYA_FILE: tinylaya-for-testing-Q8_0.gguf
+  DECISION_OPENJEV_REPO: ggml-org/tinyopenjev-for-testing-gguf
+  DECISION_OPENJEV_REV: 953e44649ca8a71e5a8eee4676edebff2a45b2a2
+  DECISION_OPENJEV_FILE: tinyopenjev-for-testing-Q8_0.gguf
 
 jobs:
   setup:
@@ -382,14 +390,14 @@ jobs:
           key: ${{ needs.setup.outputs.cache-key }}
           fail-on-cache-miss: true
 
-      # Both URLs are revision-pinned so a repo re-upload cannot silently change
-      # what CI runs. Total ~181 MB, cached on the pin.
+      # Every URL is revision-pinned so a repo re-upload cannot silently change
+      # what CI runs. Total ~318 MB, cached on the pins.
       - name: Cache GGUF models
         id: models
         uses: actions/cache@v5
         with:
           path: models
-          key: gguf-${{ env.GEN_MODEL_REV }}-${{ env.EMB_MODEL_REV }}
+          key: gguf-${{ env.GEN_MODEL_REV }}-${{ env.EMB_MODEL_REV }}-${{ env.DECISION_LAYA_REV }}-${{ env.DECISION_OPENJEV_REV }}
 
       - name: Download GGUF models
         if: steps.models.outputs.cache-hit != 'true'
@@ -399,6 +407,10 @@ jobs:
             "https://huggingface.co/${GEN_MODEL_REPO}/resolve/${GEN_MODEL_REV}/${GEN_MODEL_FILE}"
           curl -fsSL --retry 3 -o "models/${EMB_MODEL_FILE}" \
             "https://huggingface.co/${EMB_MODEL_REPO}/resolve/${EMB_MODEL_REV}/${EMB_MODEL_FILE}"
+          curl -fsSL --retry 3 -o "models/${DECISION_LAYA_FILE}" \
+            "https://huggingface.co/${DECISION_LAYA_REPO}/resolve/${DECISION_LAYA_REV}/${DECISION_LAYA_FILE}"
+          curl -fsSL --retry 3 -o "models/${DECISION_OPENJEV_FILE}" \
+            "https://huggingface.co/${DECISION_OPENJEV_REPO}/resolve/${DECISION_OPENJEV_REV}/${DECISION_OPENJEV_FILE}"
 
       # This is the job the audit says the repo was missing: CI compiled the
       # 2100-line NIF but never ran a single forward pass, while 61 of 223
@@ -407,13 +419,16 @@ jobs:
       # covers embed/2 and embed_batch/2; :slow covers the F16-vs-Q8_0 KV
       # quantization matrix, whose 10 cases had never executed anywhere — the
       # tag was excluded by default and included by nothing, even though the
-      # generation model it needs is already cached above.
+      # generation model it needs is already cached above. :decision covers
+      # LlamaCppEx.Decision, the port of upstream's server-decision code.
       - name: Run inference tests
-        run: mix test --include smoke --include embeddings --include slow
+        run: mix test --include smoke --include embeddings --include slow --include decision
         env:
           LLAMA_BACKEND: cpu
           LLAMA_SMOKE_GEN_MODEL: models/SmolLM2-135M-Instruct-Q8_0.gguf
           LLAMA_SMOKE_EMB_MODEL: models/bge-small-en-v1.5-q8_0.gguf
+          LLAMA_SMOKE_DECISION_LAYA_MODEL: models/tinylaya-for-testing-Q8_0.gguf
+          LLAMA_SMOKE_DECISION_OPENJEV_MODEL: models/tinyopenjev-for-testing-Q8_0.gguf
 
       # The taxonomy's invariant, checked rather than trusted: each gate tag must
       # stand alone, because `--include` beats `--exclude` and a test carrying two
@@ -433,3 +448,10 @@ jobs:
         env:
           LLAMA_BACKEND: cpu
           LLAMA_SMOKE_EMB_MODEL: models/bge-small-en-v1.5-q8_0.gguf
+
+      - name: Decision tag runs alone
+        run: mix test --include decision
+        env:
+          LLAMA_BACKEND: cpu
+          LLAMA_SMOKE_DECISION_LAYA_MODEL: models/tinylaya-for-testing-Q8_0.gguf
+          LLAMA_SMOKE_DECISION_OPENJEV_MODEL: models/tinyopenjev-for-testing-Q8_0.gguf

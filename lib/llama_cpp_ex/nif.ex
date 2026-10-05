@@ -209,4 +209,9 @@ defmodule LlamaCppEx.NIF do
 
   # JSON Schema to Grammar
   def json_schema_to_grammar_nif(_json_str), do: :erlang.nif_error(:not_loaded)
+
+  # Decision models (/v1/systemone)
+  def decision_model_type(_model), do: :erlang.nif_error(:not_loaded)
+  def decision_init(_ctx), do: :erlang.nif_error(:not_loaded)
+  def decision_decide(_decision, _request_json), do: :erlang.nif_error(:not_loaded)
 end

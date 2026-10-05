@@ -24,12 +24,26 @@ defmodule LlamaCppEx.TestModels do
     # The assistant sidecar for the same pair — e.g. mtp-gemma-4-E4B-it-Q8_0.gguf.
     # Its own env var because the two files are provisioned independently.
     mtp_e4b_draft:
-      {"LLAMA_SMOKE_MTP_E4B_DRAFT_MODEL", "a Gemma4 E4B MTP sidecar (gemma4-assistant)"}
+      {"LLAMA_SMOKE_MTP_E4B_DRAFT_MODEL", "a Gemma4 E4B MTP sidecar (gemma4-assistant)"},
+    # Decision models, one per readout: laya reads the embeddings output,
+    # openjev reads label logits. Upstream's own test models
+    # (ggml-org/tinylaya-for-testing-gguf, ggml-org/tinyopenjev-for-testing-gguf)
+    # are small enough for CI.
+    decision_laya: {"LLAMA_SMOKE_DECISION_LAYA_MODEL", "a laya decision"},
+    decision_openjev: {"LLAMA_SMOKE_DECISION_OPENJEV_MODEL", "an openjev decision"}
   }
 
   @kinds Map.keys(@vars)
 
-  @type kind :: :gen | :emb | :mtp | :mtp_draft | :mtp_e4b | :mtp_e4b_draft
+  @type kind ::
+          :gen
+          | :emb
+          | :mtp
+          | :mtp_draft
+          | :mtp_e4b
+          | :mtp_e4b_draft
+          | :decision_laya
+          | :decision_openjev
 
   @doc "Name of the environment variable holding the model path for `kind`."
   @spec var(kind()) :: String.t()

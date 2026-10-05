@@ -36,7 +36,7 @@ endif
 # Pinned llama.cpp commit, used when vendor/llama.cpp has to be cloned. MUST
 # match the vendor/llama.cpp submodule; bump both together, see
 # docs/release-guide.md. Override to build the NIF against another revision.
-LLAMA_COMMIT ?= c85b92c69c955961621193cd51da194f3cbcedf3
+LLAMA_COMMIT ?= e117148a41d8e9bedb72e4c6c3f003ab0fe7f857
 
 # The commit actually on disk. A submodule can be bumped without LLAMA_COMMIT
 # following it, and the build has to key off what is really there.
@@ -357,9 +357,11 @@ endif
 # CPU count for parallel builds
 NPROC := $(shell nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 4)
 
-# Sources
-NIF_SRC = c_src/llama_cpp_ex/llama_nif.cpp
-NIF_OBJ = $(BUILD)/llama_nif.o
+# Sources. decision.cpp is the port of upstream's server-decision code, kept in
+# its own translation unit so it can be diffed against upstream on a bump.
+NIF_SRCS = c_src/llama_cpp_ex/llama_nif.cpp c_src/llama_cpp_ex/decision.cpp
+NIF_HDRS = c_src/llama_cpp_ex/llama_nif.h c_src/llama_cpp_ex/decision.h
+NIF_OBJ = $(patsubst c_src/llama_cpp_ex/%.cpp,$(BUILD)/%.o,$(NIF_SRCS))
 
 # Everything downstream depends on the build *configuration*, not only on file
 # timestamps, and three separate rules were blind to it:
@@ -497,9 +499,9 @@ $(LLAMA_CONFIG_STAMP):
 	@touch $@
 
 # Compile NIF
-$(NIF_OBJ): $(NIF_SRC) c_src/llama_cpp_ex/llama_nif.h $(LLAMA_STAMP) $(LLAMA_CONFIG_STAMP)
+$(BUILD)/%.o: c_src/llama_cpp_ex/%.cpp $(NIF_HDRS) $(LLAMA_STAMP) $(LLAMA_CONFIG_STAMP)
 	@mkdir -p $(dir $@)
-	$(CXX) $(CXXFLAGS) -c $(NIF_SRC) -o $@
+	$(CXX) $(CXXFLAGS) -c $< -o $@
 
 # Link NIF - find all static libs from llama.cpp build.
 # The target is the marker, not the .so: see NIF_LINK_STAMP above for why the
