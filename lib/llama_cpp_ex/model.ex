@@ -193,16 +193,23 @@ defmodule LlamaCppEx.Model do
   @spec n_ctx_train(t()) :: integer()
   def n_ctx_train(%__MODULE__{ref: ref}), do: LlamaCppEx.NIF.model_n_ctx_train(ref)
 
-  @doc "Returns the embedding dimension of the model."
+  @doc """
+  Returns the hidden width of the model.
+
+  This is not always the length of the vectors `LlamaCppEx.embed/3` returns;
+  see `n_embd_out/1`.
+  """
   @spec n_embd(t()) :: integer()
   def n_embd(%__MODULE__{ref: ref}), do: LlamaCppEx.NIF.model_n_embd(ref)
 
   @doc """
-  Returns the output-side embedding width — the row width an MTP draft head
-  consumes. Usually equal to `n_embd/1`; for `gemma4-assistant` the checkpoint
-  has a small `n_embd` but `n_embd_out` is the target's hidden width. It is a
-  distinct number because `LlamaCppEx.MTP` matches it across the target and a
-  separate drafter GGUF.
+  Returns the output-side embedding width: the length of the vectors
+  `LlamaCppEx.embed/3` returns, and the row width an MTP draft head consumes.
+
+  Usually equal to `n_embd/1`, but not always: embeddinggemma-2 projects its
+  512-wide hidden state to 768-wide embeddings, and `gemma4-assistant` has a
+  small `n_embd` with the target's hidden width here. `LlamaCppEx.MTP` matches
+  it across the target and a separate drafter GGUF.
   """
   @spec n_embd_out(t()) :: integer()
   def n_embd_out(%__MODULE__{ref: ref}), do: LlamaCppEx.NIF.model_n_embd_out(ref)

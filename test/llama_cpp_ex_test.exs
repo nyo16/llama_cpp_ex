@@ -985,10 +985,12 @@ defmodule LlamaCppExTest do
       assert Enum.all?(embedding, &is_float/1)
     end
 
-    test "embedding dimensions match n_embd", %{model: model} do
-      n_embd = LlamaCppEx.Model.n_embd(model)
+    # n_embd_out, not n_embd: embeddinggemma-2 projects 512 -> 768, and sizing
+    # the vector by n_embd silently truncated it.
+    test "embedding dimensions match n_embd_out", %{model: model} do
+      n_embd_out = LlamaCppEx.Model.n_embd_out(model)
       {:ok, embedding} = LlamaCppEx.embed(model, "Test text")
-      assert length(embedding) == n_embd
+      assert length(embedding) == n_embd_out
     end
 
     test "L2-normalized embeddings have unit length", %{model: model} do
@@ -1018,10 +1020,10 @@ defmodule LlamaCppExTest do
       {:ok, embeddings} = LlamaCppEx.embed_batch(model, texts)
 
       assert length(embeddings) == 3
-      n_embd = LlamaCppEx.Model.n_embd(model)
+      n_embd_out = LlamaCppEx.Model.n_embd_out(model)
 
       for emb <- embeddings do
-        assert length(emb) == n_embd
+        assert length(emb) == n_embd_out
         assert Enum.all?(emb, &is_float/1)
       end
     end

@@ -690,13 +690,16 @@ int64_t model_n_embd(ErlNifEnv* env, fine::ResourcePtr<LlamaModel> model) {
 }
 FINE_NIF(model_n_embd, 0);
 
-// Output-side embedding width, which is what the MTP draft head consumes. It is
-// `n_embd` for every architecture in tree today, but upstream reads this one
-// (speculative.cpp: "MTP input row width must match the target h_nextn width")
-// and enforces the target/draft match with a GGML_ASSERT — an unconditional
-// ggml_abort that takes the whole VM down rather than failing the call. A
-// separate drafter GGUF is the only way to reach that assert, so MTP.init/2
-// compares this across the two models before it builds anything.
+// Output-side embedding width: the row width of llama_get_embeddings_* and
+// what an MTP draft head consumes. Equal to `n_embd` for most architectures,
+// but not all — embeddinggemma-2 projects a 512-wide hidden state to 768-wide
+// embeddings, and gemma4-assistant has a small `n_embd` with the target's
+// `n_embd_out`. Upstream reads this one in speculative.cpp ("MTP input row
+// width must match the target h_nextn width") and enforces the target/draft
+// match with a GGML_ASSERT — an unconditional ggml_abort that takes the whole
+// VM down rather than failing the call. A separate drafter GGUF is the only way
+// to reach that assert, so MTP.init/2 compares this across the two models
+// before it builds anything.
 int64_t model_n_embd_out(ErlNifEnv* env, fine::ResourcePtr<LlamaModel> model) {
     return llama_model_n_embd_out(model->model);
 }
@@ -1335,7 +1338,9 @@ get_embeddings(
     int64_t seq_id,
     int64_t normalize)
 {
-    int n_embd = llama_model_n_embd(llama_get_model(ctx->ctx));
+    // llama_context sizes the pooled output by n_embd_out, not n_embd; the two
+    // differ for embeddinggemma-2 (512 -> 768), so n_embd would truncate it.
+    int n_embd = llama_model_n_embd_out(llama_get_model(ctx->ctx));
     enum llama_pooling_type ptype = llama_pooling_type(ctx->ctx);
 
     const float* embd = nullptr;

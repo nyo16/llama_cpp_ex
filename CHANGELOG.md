@@ -1,5 +1,137 @@
 # Changelog
 
+## v0.8.56
+
+llama.cpp bumped to `c479922ac`
+([`b11458`](https://github.com/ggml-org/llama.cpp/releases/tag/b11458)),
+33 commits from `e117148a4` (b11424+1). Header changes are additive:
+`include/llama.h` gains `LLAMA_VOCAB_TYPE_PLAMO3` (#30045), `ggml-backend.h`
+gains `ggml_backend_sched_copy_callback` /
+`ggml_backend_sched_set_copy_callback` (#29943), and `common/common.h` gains
+`COMMON_DECISION_TYPE_PPLX_DECIDER` plus a `common_get_decision_type(const
+std::string &)` overload that reads a GGUF without loading it (#30044,
+#29987). `chat.h`, `json.h`, `json-schema-to-grammar.h`, `speculative.h` and
+`src/llama-ext.h` are byte-identical; `llama_model_default_params` /
+`llama_context_default_params` are unchanged. **`RPC_PROTO_MAJOR_VERSION` is
+7 → 8** (#26610): an `LlamaCppEx.RPC.Server` worker and the client that uses
+it must come from the same build. Upstream versions: llama.cpp 0.6.0, ggml
+0.26.0.
+
+### Added
+
+- **EmbeddingGemma 2** (`google/embeddinggemma-2`, upstream #30054, the
+  `gemma-embedding2` architecture): a 270M text embedder with a 768-wide output
+  projected from a 512-wide backbone, task-prefixed inputs and Matryoshka
+  truncation. Runs through `LlamaCppEx.embed/3` / `embed_batch/3` as is, after
+  the two fixes below that it exposed. ggml-org publishes Q8_0 and BF16
+  (`ggml-org/embeddinggemma-2-GGUF`); its vision/audio `mmproj` files need
+  libmtmd, so this binding is text-only. The README gains an **Embeddings**
+  section with the prefix table, a retrieval example and 256-d truncation,
+  with the numbers measured on the Q8_0 file.
+- **`pplx-decider` decision type** (upstream #30044): the seventh
+  `common_decision_type`, a label-logit readout like lev/nimble with one- or
+  two-letter codes and up to 255 options. Ported into `decision.cpp`
+  (`init`, `fill_task`, `can_share_prompt`, `type_shares_prompt`) and
+  `LlamaCppEx.Decision` (`:pplx_decider` in `@types`, `@shares_prompt` and
+  `decision_type/0`); "Ported at" is now `c479922ac`. No pplx-decider GGUF was
+  on disk, so it is untested beyond compiling and the unchanged laya/openjev
+  suite.
+- **Clef Flash coverage** (`Cloudflare/clef-flash`, 9B, via
+  `bartowski/Cloudflare_clef-flash-GGUF`): `test/decision_clef_test.exs` on a
+  new `:decision_clef` tag (`LLAMA_SMOKE_DECISION_CLEF_MODEL`), its own tag
+  because no tiny random-weight clef exists and the real model lets the tests
+  assert what it answers — routing by state content with the options given
+  out of key order (clef sorts them; answers must map back), the joint prompt
+  costing fewer input tokens than the questions asked one at a time, and the
+  255-option cap. The README's Decision Models section gains a **Clef Flash**
+  subsection with a worked example and the context-sizing note.
+
+### Fixed
+
+- **Embeddings truncated to `n_embd`.** `get_embeddings` sized its output by
+  `llama_model_n_embd` while `llama_context` writes `n_embd_out` floats per
+  sequence; the two differ for models with an output projection, so
+  embeddinggemma-2 came back as the first 512 of its 768 dimensions (and was
+  L2-normalized over those 512). Now `llama_model_n_embd_out`. `Model.n_embd/1`
+  is documented as the hidden width and `Model.n_embd_out/1` as the vector
+  length, `examples/embeddings.exs` prints the latter, and the two tests that
+  pinned `length(embedding) == n_embd` now pin `n_embd_out` — on
+  embeddinggemma-2 they fail before the fix.
+- **`embed_batch/3` aborted the VM with mean pooling.** llama.cpp's
+  `graph_reserve` rounds the reserve ubatch up to a multiple of `n_seq_max`
+  while `n_outputs` stays at `n_ubatch`; mean pooling multiplies the two
+  (`build_pooling`: `ggml_mul_mat(inpᵀ, inp_mean)`) and hits
+  `GGML_ASSERT(ggml_can_mul_mat(a, b))` — a `ggml_abort`, so the BEAM died at
+  context creation. It needs `pooling_type: :mean` and a sequence count that
+  does not divide the batch (five texts on the default 2048 did it), on any
+  model: reproduced on Qwen3-Embedding with `:mean` forced, and by default on
+  embeddinggemma-2, whose GGUF declares mean pooling. `embed_batch_pooled` now
+  sizes `n_ctx` and `n_batch` (the NIF sets `n_ubatch = n_batch` for embedding
+  contexts) to a multiple of `n_seq_max`, so there is nothing to round.
+  Regression test in `test/embeddings_test.exs` forces `:mean` with five
+  texts, so it bites on last-pooled models too.
+
+### Changed
+
+- Upstream, from the 33 commits: RPC `-sm tensor` with real 2-D tensor hooks
+  and an RPC all-reduce (#26610, see the defects note below), K2 Horizon dense
+  and MoVA (#29535), PLaMo-3 tokenizer pre-segmentation (#30045), the glm5-next
+  sparse-attention gather path removed (#30042), `CLAMP` on non-contiguous
+  views fixed on CPU and CUDA (#29517), a k-pool scatter data race on shared
+  sequences fixed (#29994), the scheduler re-reserved when nextn extraction
+  flags change (#30020), selective expert copying moved to user code
+  (#29943), nextn row cropping consolidated (#30017), CUDA BF16 XIELU (#29955),
+  per-thread stream for buffer-init padding memset (#28782), chunked
+  BF16/FP16→F32 conversion (#29442), Metal quantized flash-attention
+  threadgroup memory fixed (#29340), a Vulkan null `vkEnumerateInstanceVersion`
+  check (#29872), an OpenCL Adreno xmem GEMM OOB read fixed (#30041), Hexagon
+  CPY/CONCAT/CONT/DUP, ssm-conv, pool and matmul/flash-attention work (#30067,
+  #29971, #29995, #29974), LibreSSL 4.3.3 (#30019), and `GET /models` reporting
+  input/output modalities (#29987).
+
+Upstream defects (`docs/release-guide.md`): #1 (`-mcpu=native` probe) and #3
+(`ggml_backend_rpc_start_server` returns `void`) still stand by source diff —
+`ggml-cpu/CMakeLists.txt` is untouched and the signature is unchanged. **#2
+has moved:** #26610 implements the RPC buffer's `set_tensor_2d` /
+`get_tensor_2d` hooks and an RPC `comm_init` / all-reduce, exactly the two
+things the guide's "Still needed?" column names. The workaround was only
+documentation (`:layer` across hosts), so nothing was removed, but the tp=2
+verdict in `docs/dgx-spark.md` now describes an older build and needs
+`bench/spark_tensor_split.exs remote` re-run on Spark hardware; this bump was
+done on an M1 Max. **New #4, found by the clef tests:** Clef Flash answers
+wrong on Metal. Fully offloaded on an M1 Max, the model card's double-charge
+example routes `billing` 0.28 / `technical` 0.43 where the CPU path gives
+`billing` 0.977 / `technical` 0.009; `flash_attn` on or off makes no
+difference, tinylaya and tinyopenjev agree CPU↔Metal to 1e-4 (so it is
+clef's joint prompt, not the decision engine), upstream's own `llama-server`
+on Metal reproduces our Metal numbers exactly, and the old pin `e117148a4`
+gives the identical 0.28 — pre-existing, not from this range. The README's
+Clef Flash section says to load with `n_gpu_layers: 0` on Apple Silicon
+(0.977 again on the Metal build); the routing test in
+`test/decision_clef_test.exs` is left asserting the right answer, so it fails
+on Metal at this pin by design. Not filed upstream yet.
+
+Verified on macOS, M1 Max. **Metal** (`GGML_METAL_NO_RESIDENCY=1`): default
+**430 passed, 173 excluded** with no model; **574 passed, 29 excluded** for
+`--include smoke --include embeddings --include slow --include mtp`
+(Qwen3.5-0.8B-UD-Q4_K_XL, Qwen3-Embedding-0.6B-f16,
+Qwen3.6-35B-A3B-MTP-UD-Q4_K_XL); `--include embeddings` on
+embeddinggemma-2-Q8_0 **441 passed** (both `EmbeddingsTest` and the
+`embeddings` describe in `LlamaCppExTest` aborted the VM on this model before
+the fixes); `--include decision` on tinylaya + tinyopenjev **442 passed**;
+`--include decision_clef` on Cloudflare_clef-flash-Q8_0 **2 of 3**, the
+routing test failing as defect #4 describes. `scripts/decision_compare.exs`
+against upstream `llama-server` built from the same commit with Metal:
+tinylaya, tinyopenjev and Clef Flash Q8_0 all **agree on every probability
+(max |diff| 1.5e-6, 0, 0) and every token count** across the script's five
+requests. **CPU build** (`LLAMA_BACKEND=cpu`): default 430 passed; embeddings
+on embeddinggemma-2 passes; on Qwen3-Embedding-0.6B-f16 one pre-existing
+failure, `embed_batch matches per-text embed` at 1.09e-3 against its 1e-3
+bar, identical with the embedding change stashed (a CPU numerics gap; it
+passes on Metal and CI's bge-small passes it); decision 442 passed;
+decision_clef **3 of 3**. The Qwen 3.8 and Gemma 4 sidecar pairs and
+`rpc_live` were not re-run at this build.
+
 ## v0.8.55
 
 llama.cpp bumped to `e117148a4`

@@ -2,7 +2,7 @@
 // of tools/server/server-context.cpp (send_decision, the batch layout rules and
 // the /v1/systemone handler). See decision.h for scope.
 //
-// Ported at e117148a4. Functions that are upstream's carry its name in a
+// Ported at c479922ac. Functions that are upstream's carry its name in a
 // trailing comment so a bump can diff them one by one; everything below the
 // "evaluation" banner replaces server slots and is ours.
 
@@ -237,7 +237,7 @@ bool type_reads_embeddings(const std::string & type) {
 
 // Mirrors server_decision_context::can_share_prompt.
 bool type_shares_prompt(const std::string & type) {
-    return type == "openjev" || type == "lev" || type == "kev" || type == "nimble";
+    return type == "openjev" || type == "lev" || type == "kev" || type == "nimble" || type == "pplx-decider";
 }
 
 struct Engine::Impl {
@@ -255,7 +255,7 @@ struct Engine::Impl {
     bool   noul_true_first = false; // noul options are [true, false] instead of [false, true]
     bool   choice_sorted   = false; // choice options are in the order of their keys
 
-    // OPENJEV, LEV, NIMBLE
+    // OPENJEV, LEV, NIMBLE, PPLX_DECIDER
     std::vector<llama_token> labels;
     std::vector<std::string> label_texts; // only if the label of an option is given to the template
 
@@ -278,6 +278,7 @@ struct Engine::Impl {
             case COMMON_DECISION_TYPE_LEV:
             case COMMON_DECISION_TYPE_KEV:
             case COMMON_DECISION_TYPE_NIMBLE:
+            case COMMON_DECISION_TYPE_PPLX_DECIDER:
                 return true;
             default:
                 return false;
@@ -338,7 +339,7 @@ struct Engine::Impl {
             }
             n_options_max   = labels.size();
             noul_true_first = true;
-        } else if (model_type == COMMON_DECISION_TYPE_LEV || model_type == COMMON_DECISION_TYPE_NIMBLE) {
+        } else if (model_type == COMMON_DECISION_TYPE_LEV || model_type == COMMON_DECISION_TYPE_NIMBLE || model_type == COMMON_DECISION_TYPE_PPLX_DECIDER) {
             // label codes are A..Z then AA..ZZ, only the ones that are a single token are used
             std::vector<std::string> codes;
             for (char a = 'A'; a <= 'Z'; a++) {
@@ -619,7 +620,7 @@ struct Engine::Impl {
         decision_task task;
         const std::string prompt = render(state, questions, question, variant);
 
-        if (type == COMMON_DECISION_TYPE_OPENJEV || type == COMMON_DECISION_TYPE_LEV || type == COMMON_DECISION_TYPE_NIMBLE) {
+        if (type == COMMON_DECISION_TYPE_OPENJEV || type == COMMON_DECISION_TYPE_LEV || type == COMMON_DECISION_TYPE_NIMBLE || type == COMMON_DECISION_TYPE_PPLX_DECIDER) {
             // lev reads the ratings of a noul question at its first labels, not at the digits
             task.labels.assign(labels.begin(), labels.begin() + n_outputs(question));
         }
