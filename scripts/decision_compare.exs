@@ -42,11 +42,14 @@ base = %{
 }
 
 many =
-  Map.new(1..12, fn i -> {"opt#{String.pad_leading(Integer.to_string(i), 2, "0")}", "option number #{i}"} end)
+  Map.new(1..12, fn i ->
+    {"opt#{String.pad_leading(Integer.to_string(i), 2, "0")}", "option number #{i}"}
+  end)
 
 requests = [
   {"basic", state, base},
-  {"json state", %{"ticket" => state, "plan" => "pro"}, %{
+  {"json state", %{"ticket" => state, "plan" => "pro"},
+   %{
      "refund" => %{
        "type" => "noul",
        "instructions" => "Is a refund requested?",
@@ -57,9 +60,9 @@ requests = [
    [
      %{"role" => "user", "content" => "My package never arrived."},
      %{"role" => "assistant", "content" => "Sorry to hear that, let me check."}
-   ],
-   %{"resolved" => %{"type" => "noul", "instructions" => "Is the issue resolved?"}}},
-  {"12 options", "Pick option number 7.", %{
+   ], %{"resolved" => %{"type" => "noul", "instructions" => "Is the issue resolved?"}}},
+  {"12 options", "Pick option number 7.",
+   %{
      "pick" => %{"type" => "choice", "instructions" => "Which option?", "criteria" => many}
    }},
   {"single", state, %{"angry" => base["angry"]}}
@@ -86,8 +89,14 @@ end) || raise "llama-server on port #{port} did not become healthy"
 
 post = fn body ->
   url = ~c"http://127.0.0.1:#{port}/v1/systemone"
+
   {:ok, {{_, status, _}, _, resp}} =
-    :httpc.request(:post, {url, [], ~c"application/json", JSON.encode!(body)}, [timeout: 600_000], [])
+    :httpc.request(
+      :post,
+      {url, [], ~c"application/json", JSON.encode!(body)},
+      [timeout: 600_000],
+      []
+    )
 
   {status, JSON.decode!(to_string(resp))}
 end
@@ -95,9 +104,14 @@ end
 # Upstream answers use string keys throughout; normalise ours to that shape.
 norm = fn answer ->
   Map.new(answer, fn
-    {:type, t} -> {"type", Atom.to_string(t)}
-    {k, v} when is_map(v) -> {Atom.to_string(k), Map.new(v, fn {kk, vv} -> {to_string(kk), vv} end)}
-    {k, v} -> {Atom.to_string(k), v}
+    {:type, t} ->
+      {"type", Atom.to_string(t)}
+
+    {k, v} when is_map(v) ->
+      {Atom.to_string(k), Map.new(v, fn {kk, vv} -> {to_string(kk), vv} end)}
+
+    {k, v} ->
+      {Atom.to_string(k), v}
   end)
 end
 
@@ -106,9 +120,14 @@ max_diff = fn a, b, f ->
     vb = Map.fetch!(b, k)
 
     cond do
-      is_number(va) -> max(acc, abs(va - vb))
-      is_map(va) -> max(acc, f.(va, vb, f))
-      true -> if va == vb, do: acc, else: raise("mismatch at #{k}: #{inspect(va)} vs #{inspect(vb)}")
+      is_number(va) ->
+        max(acc, abs(va - vb))
+
+      is_map(va) ->
+        max(acc, f.(va, vb, f))
+
+      true ->
+        if va == vb, do: acc, else: raise("mismatch at #{k}: #{inspect(va)} vs #{inspect(vb)}")
     end
   end)
 end
@@ -130,7 +149,9 @@ failed =
     if diff > 1.0e-3 or not tokens_ok, do: failed + 1, else: failed
   end)
 
-# Upstream's invalid requests (test_systemone.py) must be rejected by both.
+# Upstream's invalid requests (test_systemone.py): both sides must agree. The
+# null state is invalid for every type but lfm2-d1, which accepts it (images
+# only, upstream); there the two must agree on the answers instead.
 invalid = [
   {nil, base},
   {state, %{}},
@@ -145,9 +166,31 @@ failed =
   Enum.reduce(invalid, failed, fn {st, qs}, failed ->
     ours = LlamaCppEx.Decision.decide(decision, st, qs)
     {status, ref} = post.(%{"state" => st, "questions" => qs})
-    ref_msg = get_in(ref, ["error", "message"])
-    IO.puts("invalid: ours=#{inspect(ours)} ref=#{status} #{inspect(ref_msg)}")
-    if match?({:error, _}, ours) and status == 400, do: failed, else: failed + 1
+
+    case {ours, status} do
+      {{:error, _}, 400} ->
+        IO.puts(
+          "invalid: ours=#{inspect(ours)} ref=400 #{inspect(get_in(ref, ["error", "message"]))}"
+        )
+
+        failed
+
+      {{:ok, %{answers: answers, usage: usage}}, 200} ->
+        diff =
+          max_diff.(ref["answers"], Map.new(answers, fn {id, a} -> {id, norm.(a)} end), max_diff)
+
+        tokens_ok = usage.input_tokens == ref["usage"]["input_tokens"]
+
+        IO.puts(
+          "accepted by both: max|diff| = #{:erlang.float_to_binary(diff, [{:decimals, 7}])} tokens ours=#{usage.input_tokens} ref=#{ref["usage"]["input_tokens"]}"
+        )
+
+        if diff > 1.0e-3 or not tokens_ok, do: failed + 1, else: failed
+
+      _ ->
+        IO.puts("DISAGREE: ours=#{inspect(ours)} ref=#{status} #{inspect(ref)}")
+        failed + 1
+    end
   end)
 
 if failed == 0 do

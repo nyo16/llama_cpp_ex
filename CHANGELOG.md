@@ -2,20 +2,29 @@
 
 ## v0.8.56
 
-llama.cpp bumped to `c479922ac`
-([`b11458`](https://github.com/ggml-org/llama.cpp/releases/tag/b11458)),
-33 commits from `e117148a4` (b11424+1). Header changes are additive:
-`include/llama.h` gains `LLAMA_VOCAB_TYPE_PLAMO3` (#30045), `ggml-backend.h`
-gains `ggml_backend_sched_copy_callback` /
-`ggml_backend_sched_set_copy_callback` (#29943), and `common/common.h` gains
-`COMMON_DECISION_TYPE_PPLX_DECIDER` plus a `common_get_decision_type(const
-std::string &)` overload that reads a GGUF without loading it (#30044,
-#29987). `chat.h`, `json.h`, `json-schema-to-grammar.h`, `speculative.h` and
-`src/llama-ext.h` are byte-identical; `llama_model_default_params` /
-`llama_context_default_params` are unchanged. **`RPC_PROTO_MAJOR_VERSION` is
-7 → 8** (#26610): an `LlamaCppEx.RPC.Server` worker and the client that uses
-it must come from the same build. Upstream versions: llama.cpp 0.6.0, ggml
-0.26.0.
+llama.cpp bumped to `88dcc460d`
+([`b11479`](https://github.com/ggml-org/llama.cpp/releases/tag/b11479)+4),
+58 commits from `e117148a4` (b11424+1). Header changes are additive:
+`include/llama.h` gains `LLAMA_VOCAB_TYPE_PLAMO3` (#30045) and
+`llama_model_params.moe_cache_size` (#29887), `ggml-backend.h` gains
+`ggml_backend_sched_copy_callback` / `ggml_backend_sched_set_copy_callback`
+(#29943), `common/common.h` gains `COMMON_DECISION_TYPE_PPLX_DECIDER` and
+`COMMON_DECISION_TYPE_LFM2_D1` plus a `common_get_decision_type(const
+std::string &)` overload that reads a GGUF without loading it (#30044, #30110,
+#29987), and `common/chat.h` replaces the `std::string` input of
+`common_chat_parse` / `common_chat_peg_parse` with a `common_chat_input`
+(#29876) — the NIF does not call either. `json.h`,
+`json-schema-to-grammar.h`, `speculative.h` and `src/llama-ext.h` are
+byte-identical; `llama_model_default_params` / `llama_context_default_params`
+are unchanged apart from the new `moe_cache_size = 0`. **`RPC_PROTO_MAJOR_VERSION`
+is 7 → 8** (#26610): an `LlamaCppEx.RPC.Server` worker and the client that
+uses it must come from the same build. Upstream versions: llama.cpp 0.6.0,
+ggml 0.26.0.
+
+The bump was done in two steps. At `c479922ac` (b11458) the new Clef Flash
+tests found that clef answers were wrong on Metal; the cause was in ggml's
+Metal backend, fixed upstream in #30100, and the pin moved on to the first
+master that carries the fix. See *Fixed* and the defects note.
 
 ### Added
 
@@ -28,14 +37,26 @@ it must come from the same build. Upstream versions: llama.cpp 0.6.0, ggml
   libmtmd, so this binding is text-only. The README gains an **Embeddings**
   section with the prefix table, a retrieval example and 256-d truncation,
   with the numbers measured on the Q8_0 file.
-- **`pplx-decider` decision type** (upstream #30044): the seventh
-  `common_decision_type`, a label-logit readout like lev/nimble with one- or
-  two-letter codes and up to 255 options. Ported into `decision.cpp`
-  (`init`, `fill_task`, `can_share_prompt`, `type_shares_prompt`) and
-  `LlamaCppEx.Decision` (`:pplx_decider` in `@types`, `@shares_prompt` and
-  `decision_type/0`); "Ported at" is now `c479922ac`. No pplx-decider GGUF was
-  on disk, so it is untested beyond compiling and the unchanged laya/openjev
-  suite.
+- **`pplx-decider` and `lfm2-d1` decision types** (upstream #30044, #30110):
+  the seventh and eighth `common_decision_type`s, both label-logit readouts.
+  pplx-decider is lev/nimble's one- or two-letter codes with up to 255
+  options; lfm2-d1 (`LiquidAI/d1-3B`, LFM2.5-VL-based) picks label codes per
+  question from a pool of letters, digits and `#n` codes, reads a `noul` at
+  yes/no spellings and a `score` at its digits, takes the max over a label's
+  spellings (`label_groups`), and accepts a `nil` state. Both ported into
+  `decision.cpp` (`init`, `d1_labels`, `render_options`, `fill_task`,
+  `read_scores`, `can_share_prompt`, `type_shares_prompt`) and
+  `LlamaCppEx.Decision` (`:pplx_decider`, `:lfm2_d1` in `@types`,
+  `@shares_prompt` and `decision_type/0`); "Ported at" is now `88dcc460d`.
+  lfm2-d1 is checked against upstream `llama-server` on `d1-3B-Q8_0`: every
+  probability and token count agrees across `scripts/decision_compare.exs`,
+  including the `nil`-state request both sides now accept (the script compares
+  behaviour there instead of assuming a rejection). The public d1 GGUFs were
+  converted before upstream renamed the type `d1` → `lfm2-d1`, so they load as
+  `:unknown` — on upstream too; the comparison ran on a copy with that one
+  metadata key rewritten, and the README says how. No pplx-decider GGUF was on
+  disk, so that type is untested beyond compiling and the unchanged
+  laya/openjev suite.
 - **Clef Flash coverage** (`Cloudflare/clef-flash`, 9B, via
   `bartowski/Cloudflare_clef-flash-GGUF`): `test/decision_clef_test.exs` on a
   new `:decision_clef` tag (`LLAMA_SMOKE_DECISION_CLEF_MODEL`), its own tag
@@ -44,7 +65,12 @@ it must come from the same build. Upstream versions: llama.cpp 0.6.0, ggml
   out of key order (clef sorts them; answers must map back), the joint prompt
   costing fewer input tokens than the questions asked one at a time, and the
   255-option cap. The README's Decision Models section gains a **Clef Flash**
-  subsection with a worked example and the context-sizing note.
+  subsection: the worked example, the context-sizing note, and four more —
+  a JSON record as the state, moderation as one described `choice` (which
+  reads a veiled threat a bare `noul` misses), RAG grounding with a text
+  state (which scores 0.92 where the same content as a map scores 0.29), and
+  a confidence-gated router — all with numbers measured on the Q8_0 file,
+  plus the caveat that clef's questions see each other inside one request.
 
 ### Fixed
 
@@ -70,24 +96,55 @@ it must come from the same build. Upstream versions: llama.cpp 0.6.0, ggml
   contexts) to a multiple of `n_seq_max`, so there is nothing to round.
   Regression test in `test/embeddings_test.exs` forces `:mean` with five
   texts, so it bites on last-pooled models too.
+- **Clef answered wrong on Metal** (upstream, ggml's Metal backend; found by
+  the new clef tests at `c479922ac`, fixed in #30100 which this pin carries).
+  `ggml_metal_op_mul_mat_mma` picked the residual of a fused `MUL_MAT+ADD`
+  as "the ADD operand that is not a MUL_MAT"; in the clef head both operands
+  are mat-muls (`options = proj_option_context @ ctx + proj_option_lexical
+  @ lex`), so the fused kernel added its own never-written output buffer.
+  Fully offloaded on an M1 Max the model card's double-charge example routed
+  `billing` 0.28 / `technical` 0.43 where the CPU gave 0.977 / 0.009,
+  deterministic per memory layout, with upstream's own `llama-server` on Metal
+  reproducing our numbers exactly. Bisected with `GGML_METAL_FUSION_DISABLE=1`
+  and then one fusion-table row at a time; the fix is one line (select the
+  residual by identity) plus a `mm2+mm` mode in `test-backend-ops` that fails
+  27 of 28 Metal cases without it. Upstream issue #30064 had attributed the
+  symptom to Q8_0 quantization of the decision head; the same Q8_0 file is
+  right on the CPU backend. `test/decision_clef_test.exs` keeps loading with
+  `n_gpu_layers: -1` so it would catch a regression.
 
 ### Changed
 
-- Upstream, from the 33 commits: RPC `-sm tensor` with real 2-D tensor hooks
-  and an RPC all-reduce (#26610, see the defects note below), K2 Horizon dense
-  and MoVA (#29535), PLaMo-3 tokenizer pre-segmentation (#30045), the glm5-next
-  sparse-attention gather path removed (#30042), `CLAMP` on non-contiguous
-  views fixed on CPU and CUDA (#29517), a k-pool scatter data race on shared
-  sequences fixed (#29994), the scheduler re-reserved when nextn extraction
-  flags change (#30020), selective expert copying moved to user code
-  (#29943), nextn row cropping consolidated (#30017), CUDA BF16 XIELU (#29955),
-  per-thread stream for buffer-init padding memset (#28782), chunked
-  BF16/FP16→F32 conversion (#29442), Metal quantized flash-attention
-  threadgroup memory fixed (#29340), a Vulkan null `vkEnumerateInstanceVersion`
-  check (#29872), an OpenCL Adreno xmem GEMM OOB read fixed (#30041), Hexagon
-  CPY/CONCAT/CONT/DUP, ssm-conv, pool and matmul/flash-attention work (#30067,
-  #29971, #29995, #29974), LibreSSL 4.3.3 (#30019), and `GET /models` reporting
-  input/output modalities (#29987).
+- Upstream, from the 58 commits: the Metal `MUL_MAT+ADD` residual fix
+  (#30100) and few-row MMA mat-mul for the remaining src0 types (#30065);
+  RPC `-sm tensor` with real 2-D tensor hooks and an RPC all-reduce (#26610,
+  see the defects note below); a GPU cache for MoE experts kept in host
+  memory (#29887, `moe_cache_size`, off by default; not exposed by the NIF);
+  GLM5Next MTP (#29928); K2 Horizon dense and MoVA (#29535); the d1-3B
+  decision model (#30110); Cohere2 vision in mtmd (#30062); PLaMo-3 tokenizer
+  pre-segmentation, FIM tokens and conversion fixes (#30045, #30090, #29843);
+  the glm5-next sparse-attention gather path removed (#30042); nextn tensor
+  flags shared between models (#30097); greedy selection for temperature-zero
+  sampler chains (#29797); the server accumulating generated text and tokens
+  as parse input (#29876, the `common_chat_input` change); `CLAMP` on
+  non-contiguous views fixed on CPU and CUDA (#29517); a k-pool scatter data
+  race on shared sequences fixed (#29994); the scheduler re-reserved when
+  nextn extraction flags change (#30020); selective expert copying moved to
+  user code (#29943); nextn row cropping consolidated (#30017); CUDA BF16
+  XIELU (#29955), FWHT kernels for block widths above 512 (#29100),
+  per-thread stream for buffer-init padding memset (#28782), coalesced pool2d
+  reads (#29425) and chunked BF16/FP16→F32 conversion (#29442); Metal
+  quantized flash-attention threadgroup memory fixed (#29340); a Vulkan null
+  `vkEnumerateInstanceVersion` check (#29872) and an AMD iGPU checkpoint-read
+  fix (#30049); an OpenCL Adreno xmem GEMM OOB read fixed (#30041); SYCL
+  flash-attention and MMVQ work (#29071, #29171, #27689, #29500); Hexagon
+  CPY/CONCAT/CONT/DUP, ssm-conv, pool and matmul/flash-attention work
+  (#30067, #29971, #29995, #29974); cpp-httplib 0.60.0 (#30081), LibreSSL
+  4.3.3 (#30019); and `GET /models` reporting input/output modalities
+  (#29987).
+- `scripts/decision_compare.exs` compares upstream's invalid-request cases by
+  agreement instead of assuming a 400: lfm2-d1 accepts a `null` state, so
+  there the two sides must agree on the answers.
 
 Upstream defects (`docs/release-guide.md`): #1 (`-mcpu=native` probe) and #3
 (`ggml_backend_rpc_start_server` returns `void`) still stand by source diff —
@@ -98,39 +155,34 @@ things the guide's "Still needed?" column names. The workaround was only
 documentation (`:layer` across hosts), so nothing was removed, but the tp=2
 verdict in `docs/dgx-spark.md` now describes an older build and needs
 `bench/spark_tensor_split.exs remote` re-run on Spark hardware; this bump was
-done on an M1 Max. **New #4, found by the clef tests:** Clef Flash answers
-wrong on Metal. Fully offloaded on an M1 Max, the model card's double-charge
-example routes `billing` 0.28 / `technical` 0.43 where the CPU path gives
-`billing` 0.977 / `technical` 0.009; `flash_attn` on or off makes no
-difference, tinylaya and tinyopenjev agree CPU↔Metal to 1e-4 (so it is
-clef's joint prompt, not the decision engine), upstream's own `llama-server`
-on Metal reproduces our Metal numbers exactly, and the old pin `e117148a4`
-gives the identical 0.28 — pre-existing, not from this range. The README's
-Clef Flash section says to load with `n_gpu_layers: 0` on Apple Silicon
-(0.977 again on the Metal build); the routing test in
-`test/decision_clef_test.exs` is left asserting the right answer, so it fails
-on Metal at this pin by design. Not filed upstream yet.
+done on an M1 Max. A fourth defect — the Metal clef answers above — was found
+at `c479922ac`, reported with a fix (#30100), and is gone at `88dcc460d`; it
+was pre-existing (the old pin `e117148a4` gave the identical 0.28), and the
+guide records how it was bisected. The table stays at three rows.
 
-Verified on macOS, M1 Max. **Metal** (`GGML_METAL_NO_RESIDENCY=1`): default
-**430 passed, 173 excluded** with no model; **574 passed, 29 excluded** for
-`--include smoke --include embeddings --include slow --include mtp`
-(Qwen3.5-0.8B-UD-Q4_K_XL, Qwen3-Embedding-0.6B-f16,
-Qwen3.6-35B-A3B-MTP-UD-Q4_K_XL); `--include embeddings` on
-embeddinggemma-2-Q8_0 **441 passed** (both `EmbeddingsTest` and the
-`embeddings` describe in `LlamaCppExTest` aborted the VM on this model before
-the fixes); `--include decision` on tinylaya + tinyopenjev **442 passed**;
-`--include decision_clef` on Cloudflare_clef-flash-Q8_0 **2 of 3**, the
-routing test failing as defect #4 describes. `scripts/decision_compare.exs`
-against upstream `llama-server` built from the same commit with Metal:
-tinylaya, tinyopenjev and Clef Flash Q8_0 all **agree on every probability
-(max |diff| 1.5e-6, 0, 0) and every token count** across the script's five
-requests. **CPU build** (`LLAMA_BACKEND=cpu`): default 430 passed; embeddings
-on embeddinggemma-2 passes; on Qwen3-Embedding-0.6B-f16 one pre-existing
-failure, `embed_batch matches per-text embed` at 1.09e-3 against its 1e-3
-bar, identical with the embedding change stashed (a CPU numerics gap; it
-passes on Metal and CI's bge-small passes it); decision 442 passed;
-decision_clef **3 of 3**. The Qwen 3.8 and Gemma 4 sidecar pairs and
-`rpc_live` were not re-run at this build.
+Verified on macOS, M1 Max, at `88dcc460d`. **Metal**
+(`GGML_METAL_NO_RESIDENCY=1`): default **430 passed, 173 excluded** with no
+model; **563 passed, 40 excluded** for `--include smoke --include slow
+--include mtp` (Qwen3.5-0.8B-UD-Q4_K_XL, Qwen3.6-35B-A3B-MTP-UD-Q4_K_XL);
+`--include embeddings` **441 passed** on embeddinggemma-2-Q8_0 and again on
+Qwen3-Embedding-0.6B-f16 (both `EmbeddingsTest` and the `embeddings`
+describe in `LlamaCppExTest` aborted the VM on embeddinggemma-2 before the
+fixes); `--include decision` on tinylaya + tinyopenjev **442 passed**;
+`--include decision_clef` on Cloudflare_clef-flash-Q8_0 **3 of 3, fully
+offloaded** (2 of 3 at `c479922ac`). `scripts/decision_compare.exs` against
+upstream `llama-server` built from the same commit with Metal: tinylaya,
+tinyopenjev, Clef Flash Q8_0 and d1-3B Q8_0 all **ALL MATCH** — every
+probability within 1e-3 (tinylaya 1.5e-6, openjev 0, clef 0, d1 ≤ 7e-4 on a
+shared-prefix request) and every token count identical, including the
+invalid-request cases. Format and dialyzer (0 errors) clean; the Hex source
+build clones `88dcc460d` and compiles. **CPU build** was exercised at
+`c479922ac` (default 430 passed; embeddings on embeddinggemma-2 passes; on
+Qwen3-Embedding-0.6B-f16 one pre-existing failure, `embed_batch matches
+per-text embed` at 1.09e-3 against its 1e-3 bar, identical with the embedding
+change stashed — a CPU numerics gap, passes on Metal and CI's bge-small passes
+it; decision 442; decision_clef 3 of 3) and not re-run at `88dcc460d`. The
+Qwen 3.8 and Gemma 4 sidecar pairs and `rpc_live` were not re-run at this
+build.
 
 ## v0.8.55
 

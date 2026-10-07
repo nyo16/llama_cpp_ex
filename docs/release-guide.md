@@ -128,7 +128,7 @@ server's JSON from the same keyword list, not from a map (which sorts).
 
 ### Upstream defects we work around
 
-Four known llama.cpp defects have workarounds in this repo. A bump is the only
+Three known llama.cpp defects have workarounds in this repo. A bump is the only
 time anyone looks at them, so check each one here — if upstream has fixed it, the
 workaround should come out rather than quietly accumulate.
 
@@ -190,15 +190,27 @@ now a claim about an older build and has to be re-measured with
 `mix run bench/spark_tensor_split.exs remote` on Spark hardware before it is
 changed. This bump was done on an M1 Max, so that measurement is still owed.
 `RPC_PROTO_MAJOR_VERSION` went 7 → 8 with it: a worker and a client must come
-from the same build. #4 below was found at this bump by the new Clef Flash
-tests and measured at both pins; it is not from this range.
+from the same build.
+
+Re-checked at `88dcc460d` (b11479+4), covering the gap from `c479922ac`: #1,
+#2 and #3 are as above — none of the three files changed in the 25 commits.
+This range also **fixes a fourth defect found at the previous pin**: the Metal
+`MUL_MAT+ADD` fusion picked the residual as "the ADD operand that is not a
+MUL_MAT", which is both operands when the residual is itself a mat-mul — the
+clef head's `options = proj_option_context @ ctx + proj_option_lexical @ lex`
+— so the fused kernel added a never-written buffer and Clef Flash routed
+`billing` 0.28 where the CPU gave 0.977. Found by `test/decision_clef_test.exs`
+(loaded with `n_gpu_layers: -1` for exactly this reason), bisected with
+`GGML_METAL_FUSION_DISABLE=1` then one fusion-table row at a time, fixed
+upstream in #30100 (`7e8324f5f`, with a `mm2+mm` mode in `test-backend-ops`
+that fails 27 of 28 cases without it). Nothing to remove here: the workaround
+was a README note, now gone.
 
 | # | Upstream defect | Our workaround | Still needed? |
 |---|---|---|---|
 | 1 | `GGML_NATIVE=ON` makes ggml's `-mcpu=native` probe resolve to **base ARMv8-A** on Cortex-X925/A725 with GCC 13.3 — silently, with a soft CMake warning and exit 0. Costs every `sdot`/`smmla`/SVE kernel. | `LLAMA_CPU_ARM_ARCH` + `LLAMA_CUDA_ARCH` in the `Makefile`, which must be set together. See [DGX Spark](dgx-spark.md) and [Cross-Platform Builds](cross-platform-builds.md). | `scripts/spark/verify-build-flags.sh` on an aarch64 host. If a default build (no `LLAMA_CPU_ARM_ARCH`) now reports non-zero `sdot`/`smmla`, upstream fixed the probe. |
 | 2 | `-sm tensor` with a non-CUDA device in the set **runs and is correct but ~2.7× slower on decode**: `ggml_backend_cuda_comm_init` returns `nullptr` on any non-CUDA member, so the generic meta-backend butterfly runs instead, and the RPC backend's `NULL` 2-D tensor hooks degrade it to a loop of 1-D transfers. | Documented, not coded around: `Model.load/2` maps `:tensor` to its upstream value and the docs say to use `:layer` across hosts. See the tp=2 verdict in [DGX Spark](dgx-spark.md). | `mix run bench/spark_tensor_split.exs remote`. If `:tensor` comes within range of `:layer`, upstream implemented the 2-D hooks or the all-reduce — update the verdict section. |
 | 3 | `ggml_backend_rpc_start_server` returns `void`, never returns on success, and prints failures to stderr, so an **embedded** caller cannot tell "listening" from "port in use". | `rpc_start_server` in `llama_nif.cpp` pre-`bind()`s the endpoint for a real `errno`, then polls `connect()` until something accepts. A TOCTOU window and one wasted connection per start. | Check whether the signature gained a return value or a listening callback. If so, delete `rpc_preflight_bind` and `rpc_wait_until_listening` and drop the poll. |
-| 4 | **Clef on Metal answers wrong.** Clef Flash Q8_0 (`Cloudflare/clef-flash`) fully offloaded on an M1 Max gives near-uniform, wrong routes — `billing` 0.28 / `technical` 0.43 for the model card's double-charge example — where the CPU path gives `billing` 0.977 / `technical` 0.009, i.e. the documented answer. Upstream's own `llama-server` on Metal agrees with our Metal numbers exactly, so it is the backend, not the port; `flash_attn` on/off makes no difference; tinylaya and tinyopenjev agree CPU↔Metal to 1e-4, so it is specific to clef's joint prompt (`llama_decision_order`). Measured identically at `e117148a4` and `c479922ac`, so it predates the latter. Not yet filed upstream. | Documented, not coded around: the README's Clef Flash section says to load with `n_gpu_layers: 0` on Apple Silicon (0.977 again on the Metal build). `test/decision_clef_test.exs` asserts the correct answer, so under `--include decision_clef` on Metal its routing test **fails at this build**; that is the test doing its job. | `GGML_METAL_NO_RESIDENCY=1 LLAMA_SMOKE_DECISION_CLEF_MODEL=... mix test --include decision_clef` on the Metal build. When the routing test passes with `n_gpu_layers: -1`, drop the README note and this row. |
 
 Not a defect and not going away: `RPC_STATUS_ASSERT` is `GGML_ABORT`
 (`ggml-rpc.cpp:30`), so a peer failure terminates the client process — the BEAM
@@ -243,6 +255,10 @@ LLAMA_SMOKE_DECISION_OPENJEV_MODEL=~/Downloads/tinyopenjev-for-testing-Q8_0.gguf
 GGML_METAL_NO_RESIDENCY=1 \
 LLAMA_SMOKE_DECISION_CLEF_MODEL=~/Downloads/Cloudflare_clef-flash-Q8_0.gguf \
   mix test --include decision_clef
+
+# lfm2-d1 has no tag: check it with scripts/decision_compare.exs (below) on a
+# d1-3B GGUF whose lfm2.decision.type reads "lfm2-d1" — the quants published
+# before upstream's rename say "d1" and are refused by both sides.
 
 GGML_METAL_NO_RESIDENCY=1 \
 LLAMA_SMOKE_MTP_MODEL=~/Downloads/Qwen3.8-27B-Q4_K_M.gguf \

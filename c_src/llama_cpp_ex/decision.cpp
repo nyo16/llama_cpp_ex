@@ -2,7 +2,7 @@
 // of tools/server/server-context.cpp (send_decision, the batch layout rules and
 // the /v1/systemone handler). See decision.h for scope.
 //
-// Ported at c479922ac. Functions that are upstream's carry its name in a
+// Ported at 88dcc460d. Functions that are upstream's carry its name in a
 // trailing comment so a bump can diff them one by one; everything below the
 // "evaluation" banner replaces server slots and is ours.
 
@@ -17,6 +17,7 @@
 #include "../../vendor/llama.cpp/src/llama-ext.h"
 
 #include <algorithm>
+#include <cctype>
 #include <cmath>
 #include <map>
 #include <regex>
@@ -54,8 +55,9 @@ struct decision_question {
 struct decision_task {
     llama_tokens tokens;
 
-    std::vector<llama_token> labels;  // logits of these tokens, at the last prompt token
-    std::vector<int32_t>     markers; // embeddings[column] at these prompt positions
+    std::vector<llama_token> labels;       // logits of these tokens, at the last prompt token
+    std::vector<int32_t>     label_groups; // if set, number of labels per output, the output is their max
+    std::vector<int32_t>     markers;      // embeddings[column] at these prompt positions
     int32_t                  column  = 0;
     // if set, embeddings is [q | k], and the output is instead the scaled dot product of q[pointer] and k[marker]
     int32_t                  pointer = -1;
@@ -237,7 +239,7 @@ bool type_reads_embeddings(const std::string & type) {
 
 // Mirrors server_decision_context::can_share_prompt.
 bool type_shares_prompt(const std::string & type) {
-    return type == "openjev" || type == "lev" || type == "kev" || type == "nimble" || type == "pplx-decider";
+    return type == "openjev" || type == "lev" || type == "kev" || type == "nimble" || type == "pplx-decider" || type == "lfm2-d1";
 }
 
 struct Engine::Impl {
@@ -279,6 +281,7 @@ struct Engine::Impl {
             case COMMON_DECISION_TYPE_KEV:
             case COMMON_DECISION_TYPE_NIMBLE:
             case COMMON_DECISION_TYPE_PPLX_DECIDER:
+            case COMMON_DECISION_TYPE_LFM2_D1:
                 return true;
             default:
                 return false;
@@ -384,6 +387,9 @@ struct Engine::Impl {
             n_options_max   = 255;
             noul_true_first = true;
             choice_sorted   = true;
+        } else if (model_type == COMMON_DECISION_TYPE_LFM2_D1) {
+            n_options_max   = 255;
+            noul_true_first = true;
         } else {
             throw std::runtime_error("unsupported decision model type: " + type_name);
         }
@@ -401,7 +407,8 @@ struct Engine::Impl {
     //
 
     std::vector<decision_question> parse_questions(const json & body) const { // server_decision_context::parse_questions
-        if (!body.contains("state") || body.at("state").is_null()) {
+        // d1 accepts a null state (images only upstream; here it just asks about nothing but the questions)
+        if (!body.contains("state") || (body.at("state").is_null() && type != COMMON_DECISION_TYPE_LFM2_D1)) {
             throw std::invalid_argument("\"state\" must be provided");
         }
         if (!body.contains("questions") || !body.at("questions").is_object() || body.at("questions").empty()) {
@@ -529,9 +536,111 @@ struct Engine::Impl {
         return question.options.size();
     }
 
+    // label codes follow prompt.py of the model repo
+    void d1_labels(const decision_question & question, std::vector<std::string> & texts, std::vector<llama_tokens> & groups) const { // server_decision_context::d1_labels
+        const size_t n_options = question.options.size();
+
+        auto get_single_tokens = [&](const std::vector<std::string> & forms) {
+            llama_tokens out;
+            for (const auto & form : forms) {
+                const auto toks = common_tokenize(vocab, form, false, false);
+                if (toks.size() == 1 && std::find(out.begin(), out.end(), toks[0]) == out.end()) {
+                    out.push_back(toks[0]);
+                }
+            }
+            return out;
+        };
+
+        if (question.type != QUESTION_CHOICE) {
+            for (const auto & opt : question.options) {
+                llama_tokens group;
+                if (question.type == QUESTION_SCORE) {
+                    group = get_single_tokens({opt.key});
+                } else if (opt.key == "true") {
+                    group = get_single_tokens({"yes", "Yes", "YES"});
+                } else {
+                    group = get_single_tokens({"no", "No", "NO"});
+                }
+                if (group.empty()) {
+                    throw std::runtime_error("decision label is not a single token: " + opt.key);
+                }
+                texts.push_back(opt.key);
+                groups.push_back(group);
+            }
+            return;
+        }
+
+        bool is_letters = true;
+        for (const auto & opt : question.options) {
+            is_letters = is_letters && opt.key.size() == 1 && std::isalpha((unsigned char) opt.key[0]);
+        }
+
+        std::vector<std::string> codes;
+        for (size_t i = 0; i < n_options; i++) {
+            if (is_letters) {
+                codes.push_back(question.options[i].key);
+            } else if (n_options <= 26) {
+                codes.push_back(std::string(1, 'A' + i));
+            } else {
+                codes.push_back(string_format("%02zu", i));
+            }
+        }
+
+        std::vector<std::string> pool;
+        for (char c = 'A'; c <= 'Z'; c++) {
+            pool.push_back(std::string(1, c));
+        }
+        for (int i = 0; i < 100; i++) {
+            pool.push_back(string_format("%02d", i));
+        }
+        for (char c = 'a'; c <= 'z'; c++) {
+            pool.push_back(std::string(1, c));
+        }
+        for (int i = 0; i < 200; i++) {
+            pool.push_back(string_format("#%d", i));
+        }
+        for (char a = 'A'; a <= 'Z'; a++) {
+            for (char b = 'A'; b <= 'Z'; b++) {
+                pool.push_back(std::string{a, b});
+            }
+        }
+
+        llama_tokens used;
+        auto take = [&](const std::string & code) {
+            const auto toks = common_tokenize(vocab, code, false, false);
+            if (toks.size() != 1 || std::find(used.begin(), used.end(), toks[0]) != used.end()) {
+                return false;
+            }
+            used.push_back(toks[0]);
+            llama_tokens group = {toks[0]};
+            for (const llama_token tok : get_single_tokens({" " + code})) {
+                if (tok != toks[0]) {
+                    group.push_back(tok);
+                }
+            }
+            texts.push_back(code);
+            groups.push_back(group);
+            return true;
+        };
+        for (const auto & code : codes) {
+            bool is_taken = take(code);
+            for (size_t i = 0; !is_taken && i < pool.size(); i++) {
+                is_taken = take(pool[i]);
+            }
+            if (!is_taken) {
+                throw std::invalid_argument(string_format("no single-token label left for %zu options", n_options));
+            }
+        }
+    }
+
     json render_options(const decision_question & question, size_t variant) const { // server_decision_context::render_options
         const size_t n_options = question.options.size();
 
+        std::vector<std::string>  d1_texts;
+        std::vector<llama_tokens> d1_groups;
+        if (type == COMMON_DECISION_TYPE_LFM2_D1) {
+            d1_labels(question, d1_texts, d1_groups);
+        }
         // the second variant shows the options in the reverse order
         json options = json::array();
         for (size_t i = 0; i < n_options; i++) {
@@ -548,6 +657,9 @@ struct Engine::Impl {
             }
             if (!label_texts.empty()) {
                 option["label"] = label_texts[i];
+            }
+            if (!d1_texts.empty()) {
+                option["label"] = d1_texts[i];
             }
             options.push_back(option);
         }
@@ -623,6 +735,15 @@ struct Engine::Impl {
         if (type == COMMON_DECISION_TYPE_OPENJEV || type == COMMON_DECISION_TYPE_LEV || type == COMMON_DECISION_TYPE_NIMBLE || type == COMMON_DECISION_TYPE_PPLX_DECIDER) {
             // lev reads the ratings of a noul question at its first labels, not at the digits
             task.labels.assign(labels.begin(), labels.begin() + n_outputs(question));
+        }
+        if (type == COMMON_DECISION_TYPE_LFM2_D1) {
+            std::vector<std::string>  texts;
+            std::vector<llama_tokens> groups;
+            d1_labels(question, texts, groups);
+            for (const auto & group : groups) {
+                task.labels.insert(task.labels.end(), group.begin(), group.end());
+                task.label_groups.push_back(group.size());
+            }
         }
 
         llama_tokens tokens = common_tokenize(vocab, prompt, false, true);
@@ -982,6 +1103,18 @@ struct Engine::Impl {
                     throw std::runtime_error("decision label is outside the vocabulary");
                 }
                 scores.push_back(logits[label]);
+            }
+            if (!task.label_groups.empty()) {
+                std::vector<float> grouped;
+                size_t i = 0;
+                for (const int32_t n : task.label_groups) {
+                    if (n <= 0 || i + n > scores.size()) {
+                        throw std::runtime_error("decision label groups do not match the labels");
+                    }
+                    grouped.push_back(*std::max_element(scores.begin() + i, scores.begin() + i + n));
+                    i += n;
+                }
+                scores = std::move(grouped);
             }
             return scores;
         }

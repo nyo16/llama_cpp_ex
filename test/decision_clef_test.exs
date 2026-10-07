@@ -13,10 +13,9 @@ defmodule LlamaCppEx.DecisionClefTest do
         mix test test/decision_clef_test.exs --include decision_clef
 
   The model is loaded with `n_gpu_layers: -1` on purpose: the routing test asks
-  whether clef works on the build and device you have. At llama.cpp `c479922ac`
-  it fails on Metal (billing 0.28 where the CPU gives 0.977, and upstream's own
-  server on Metal agrees with the wrong number) — upstream defect #4 in
-  docs/release-guide.md. It passes on the CPU build, or with `n_gpu_layers: 0`.
+  whether clef works on the build and device you have. It caught llama.cpp's
+  Metal MUL_MAT+ADD fusion picking the wrong residual (billing 0.28 where the
+  CPU gave 0.977; fixed upstream in #30100, in the pin since v0.8.56).
   """
   use ExUnit.Case, async: false
 

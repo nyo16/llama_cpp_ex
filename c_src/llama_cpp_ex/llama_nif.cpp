@@ -2906,7 +2906,7 @@ decision_init(ErlNifEnv* env, fine::ResourcePtr<LlamaContext> ctx) {
         return fine::Error(std::string(e.what()));
     }
 }
-// Dirty: tokenizes up to 702 label codes (lev, nimble) and parses the template.
+// Dirty: tokenizes up to 702 label codes (lev, nimble, pplx-decider) and parses the template.
 FINE_NIF(decision_init, ERL_NIF_DIRTY_JOB_CPU_BOUND);
 
 // The request is untrusted JSON. nlohmann's parser and the port's own

@@ -433,7 +433,9 @@ answers.urgency # => %{type: :score, score: 1.153, confidence: 0.811,
 {:ok, result} = LlamaCppEx.decide(model, state, questions)
 ```
 
-The model file declares its decision type; `LlamaCppEx.Decision.model_type/1` reads it. All seven upstream types are supported: `openjev`, `lev`, `nimble`, `pplx-decider` (label logits), `kev` (hidden-state dot product), `laya` (ModernBERT encoder) and `clef` (all questions decided jointly in one prompt). ggml-org publishes them in its "Decision models" Hugging Face collection, e.g. [`ggml-org/Laya-GGUF`](https://huggingface.co/ggml-org/Laya-GGUF), [`ggml-org/Clef-Flash-GGUF`](https://huggingface.co/ggml-org/Clef-Flash-GGUF), [`ggml-org/OpenJev-GGUF`](https://huggingface.co/ggml-org/OpenJev-GGUF).
+The model file declares its decision type; `LlamaCppEx.Decision.model_type/1` reads it. All eight upstream types are supported: `openjev`, `lev`, `nimble`, `pplx-decider`, `lfm2-d1` (label logits), `kev` (hidden-state dot product), `laya` (ModernBERT encoder) and `clef` (all questions decided jointly in one prompt). ggml-org publishes them in its "Decision models" Hugging Face collection, e.g. [`ggml-org/Laya-GGUF`](https://huggingface.co/ggml-org/Laya-GGUF), [`ggml-org/Clef-Flash-GGUF`](https://huggingface.co/ggml-org/Clef-Flash-GGUF), [`ggml-org/OpenJev-GGUF`](https://huggingface.co/ggml-org/OpenJev-GGUF); LiquidAI publishes `d1-3B`.
+
+`lfm2-d1` is [LiquidAI/d1-3B](https://huggingface.co/LiquidAI/d1-3B) (3B, LFM2.5-VL-based, accepts a `nil` state). Upstream renamed its type from `d1` to `lfm2-d1` in the second commit of the PR that added it (#30110); a GGUF converted before that loads as `model_type/1 == :unknown` and `Decision.new/2` returns `{:error, "unsupported decision model type: d1"}` — the same refusal `llama-server` gives. Re-convert, or rewrite the `lfm2.decision.type` key to `"lfm2-d1"` (one `gguf-py` call); checked against upstream on such a file, every probability and token count agrees.
 
 Limits: text only (upstream's image input needs libmtmd, which this build does not link), laya and clef evaluate the whole prompt in one batch (`:n_batch`, 2048 by default), and a `%Decision{}` is single-process like a `Context`.
 
@@ -451,21 +453,11 @@ decision head is Q8_0 in every file) and
 The `mmproj-*` files in both repos are for image input, which this binding
 does not link.
 
-> **Apple Silicon:** at the current llama.cpp pin, clef answers are wrong on
-> the Metal backend — the request below gives `billing` 0.28 / `technical`
-> 0.43 fully offloaded on an M1 Max, and the correct `billing` 0.977 /
-> `technical` 0.009 on the CPU. Upstream's own `llama-server` on Metal gives
-> the same wrong numbers, and laya/openjev are unaffected, so it is Metal's
-> handling of clef's joint prompt. Load clef with `n_gpu_layers: 0` on macOS
-> until it is fixed upstream (defect #4 in `docs/release-guide.md`); CUDA was
-> not measured.
-
 ```elixir
 {:ok, model} =
   LlamaCppEx.load_model_from_hub(
     "bartowski/Cloudflare_clef-flash-GGUF", "Cloudflare_clef-flash-Q4_K_M.gguf",
-    # -1 on CUDA; 0 on Apple Silicon, see above
-    n_gpu_layers: 0
+    n_gpu_layers: -1
   )
 
 LlamaCppEx.Decision.model_type(model)
@@ -518,14 +510,149 @@ answers.route.choice   # => :technical  (0.990)
 answers.angry.noul     # => 0.022
 ```
 
+#### More clef examples
+
+All numbers below are `Cloudflare_clef-flash-Q8_0` on an M1 Max (Metal),
+rounded; each request is one forward pass over one prompt.
+
+**A record as the state.** A map is given to the model as JSON text, so a
+database row or an API payload works as is:
+
+```elixir
+order = %{
+  "order_id" => "A-10492",
+  "items" => [%{"sku" => "KB-77", "qty" => 2, "price" => 129.0}],
+  "shipping_country" => "DE",
+  "payment" => %{"method" => "card", "attempts" => 3, "last_error" => "insufficient_funds"},
+  "customer_note" => "Please ship before Friday, it's a birthday gift."
+}
+
+{:ok, %{answers: a, usage: %{input_tokens: 408}}} =
+  LlamaCppEx.Decision.decide(decision, order,
+    payment_ok: [type: :noul, instructions: "Did the payment succeed?"],
+    risk: [
+      type: :score,
+      instructions: "How likely is this order to be fraudulent?",
+      criteria: ["very unlikely", "unlikely", "possible", "likely"]
+    ],
+    action: [
+      type: :choice,
+      instructions: "What should happen next?",
+      criteria: [
+        ship: "ship the order as is",
+        retry_payment: "ask the customer to retry the payment",
+        manual_review: "hold for a human to review"
+      ]
+    ]
+  )
+
+a.payment_ok.noul    # => 0.022
+a.risk.score         # => 1.198  (legend 1 = "unlikely"; probabilities 0.17 / 0.55 / 0.19 / 0.09)
+a.action.choice      # => :retry_payment  (0.954; ship 0.007, manual_review 0.039)
+```
+
+**Moderation as one `choice`.** Describe the categories; a single described
+choice reads a veiled threat that a bare yes/no question does not (the same
+first message scores `noul` 0.02 on "Does the message contain harassment,
+threats or hate speech?"):
+
+```elixir
+category = [
+  type: :choice,
+  instructions: "Classify the message.",
+  criteria: [
+    ok: "normal message",
+    spam: "spam or advertising",
+    threat: "threat or intimidation",
+    hate: "hate speech"
+  ]
+]
+
+for msg <- messages do
+  {:ok, %{answers: %{category: c}}} = LlamaCppEx.Decision.decide(decision, msg, category: category)
+  {c.choice, c.probabilities[c.choice]}
+end
+```
+
+| message | choice |
+|---|---|
+| "If I see you at the office tomorrow you'll regret it." | `:threat` 0.68 |
+| "I know where you live. Watch your back." | `:threat` 0.96 |
+| "You people are subhuman and should be wiped out." | `:hate` 0.87 |
+| "Super Produkt, schnelle Lieferung. Danke!" | `:ok` 0.93 |
+| "BUY CHEAP WATCHES NOW!!! visit w4tch-deals.example" | `:spam` 0.98 |
+
+**RAG verification.** Grade a generated answer against the passage it was
+supposed to come from. Prose with a natural shape is better given as text than
+as a map: "does the passage contain the information needed to answer the
+question?" on `"Question: ...\n\nPassage: ..."` scores 0.92, the same content
+as `%{"question" => ..., "passage" => ...}` 0.29, and an unrelated passage
+0.02.
+
+```elixir
+passage = "Physical goods can be returned within 30 days of delivery. Digital purchases are final and cannot be refunded once downloaded."
+question = "What is the refund window for digital purchases?"
+
+grade = fn draft ->
+  state = "Question: #{question}\n\nPassage: #{passage}\n\nDraft answer: #{draft}"
+
+  {:ok, %{answers: a}} =
+    LlamaCppEx.Decision.decide(decision, state,
+      grounded: [type: :noul, instructions: "Is the draft answer supported by the passage?"],
+      quality: [
+        type: :score,
+        instructions: "How good is the draft answer?",
+        criteria: ["wrong", "partly wrong", "mostly right", "correct"]
+      ]
+    )
+
+  {a.grounded.noul, a.quality.score}
+end
+
+grade.("You can get a refund on digital purchases within 30 days.")
+# => {0.019, 0.141}   — "wrong" at 0.91
+
+grade.("Digital purchases cannot be refunded once downloaded; only physical goods have a 30-day window.")
+# => {0.956, 2.714}   — "correct" at 0.83
+```
+
+**Route or escalate.** `confidence` is the answer's margin, so a threshold turns
+the model into a classifier that knows when to hand off:
+
+```elixir
+route = [
+  type: :choice,
+  instructions: "Which team should handle this?",
+  criteria: [billing: nil, shipping: nil, technical: nil]
+]
+
+assign = fn ticket ->
+  {:ok, %{answers: %{route: r}}} = LlamaCppEx.Decision.decide(decision, ticket, route: route)
+  if r.confidence >= 0.8, do: r.choice, else: {:human, r.choice, r.confidence}
+end
+
+assign.("I was charged twice for my order last week and nobody has replied.")
+# => :billing                     (0.94)
+assign.("Where is my package? Tracking has not updated in 6 days.")
+# => :shipping                    (0.94)
+assign.("The app crashes when I open the settings page on Android 15.")
+# => :technical                   (0.98)
+assign.("I want to change my shipping address and also my card was declined, not sure which is the issue.")
+# => {:human, :shipping, 0.495}   — genuinely ambiguous, so it goes to a person
+```
+
 Clef specifics: a `choice` takes up to 255 options and shows them to the model
 sorted by key (answers still come back under the keys you gave); the questions
 of one request are decided together, so their order is visible to the model —
-pass a keyword list, not a map, when it matters. On an M1 Max the three
-questions above take ~5.6 s on the CPU at Q8_0 (one 324-token prompt). The
-opt-in `test/decision_clef_test.exs` runs against this model
-(`LLAMA_SMOKE_DECISION_CLEF_MODEL`, tag `:decision_clef`); on a Metal build its
-routing test fails at this pin for the reason above.
+pass a keyword list, not a map, when it matters — and so are each other: in
+the RAG example, the relevance question above scores 0.06 *in the same
+request* as the bad draft, against 0.92 on its own, because the wrong draft is
+in the prompt the model reads for every question. Put a
+judgement that must not see the others in its own request. On an M1 Max the
+three questions of the first example take ~0.7 s on Metal and ~5.6 s on the
+CPU build at Q8_0 (one 324-token prompt). The opt-in
+`test/decision_clef_test.exs` runs against this model
+(`LLAMA_SMOKE_DECISION_CLEF_MODEL`, tag `:decision_clef`).
 
 ## Lower-level API
 

@@ -14,10 +14,12 @@ defmodule LlamaCppEx.Decision do
   The model file says what kind of decision model it is
   (`"<arch>.decision.type"`); `model_type/1` reads it. Supported types:
 
-    * `:openjev`, `:lev`, `:nimble`, `:pplx_decider` - read the logits of one
-      label token per option (`:nimble` lists every question of the request in
-      each prompt, `:lev` asks each choice twice with the options reversed,
-      `:pplx_decider` uses one- or two-letter label codes like `:lev`).
+    * `:openjev`, `:lev`, `:nimble`, `:pplx_decider`, `:lfm2_d1` - read the
+      logits of one label token per option (`:nimble` lists every question of
+      the request in each prompt, `:lev` asks each choice twice with the
+      options reversed, `:pplx_decider` uses one- or two-letter label codes
+      like `:lev`, `:lfm2_d1` picks label codes per question and accepts a
+      `nil` state).
     * `:kev` - scores each option by a dot product of hidden states.
     * `:laya` - a ModernBERT encoder; one score per `[MASK]` marker.
     * `:clef` - reads every question in one prompt and decides them jointly.
@@ -36,7 +38,7 @@ defmodule LlamaCppEx.Decision do
     * `:criteria` - depends on `:type`:
       * `:choice` - the options, mapping each option key to its description
         (`nil` for none). The number of options is capped by the model: 52
-        for openjev, 255 for laya, clef and pplx-decider.
+        for openjev, 255 for laya, clef, pplx-decider and lfm2-d1.
       * `:score` - a list of 2 to 10 level descriptions, lowest first.
       * `:noul` - optional; `%{"true" => ..., "false" => ...}` descriptions.
 
@@ -110,7 +112,8 @@ defmodule LlamaCppEx.Decision do
   @enforce_keys [:ref, :context, :type]
   defstruct [:ref, :context, :type]
 
-  @type decision_type :: :openjev | :lev | :kev | :nimble | :laya | :clef | :pplx_decider
+  @type decision_type ::
+          :openjev | :lev | :kev | :nimble | :laya | :clef | :pplx_decider | :lfm2_d1
 
   @type t :: %__MODULE__{
           ref: reference(),
@@ -153,13 +156,14 @@ defmodule LlamaCppEx.Decision do
     "nimble" => :nimble,
     "laya" => :laya,
     "clef" => :clef,
-    "pplx-decider" => :pplx_decider
+    "pplx-decider" => :pplx_decider,
+    "lfm2-d1" => :lfm2_d1
   }
 
   # Mirror upstream's common_init_result and can_share_prompt; decision.cpp
   # checks the first of these against the context it is handed.
   @reads_embeddings [:laya, :kev, :clef]
-  @shares_prompt [:openjev, :lev, :kev, :nimble, :pplx_decider]
+  @shares_prompt [:openjev, :lev, :kev, :nimble, :pplx_decider, :lfm2_d1]
 
   @default_n_ctx 4096
   @default_n_batch_embeddings 2048
@@ -187,7 +191,8 @@ defmodule LlamaCppEx.Decision do
   The context is shaped for the model's decision type: laya, kev and clef read
   the embeddings output, so their context has embeddings on and no pooling; the
   types that share a prompt prefix across questions (openjev, lev, kev, nimble,
-  pplx-decider) get a second sequence to evaluate that prefix once per request.
+  pplx-decider, lfm2-d1) get a second sequence to evaluate that prefix once per
+  request.
 
   ## Options
 
