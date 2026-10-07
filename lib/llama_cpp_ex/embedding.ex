@@ -83,14 +83,24 @@ defmodule LlamaCppEx.Embedding do
       longest = tokenized |> Enum.map(&length/1) |> Enum.max()
       budget = max(n_ctx, longest + 8)
       groups = group_by_budget(tokenized, budget, max_seqs)
-      max_group = groups |> Enum.map(&length/1) |> Enum.max()
+      n_seq_max = groups |> Enum.map(&length/1) |> Enum.max() |> max(1)
+
+      # llama_context reserves its prompt graph for n_ubatch tokens rounded up to
+      # a multiple of n_seq_max but keeps n_outputs at n_ubatch; mean pooling
+      # multiplies the two and GGML_ASSERTs — aborting the VM — when they differ
+      # (any model: Qwen3-Embedding with pooling_type: :mean and 5 texts). A
+      # context that is already a multiple of n_seq_max leaves nothing to round.
+      # n_batch follows n_ctx (llama clamps it to n_ctx for causal models) and
+      # the NIF sets n_ubatch = n_batch for embedding contexts.
+      n_ctx = div(budget + n_seq_max - 1, n_seq_max) * n_seq_max
 
       with {:ok, ctx} <-
              Context.create(model,
-               n_ctx: budget,
+               n_ctx: n_ctx,
+               n_batch: n_ctx,
                embeddings: true,
                pooling_type: pooling_type,
-               n_seq_max: max(max_group, 1)
+               n_seq_max: n_seq_max
              ) do
         decode_groups(ctx, groups, normalize, format)
       end

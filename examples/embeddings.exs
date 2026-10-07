@@ -10,7 +10,7 @@ model_path =
 {:ok, model} = LlamaCppEx.load_model(model_path, n_gpu_layers: -1)
 
 IO.puts("Model: #{LlamaCppEx.Model.desc(model)}")
-IO.puts("Embedding dimensions: #{LlamaCppEx.Model.n_embd(model)}")
+IO.puts("Embedding dimensions: #{LlamaCppEx.Model.n_embd_out(model)}")
 IO.puts("---")
 
 # --- Single embedding ---

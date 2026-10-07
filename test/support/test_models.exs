@@ -30,7 +30,12 @@ defmodule LlamaCppEx.TestModels do
     # (ggml-org/tinylaya-for-testing-gguf, ggml-org/tinyopenjev-for-testing-gguf)
     # are small enough for CI.
     decision_laya: {"LLAMA_SMOKE_DECISION_LAYA_MODEL", "a laya decision"},
-    decision_openjev: {"LLAMA_SMOKE_DECISION_OPENJEV_MODEL", "an openjev decision"}
+    decision_openjev: {"LLAMA_SMOKE_DECISION_OPENJEV_MODEL", "an openjev decision"},
+    # The joint readout: every question in one prompt, one score row per
+    # option. No tiny test model exists, so this is the real Clef Flash (9B,
+    # e.g. bartowski/Cloudflare_clef-flash-GGUF Q4_K_M or ggml-org/Clef-Flash-GGUF)
+    # behind its own tag.
+    decision_clef: {"LLAMA_SMOKE_DECISION_CLEF_MODEL", "a clef decision"}
   }
 
   @kinds Map.keys(@vars)
@@ -44,6 +49,7 @@ defmodule LlamaCppEx.TestModels do
           | :mtp_e4b_draft
           | :decision_laya
           | :decision_openjev
+          | :decision_clef
 
   @doc "Name of the environment variable holding the model path for `kind`."
   @spec var(kind()) :: String.t()

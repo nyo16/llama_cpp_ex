@@ -114,6 +114,18 @@ build and serve commands) on tinylaya, tinyopenjev and any decision model on
 disk. A new decision *type* is a new branch in `init`, in `@types` in
 `lib/llama_cpp_ex/decision.ex`, and in the two type lists beside it.
 
+Run the comparison on the **Metal** build (NIF and reference server both). Two
+CPU builds with identical cmake flags still differ by up to 9e-4 on
+tinylaya's near-uniform random-weight outputs, which is inside the script's
+1e-3 bar but enough to flip the argmax of its 12-option request and trip the
+choice check; and at `c479922ac` the CPU-only `llama-server` aborts on Clef
+Flash at startup (`GGML_ASSERT(*cur_backend_id != -1)` in
+`resolve_fused_ops`, with or without `-fit off`, `-np 1`, `-dev none`), while
+the NIF runs the same model fine. On Metal all three agree to 1.5e-6 or
+exactly. Keep question *order* identical on both sides: clef decides jointly,
+so `[route, angry]` and `[angry, route]` are different prompts — build the
+server's JSON from the same keyword list, not from a map (which sorts).
+
 ### Upstream defects we work around
 
 Three known llama.cpp defects have workarounds in this repo. A bump is the only
@@ -162,6 +174,38 @@ the `NULL` `set_tensor_2d`/`get_tensor_2d` hooks are unchanged. The
 `ggml-cuda.cu` diff is MMVQ/MMVF/fusion work plus the same `alloc_buffer_n`
 slots, none of it near `ggml_backend_cuda_comm_init`.
 
+Re-checked at `c479922ac` (b11458), covering the gap from `e117148a4`: #1 and
+#3 still stand — `ggml-cpu/CMakeLists.txt` is untouched and
+`ggml_backend_rpc_start_server` still returns `void` with the same signature.
+**#2 has moved.** #26610 (RPC `-sm tensor`) implements exactly what the "Still
+needed?" column names: the RPC buffer's `set_tensor_2d`/`get_tensor_2d` hooks
+(and their `_async` backend variants) are no longer `NULL`, and the RPC backend
+now exposes `ggml_backend_comm_init` with `RPC_CMD_COMM_INIT` /
+`RPC_CMD_COMM_ALLREDUCE` /
+`RPC_CMD_COMM_FREE`, so an all-CUDA-plus-RPC set no longer has to fall back to
+the generic butterfly over 1-D copies. `ggml_backend_cuda_comm_init` itself is
+untouched. The workaround is documentation only (`:layer` across hosts), so
+there is nothing to delete; the tp=2 verdict in [DGX Spark](dgx-spark.md) is
+now a claim about an older build and has to be re-measured with
+`mix run bench/spark_tensor_split.exs remote` on Spark hardware before it is
+changed. This bump was done on an M1 Max, so that measurement is still owed.
+`RPC_PROTO_MAJOR_VERSION` went 7 → 8 with it: a worker and a client must come
+from the same build.
+
+Re-checked at `88dcc460d` (b11479+4), covering the gap from `c479922ac`: #1,
+#2 and #3 are as above — none of the three files changed in the 25 commits.
+This range also **fixes a fourth defect found at the previous pin**: the Metal
+`MUL_MAT+ADD` fusion picked the residual as "the ADD operand that is not a
+MUL_MAT", which is both operands when the residual is itself a mat-mul — the
+clef head's `options = proj_option_context @ ctx + proj_option_lexical @ lex`
+— so the fused kernel added a never-written buffer and Clef Flash routed
+`billing` 0.28 where the CPU gave 0.977. Found by `test/decision_clef_test.exs`
+(loaded with `n_gpu_layers: -1` for exactly this reason), bisected with
+`GGML_METAL_FUSION_DISABLE=1` then one fusion-table row at a time, fixed
+upstream in #30100 (`7e8324f5f`, with a `mm2+mm` mode in `test-backend-ops`
+that fails 27 of 28 cases without it). Nothing to remove here: the workaround
+was a README note, now gone.
+
 | # | Upstream defect | Our workaround | Still needed? |
 |---|---|---|---|
 | 1 | `GGML_NATIVE=ON` makes ggml's `-mcpu=native` probe resolve to **base ARMv8-A** on Cortex-X925/A725 with GCC 13.3 — silently, with a soft CMake warning and exit 0. Costs every `sdot`/`smmla`/SVE kernel. | `LLAMA_CPU_ARM_ARCH` + `LLAMA_CUDA_ARCH` in the `Makefile`, which must be set together. See [DGX Spark](dgx-spark.md) and [Cross-Platform Builds](cross-platform-builds.md). | `scripts/spark/verify-build-flags.sh` on an aarch64 host. If a default build (no `LLAMA_CPU_ARM_ARCH`) now reports non-zero `sdot`/`smmla`, upstream fixed the probe. |
@@ -193,6 +237,28 @@ LLAMA_SMOKE_GEN_MODEL=~/Downloads/Qwen3.5-0.8B-UD-Q4_K_XL.gguf \
 LLAMA_SMOKE_EMB_MODEL=~/Downloads/Qwen3-Embedding-0.6B-f16.gguf \
 LLAMA_SMOKE_MTP_MODEL=~/Downloads/Qwen3.6-35B-A3B-MTP-UD-Q4_K_XL.gguf \
   mix test --include smoke --include embeddings --include slow --include mtp
+
+# A second embedding model worth running: embeddinggemma-2 has n_embd_out
+# (768) != n_embd (512) and defaults to mean pooling, which together caught
+# two bugs in v0.8.56 that Qwen3-Embedding (last pooling, equal widths) cannot.
+GGML_METAL_NO_RESIDENCY=1 \
+LLAMA_SMOKE_EMB_MODEL=~/Downloads/embeddinggemma-2-Q8_0.gguf \
+  mix test --include embeddings
+
+# The decision tags: the tiny laya/openjev pair that CI uses, and the real
+# Clef Flash (9B) behind its own tag because no tiny clef exists.
+GGML_METAL_NO_RESIDENCY=1 \
+LLAMA_SMOKE_DECISION_LAYA_MODEL=~/Downloads/tinylaya-for-testing-Q8_0.gguf \
+LLAMA_SMOKE_DECISION_OPENJEV_MODEL=~/Downloads/tinyopenjev-for-testing-Q8_0.gguf \
+  mix test --include decision
+
+GGML_METAL_NO_RESIDENCY=1 \
+LLAMA_SMOKE_DECISION_CLEF_MODEL=~/Downloads/Cloudflare_clef-flash-Q8_0.gguf \
+  mix test --include decision_clef
+
+# lfm2-d1 has no tag: check it with scripts/decision_compare.exs (below) on a
+# d1-3B GGUF whose lfm2.decision.type reads "lfm2-d1" — the quants published
+# before upstream's rename say "d1" and are refused by both sides.
 
 GGML_METAL_NO_RESIDENCY=1 \
 LLAMA_SMOKE_MTP_MODEL=~/Downloads/Qwen3.8-27B-Q4_K_M.gguf \

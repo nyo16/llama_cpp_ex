@@ -65,6 +65,20 @@ defmodule LlamaCppEx.EmbeddingsTest do
     assert max_elementwise_diff(grouped, reference) < 1.0e-3
   end
 
+  # Regression: llama_context reserves its prompt graph for n_ubatch rounded up
+  # to a multiple of n_seq_max while n_outputs stays at n_ubatch; mean pooling
+  # multiplies the two and GGML_ASSERTs when they differ, taking the VM down at
+  # context creation. Five texts do not divide any power-of-two batch, and
+  # :mean forces the pooling path on models that default to :last.
+  test "embed_batch with mean pooling survives a sequence count that does not divide the batch",
+       %{emb_model: em} do
+    texts = for i <- 1..5, do: "sentence number #{i}"
+
+    assert {:ok, vectors} = LlamaCppEx.embed_batch(em, texts, pooling_type: :mean)
+    assert length(vectors) == 5
+    assert Enum.all?(vectors, &(length(&1) == LlamaCppEx.Model.n_embd_out(em)))
+  end
+
   defp max_elementwise_diff(a, b) do
     Enum.zip(a, b)
     |> Enum.map(fn {va, vb} ->

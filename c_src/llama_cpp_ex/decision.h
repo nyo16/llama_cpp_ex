@@ -33,8 +33,8 @@ std::string model_type(const llama_model * model);
 bool type_reads_embeddings(const std::string & type);
 
 // True for the types whose prompts share a prefix across the questions of one
-// request (openjev, lev, kev, nimble). The prefix is evaluated once when the
-// context has n_seq_max >= 2.
+// request (openjev, lev, kev, nimble, pplx-decider, lfm2-d1). The prefix is
+// evaluated once when the context has n_seq_max >= 2.
 bool type_shares_prompt(const std::string & type);
 
 class Engine {

@@ -217,6 +217,103 @@ Download GGUF models directly from HuggingFace Hub. Requires the optional `:req`
 
 For private/gated models, set `HF_TOKEN` or pass `token: "hf_..."`. Set `LLAMA_OFFLINE=1` for offline-only cached access.
 
+## Embeddings
+
+`LlamaCppEx.embed/3` and `LlamaCppEx.embed_batch/3` run an embedding GGUF and
+return one L2-normalized vector per text (`normalize: -1` for raw, `format:
+:binary` for a zero-copy f32 binary that `Nx.from_binary(bin, :f32)` loads).
+`embed_batch/3` packs the texts into one context as separate sequences and
+decodes them in as few batches as fit. The vector length is
+`LlamaCppEx.Model.n_embd_out/1` — not `n_embd/1`, which is the hidden width
+and differs for models with an output projection.
+
+### EmbeddingGemma 2
+
+[`google/embeddinggemma-2`](https://huggingface.co/google/embeddinggemma-2) is
+a 270M-parameter text embedder (768-dimensional output from a 512-wide
+backbone, 100+ languages and code, Apache 2.0). ggml-org publishes it as
+[`ggml-org/embeddinggemma-2-GGUF`](https://huggingface.co/ggml-org/embeddinggemma-2-GGUF)
+in Q8_0 (310 MB) and BF16 (558 MB); the `mmproj-*` files beside them hold the
+vision and audio encoders, which need libmtmd and are not used by this
+binding — text input only. Needs llama.cpp `b11452` or later (#30054), so
+`llama_cpp_ex` 0.8.56+; the full 768 dimensions also need 0.8.56's
+`n_embd_out` fix.
+
+```elixir
+:ok = LlamaCppEx.init()
+
+{:ok, model} =
+  LlamaCppEx.load_model_from_hub("ggml-org/embeddinggemma-2-GGUF", "embeddinggemma-2-Q8_0.gguf",
+    n_gpu_layers: -1
+  )
+
+LlamaCppEx.Model.n_embd_out(model)
+# => 768
+
+# Retrieval is asymmetric: one prefix for the query, another for the documents.
+# `title: none` when a document has no title.
+{:ok, query} = LlamaCppEx.embed(model, "task: search result | query: What causes the northern lights?")
+
+{:ok, [aurora, elixir]} =
+  LlamaCppEx.embed_batch(model, [
+    "title: none | text: The northern lights are caused by charged particles from the sun colliding with the atmosphere.",
+    "title: none | text: Elixir is a dynamic, functional language for building scalable applications."
+  ])
+
+# Vectors are unit length, so the dot product is the cosine similarity.
+dot = fn a, b -> Enum.zip_with(a, b, &(&1 * &2)) |> Enum.sum() end
+dot.(query, aurora)   # => 0.8755
+dot.(query, elixir)   # => 0.5924
+```
+
+The model is trained with a short task prefix on every text; leaving it off
+still works but loses precision. Asymmetric tasks pair a query prefix with the
+document form, symmetric tasks put the same prefix on every side:
+
+| Task | Query / input prefix | Document form |
+|---|---|---|
+| Search | `task: search result \| query: {q}` | `title: {title} \| text: {content}` |
+| Question answering | `task: question answering \| query: {q}` | `title: {title} \| text: {passage}` |
+| Fact checking | `task: fact checking \| query: {claim}` | `title: {title} \| text: {evidence}` |
+| Code search | `task: code retrieval \| query: {q}` | `title: {filename} \| text: {code}` |
+| Classification | `task: classification \| query: {text}` | — |
+| Clustering | `task: clustering \| query: {text}` | — |
+| Sentence similarity | `task: sentence similarity \| query: {text}` | — |
+
+```elixir
+{:ok, [a, b, c]} =
+  LlamaCppEx.embed_batch(model, [
+    "task: sentence similarity | query: The cat sleeps on the sofa.",
+    "task: sentence similarity | query: A cat is napping on the couch.",
+    "task: sentence similarity | query: Quarterly revenue grew by 12%."
+  ])
+
+dot.(a, b)   # => 0.9853
+dot.(a, c)   # => 0.7010
+```
+
+**Matryoshka truncation.** The 768 dimensions are ordered by importance, so a
+vector can be cut to its first 512, 256 or 128 and re-normalized (slicing a
+unit vector does not keep it unit length). Queries and documents must share a
+dimension. Google reports near-lossless quality down to 256 for text;
+the retrieval example above keeps its ranking at 256 (0.899 vs 0.611):
+
+```elixir
+truncate = fn vec, dim ->
+  head = Enum.take(vec, dim)
+  norm = :math.sqrt(Enum.reduce(head, 0.0, &(&2 + &1 * &1)))
+  Enum.map(head, &(&1 / norm))
+end
+
+q256 = truncate.(query, 256)
+dot.(q256, truncate.(aurora, 256))   # => 0.8994
+dot.(q256, truncate.(elixir, 256))   # => 0.6111
+```
+
+Through `LlamaCppEx.ModelManager` the same model is `capabilities: [:embed]`
+(see [Multiple Models](#multiple-models-modelmanager)); the task prefixes are
+part of the text you pass to `ModelManager.embed/2`.
+
 ## Structured Output (JSON Schema)
 
 Constrain model output to valid JSON matching a schema. Pass `:json_schema` to any generate or chat function — the schema is automatically converted to a GBNF grammar via llama.cpp's built-in converter.
@@ -336,9 +433,226 @@ answers.urgency # => %{type: :score, score: 1.153, confidence: 0.811,
 {:ok, result} = LlamaCppEx.decide(model, state, questions)
 ```
 
-The model file declares its decision type; `LlamaCppEx.Decision.model_type/1` reads it. All six upstream types are supported: `openjev`, `lev`, `nimble` (label logits), `kev` (hidden-state dot product), `laya` (ModernBERT encoder) and `clef` (all questions decided jointly in one prompt). ggml-org publishes them in its "Decision models" Hugging Face collection, e.g. [`ggml-org/Laya-GGUF`](https://huggingface.co/ggml-org/Laya-GGUF), [`ggml-org/Clef-Flash-GGUF`](https://huggingface.co/ggml-org/Clef-Flash-GGUF), [`ggml-org/OpenJev-GGUF`](https://huggingface.co/ggml-org/OpenJev-GGUF).
+The model file declares its decision type; `LlamaCppEx.Decision.model_type/1` reads it. All eight upstream types are supported: `openjev`, `lev`, `nimble`, `pplx-decider`, `lfm2-d1` (label logits), `kev` (hidden-state dot product), `laya` (ModernBERT encoder) and `clef` (all questions decided jointly in one prompt). ggml-org publishes them in its "Decision models" Hugging Face collection, e.g. [`ggml-org/Laya-GGUF`](https://huggingface.co/ggml-org/Laya-GGUF), [`ggml-org/Clef-Flash-GGUF`](https://huggingface.co/ggml-org/Clef-Flash-GGUF), [`ggml-org/OpenJev-GGUF`](https://huggingface.co/ggml-org/OpenJev-GGUF); LiquidAI publishes `d1-3B`.
+
+`lfm2-d1` is [LiquidAI/d1-3B](https://huggingface.co/LiquidAI/d1-3B) (3B, LFM2.5-VL-based, accepts a `nil` state). Upstream renamed its type from `d1` to `lfm2-d1` in the second commit of the PR that added it (#30110); a GGUF converted before that loads as `model_type/1 == :unknown` and `Decision.new/2` returns `{:error, "unsupported decision model type: d1"}` — the same refusal `llama-server` gives. Re-convert, or rewrite the `lfm2.decision.type` key to `"lfm2-d1"` (one `gguf-py` call); checked against upstream on such a file, every probability and token count agrees.
 
 Limits: text only (upstream's image input needs libmtmd, which this build does not link), laya and clef evaluate the whole prompt in one batch (`:n_batch`, 2048 by default), and a `%Decision{}` is single-process like a `Context`.
+
+### Clef Flash
+
+[Cloudflare/clef-flash](https://huggingface.co/Cloudflare/clef-flash) is a 9B
+Qwen3.5-based clef model: one prompt carries the state *and every question*,
+and the model decides them jointly, so the state is paid for once per request
+rather than once per question. GGUFs:
+[`bartowski/Cloudflare_clef-flash-GGUF`](https://huggingface.co/bartowski/Cloudflare_clef-flash-GGUF)
+(Q2_K through Q8_0 and bf16; static quants, because an imatrix cannot be
+calibrated on a model that generates nothing, so prefer Q4_K_M or larger — the
+decision head is Q8_0 in every file) and
+[`ggml-org/Clef-Flash-GGUF`](https://huggingface.co/ggml-org/Clef-Flash-GGUF).
+The `mmproj-*` files in both repos are for image input, which this binding
+does not link.
+
+```elixir
+{:ok, model} =
+  LlamaCppEx.load_model_from_hub(
+    "bartowski/Cloudflare_clef-flash-GGUF", "Cloudflare_clef-flash-Q4_K_M.gguf",
+    n_gpu_layers: -1
+  )
+
+LlamaCppEx.Decision.model_type(model)
+# => :clef
+
+# Clef reads the embeddings output, so Decision.new/2 builds a context with
+# embeddings on, no pooling, and n_batch = n_ubatch = min(n_ctx, 2048): the
+# whole prompt (state + all questions + options) is evaluated in one batch and
+# has to fit. Raise :n_ctx and :n_batch together for long states.
+{:ok, decision} = LlamaCppEx.Decision.new(model, n_ctx: 8192, n_batch: 8192)
+
+questions = [
+  route: [
+    type: :choice,
+    instructions: "Which team should handle this?",
+    criteria: [billing: nil, shipping: nil, technical: nil]
+  ],
+  angry: [type: :noul, instructions: "Is the customer angry?"],
+  urgency: [
+    type: :score,
+    instructions: "How urgent is this?",
+    criteria: ["can wait", "this week", "today", "right now"]
+  ]
+]
+
+{:ok, %{answers: answers, usage: usage}} =
+  LlamaCppEx.Decision.decide(
+    decision,
+    "Customer message: I was charged twice for my order last week and nobody has replied.",
+    questions
+  )
+
+# Cloudflare_clef-flash-Q8_0, rounded:
+usage           # => %{input_tokens: 324, output_tokens: 0}  — one prompt for all three
+answers.route   # => %{type: :choice, choice: :billing, confidence: 0.966,
+                #      probabilities: %{billing: 0.977, shipping: 0.014, technical: 0.008}}
+answers.angry   # => %{type: :noul, noul: 0.420}
+answers.urgency # => %{type: :score, score: 2.209, confidence: 0.209,
+                #      probabilities: %{0 => 0.029, 1 => 0.156, 2 => 0.393, 3 => 0.423}, ...}
+
+# The state can be a chat transcript; the same engine serves every request.
+{:ok, %{answers: answers}} =
+  LlamaCppEx.Decision.decide(
+    decision,
+    %{"messages" => [%{"role" => "user", "content" => "The app crashes when I open the settings page on Android 15."}]},
+    questions
+  )
+
+answers.route.choice   # => :technical  (0.990)
+answers.angry.noul     # => 0.022
+```
+
+#### More clef examples
+
+All numbers below are `Cloudflare_clef-flash-Q8_0` on an M1 Max (Metal),
+rounded; each request is one forward pass over one prompt.
+
+**A record as the state.** A map is given to the model as JSON text, so a
+database row or an API payload works as is:
+
+```elixir
+order = %{
+  "order_id" => "A-10492",
+  "items" => [%{"sku" => "KB-77", "qty" => 2, "price" => 129.0}],
+  "shipping_country" => "DE",
+  "payment" => %{"method" => "card", "attempts" => 3, "last_error" => "insufficient_funds"},
+  "customer_note" => "Please ship before Friday, it's a birthday gift."
+}
+
+{:ok, %{answers: a, usage: %{input_tokens: 408}}} =
+  LlamaCppEx.Decision.decide(decision, order,
+    payment_ok: [type: :noul, instructions: "Did the payment succeed?"],
+    risk: [
+      type: :score,
+      instructions: "How likely is this order to be fraudulent?",
+      criteria: ["very unlikely", "unlikely", "possible", "likely"]
+    ],
+    action: [
+      type: :choice,
+      instructions: "What should happen next?",
+      criteria: [
+        ship: "ship the order as is",
+        retry_payment: "ask the customer to retry the payment",
+        manual_review: "hold for a human to review"
+      ]
+    ]
+  )
+
+a.payment_ok.noul    # => 0.022
+a.risk.score         # => 1.198  (legend 1 = "unlikely"; probabilities 0.17 / 0.55 / 0.19 / 0.09)
+a.action.choice      # => :retry_payment  (0.954; ship 0.007, manual_review 0.039)
+```
+
+**Moderation as one `choice`.** Describe the categories; a single described
+choice reads a veiled threat that a bare yes/no question does not (the same
+first message scores `noul` 0.02 on "Does the message contain harassment,
+threats or hate speech?"):
+
+```elixir
+category = [
+  type: :choice,
+  instructions: "Classify the message.",
+  criteria: [
+    ok: "normal message",
+    spam: "spam or advertising",
+    threat: "threat or intimidation",
+    hate: "hate speech"
+  ]
+]
+
+for msg <- messages do
+  {:ok, %{answers: %{category: c}}} = LlamaCppEx.Decision.decide(decision, msg, category: category)
+  {c.choice, c.probabilities[c.choice]}
+end
+```
+
+| message | choice |
+|---|---|
+| "If I see you at the office tomorrow you'll regret it." | `:threat` 0.68 |
+| "I know where you live. Watch your back." | `:threat` 0.96 |
+| "You people are subhuman and should be wiped out." | `:hate` 0.87 |
+| "Super Produkt, schnelle Lieferung. Danke!" | `:ok` 0.93 |
+| "BUY CHEAP WATCHES NOW!!! visit w4tch-deals.example" | `:spam` 0.98 |
+
+**RAG verification.** Grade a generated answer against the passage it was
+supposed to come from. Prose with a natural shape is better given as text than
+as a map: "does the passage contain the information needed to answer the
+question?" on `"Question: ...\n\nPassage: ..."` scores 0.92, the same content
+as `%{"question" => ..., "passage" => ...}` 0.29, and an unrelated passage
+0.02.
+
+```elixir
+passage = "Physical goods can be returned within 30 days of delivery. Digital purchases are final and cannot be refunded once downloaded."
+question = "What is the refund window for digital purchases?"
+
+grade = fn draft ->
+  state = "Question: #{question}\n\nPassage: #{passage}\n\nDraft answer: #{draft}"
+
+  {:ok, %{answers: a}} =
+    LlamaCppEx.Decision.decide(decision, state,
+      grounded: [type: :noul, instructions: "Is the draft answer supported by the passage?"],
+      quality: [
+        type: :score,
+        instructions: "How good is the draft answer?",
+        criteria: ["wrong", "partly wrong", "mostly right", "correct"]
+      ]
+    )
+
+  {a.grounded.noul, a.quality.score}
+end
+
+grade.("You can get a refund on digital purchases within 30 days.")
+# => {0.019, 0.141}   — "wrong" at 0.91
+
+grade.("Digital purchases cannot be refunded once downloaded; only physical goods have a 30-day window.")
+# => {0.956, 2.714}   — "correct" at 0.83
+```
+
+**Route or escalate.** `confidence` is the answer's margin, so a threshold turns
+the model into a classifier that knows when to hand off:
+
+```elixir
+route = [
+  type: :choice,
+  instructions: "Which team should handle this?",
+  criteria: [billing: nil, shipping: nil, technical: nil]
+]
+
+assign = fn ticket ->
+  {:ok, %{answers: %{route: r}}} = LlamaCppEx.Decision.decide(decision, ticket, route: route)
+  if r.confidence >= 0.8, do: r.choice, else: {:human, r.choice, r.confidence}
+end
+
+assign.("I was charged twice for my order last week and nobody has replied.")
+# => :billing                     (0.94)
+assign.("Where is my package? Tracking has not updated in 6 days.")
+# => :shipping                    (0.94)
+assign.("The app crashes when I open the settings page on Android 15.")
+# => :technical                   (0.98)
+assign.("I want to change my shipping address and also my card was declined, not sure which is the issue.")
+# => {:human, :shipping, 0.495}   — genuinely ambiguous, so it goes to a person
+```
+
+Clef specifics: a `choice` takes up to 255 options and shows them to the model
+sorted by key (answers still come back under the keys you gave); the questions
+of one request are decided together, so their order is visible to the model —
+pass a keyword list, not a map, when it matters — and so are each other: in
+the RAG example, the relevance question above scores 0.06 *in the same
+request* as the bad draft, against 0.92 on its own, because the wrong draft is
+in the prompt the model reads for every question. Put a
+judgement that must not see the others in its own request. On an M1 Max the
+three questions of the first example take ~0.7 s on Metal and ~5.6 s on the
+CPU build at Q8_0 (one 324-token prompt). The opt-in
+`test/decision_clef_test.exs` runs against this model
+(`LLAMA_SMOKE_DECISION_CLEF_MODEL`, tag `:decision_clef`).
 
 ## Lower-level API
 
@@ -1112,8 +1426,8 @@ LLAMA_MODEL_PATH=/path/to/model.gguf mix run examples/chat.exs
 # JSON Schema constrained generation + Ecto integration
 LLAMA_MODEL_PATH=/path/to/model.gguf mix run examples/structured_output.exs
 
-# Embedding generation and cosine similarity
-LLAMA_EMBEDDING_MODEL_PATH=/path/to/embedding-model.gguf mix run examples/embeddings.exs
+# Embedding generation and cosine similarity (any embedding GGUF, e.g. embeddinggemma-2)
+LLAMA_EMBEDDING_MODEL_PATH=~/Downloads/embeddinggemma-2-Q8_0.gguf mix run examples/embeddings.exs
 
 # Continuous batching server with concurrent requests
 LLAMA_MODEL_PATH=/path/to/model.gguf mix run examples/server.exs

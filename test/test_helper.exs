@@ -25,6 +25,10 @@
 #                 LLAMA_SMOKE_DECISION_LAYA_MODEL and
 #                 LLAMA_SMOKE_DECISION_OPENJEV_MODEL (upstream's tinylaya and
 #                 tinyopenjev test models, one per readout).
+#   :decision_clef — the clef readout (all questions decided jointly in one
+#                 prompt); needs LLAMA_SMOKE_DECISION_CLEF_MODEL. Its own tag
+#                 because no tiny clef test model exists: this is the real
+#                 Clef Flash (9B), so the tests also assert what it answers.
 #   :rpc_live   — needs a *reachable RPC worker*, not just a model: set
 #                 LLAMA_RPC_ENDPOINT to "host:port". Excluded automatically when
 #                 that variable is unset, so `--include rpc_live` without a
@@ -87,6 +91,10 @@
 #   LLAMA_SMOKE_DECISION_OPENJEV_MODEL=/path/to/tinyopenjev-for-testing-Q8_0.gguf \
 #     mix test --include decision
 #
+#   GGML_METAL_NO_RESIDENCY=1 \
+#   LLAMA_SMOKE_DECISION_CLEF_MODEL=/path/to/Cloudflare_clef-flash-Q8_0.gguf \
+#     mix test --include decision_clef
+#
 # `GGML_METAL_NO_RESIDENCY=1` is only needed on Metal, and only to keep the VM
 # from aborting *after* the suite has passed:
 #
@@ -113,5 +121,15 @@ Code.require_file("support/test_slots.exs", __DIR__)
 # so an explicit `--include rpc_live` without a worker skips rather than fails
 # (`--include` beats `--exclude`, so the exclusion alone cannot do that).
 ExUnit.start(
-  exclude: [:smoke, :embeddings, :slow, :mtp, :mtp_cancel, :mtp_sidecar, :decision, :rpc_live]
+  exclude: [
+    :smoke,
+    :embeddings,
+    :slow,
+    :mtp,
+    :mtp_cancel,
+    :mtp_sidecar,
+    :decision,
+    :decision_clef,
+    :rpc_live
+  ]
 )
