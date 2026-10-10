@@ -1,5 +1,123 @@
 # Changelog
 
+## v0.8.57
+
+llama.cpp bumped to `23b0202a1`
+([`b11552`](https://github.com/ggml-org/llama.cpp/releases/tag/b11552)),
+69 commits from `88dcc460d` (b11479+4). No source change was needed in
+`llama_nif.cpp`. `include/llama.h` changes comments only
+(`moe_cache_size` is split among devices like the layers,
+`llama_batch_ext_set_embd_state` returns false on a context that takes no
+state, M-RoPE embedding positions are `[t, y, x, z]`). `common/chat.h` is
+reworked by #30210 — a new `common_chat_session`, `common_chat_params.parser`
+is now a `common_peg_arena`, `common_chat_parser_params` loses its
+reasoning/tool-call flags, and `common_chat_template` runs the differential
+autoparser analysis once in its (now out-of-line) constructor — but
+`common_chat_templates_inputs` and `common_chat_templates_apply`, the only
+parts the NIF calls, are unchanged. `common/common.h` gains
+`COMMON_DECISION_TYPE_LFM2_D1_OMNI` and `common_batch::set_embd_state`, replaces
+`common_get_decision_type(const std::string &)` with `common_get_gguf_info`,
+makes `common_prompt_checkpoint::load_tgt` / `load_dft` return `bool`, and
+moves the server's default port to 9931; the NIF uses none of those besides
+the enum. `common/sampling.h` adds two helpers. `json.h`,
+`json-schema-to-grammar.h`, `speculative.h`, `src/llama-ext.h` and every ggml
+header are byte-identical, and `llama_model_default_params` /
+`llama_context_default_params` are unchanged. RPC protocol stays at 8.0.0.
+Upstream versions: llama.cpp 0.6.0, ggml 0.26.0.
+
+### Added
+
+- **`lfm2-d1-omni` decision type** (upstream #30114,
+  [LiquidAI/d1-omni-600M](https://huggingface.co/LiquidAI/d1-omni-600M)): the
+  ninth `common_decision_type`. A non-causal LFM2 trunk with a two-block
+  decision head that reads one score per `<|mask|>` marker, like laya, from a
+  context with no memory. Ported into `decision.cpp`: `init` (mask token, 255
+  options), `parse_questions` (accepts a `null` state; `noul` descriptions
+  also read under `"yes"` / `"no"`), `render` (special-token escaping in keys
+  and values, the `<<d1omni:...>>` piece markers), the new `fill_task_d1omni`
+  (question, option and state token budgets as the model was trained, from
+  d1-omni's `prompt.py`), `reads_embeddings` / `type_reads_embeddings`, and
+  the one-batch rule in `first_output` (no memory to carry a batch over).
+  `LlamaCppEx.Decision` maps it to `:lfm2_d1_omni`, in `@types`,
+  `@reads_embeddings` and `decision_type/0`, so `Decision.new/2` gives it an
+  embeddings context with `n_batch = n_ubatch`. "Ported at" is now
+  `23b0202a1`. Checked against upstream `llama-server` on
+  `d1-omni-600M-Q8_0.gguf` (`LiquidAI/d1-omni-600M-GGUF`, which already says
+  `lfm2-d1-omni`): every token count identical and every probability within
+  7e-4 — exactly equal on every single-question request; the multi-question
+  ones differ by up to 6.6e-4, as d1-3B's did at v0.8.56. Image and audio
+  input stay upstream-only (libmtmd). README documents it with measured
+  answers.
+- `scripts/decision_compare.exs` gains three requests every type runs: a
+  `noul` with `"yes"` / `"no"` descriptions, a choice whose instructions and
+  options exceed the token budgets (laya's `max_head_tokens`, d1-omni's
+  per-piece cuts), and special-token text plus template markers in the
+  input.
+
+### Changed
+
+- `parse_state` in `decision.cpp` follows upstream: `"files"` is read with
+  `"images"` as its alias, and an `input_audio` part of a chat-message state
+  is rejected as `"audio input is not supported: LlamaCppEx is built without
+  libmtmd"` (images keep their message). Requests built by
+  `LlamaCppEx.Decision` never carry `"files"` / `"images"`; the state's parts
+  are the reachable path.
+- Upstream, from the 69 commits: the chat API refactor (#30210), a
+  TranslateGemma parser (#30096) and parser rules named by index (#30088);
+  MiniCPM-V 4.7 (#29416), d1-omni-600M (#30114), exact GELU for ModernBERT
+  encoders (#30108 — laya's numbers move; the comparison still matches),
+  `classifier_activation` for rerankers (#29692), Qwen3.5 embedding conversion
+  (#27920) and a DFlash output-head sharing fix (#30111); MTP takes vision
+  input and its draft state now enters through
+  `llama_batch_ext_set_embd_state` rather than `set_embd` (#30257 — the NIF
+  feeds the draft context only through `common_speculative`, and the MTP and
+  sidecar suites pass); the MoE expert cache split over several GPUs (#30112);
+  a static backend-sampling graph across ubatches (#30223); `get_rows`
+  reordered for embeddings (#30160); an OOB write in `ggml_acc` with a negative
+  offset fixed (#30135); meta-backend host views (#30217); vectorized
+  fp32→fp16 on CPU (#30157); Metal 128/96 flash-attention kernels (#30209);
+  CUDA MMQ out-of-bounds reads (#29953), a flash-attention tile race
+  (#30103), top-k selection (#28713), PAD past 65535 rows (#30147), norm
+  kernels past grid limits (#28175), MSVC rounding (#30229), GDN state
+  columns per warp (#30087), fewer copies after `SSM_SCAN` (#29807), MMVQ for
+  `MUL_MAT_ID` on sm_60 (#27828), strided unary ops (#29781) and `ROLL`
+  (#29547); Vulkan `TOP_K` on inf/NaN (#30107), sparse FA on coopmat2
+  (#30003), an `rms_norm` workgroup overflow (#30145) and NVIDIA
+  `MUL_MAT_ID` MMVQ (#29274); SYCL, OpenCL, Hexagon, WebGPU and MUSA work;
+  s390x z17 builds (#30297, #30140); the server's default port 9931 (#30159),
+  context checkpoints kept across slot save/restore (#26004), a busy pinned
+  slot left untouched (#30295) and the models-manager UI (#29583, #30228);
+  cpp-httplib 0.60.1 (#30134) and nlohmann's deep-nesting patch (#30253).
+- `test/mtp_model_test.exs` and `test/test_helper.exs` record that
+  `:mtp_cancel` aborts the VM again (4 of 6 runs, exit 134 or 139) — measured
+  identically at the previous pin `88dcc460d`, so not new here; nothing had
+  run that tag since v0.8.49, when it failed without aborting.
+
+Upstream defects (`docs/release-guide.md`): #1, #2 and #3 are unchanged by
+source diff — `ggml-rpc.cpp` is untouched, the `ggml-cpu/CMakeLists.txt` diff
+is the s390x z17 `-march=arch15` mapping (#30297), and the `ggml-cuda.cu`
+diff is GDN cache fusion and `supports_op`, nowhere near
+`ggml_backend_cuda_comm_init`. #2's tp=2 re-measurement on Spark is still
+owed.
+
+Verified on macOS, M1 Max, at `23b0202a1`. **Metal**
+(`GGML_METAL_NO_RESIDENCY=1`): default **430 passed, 173 excluded** with no
+model; **574 passed, 29 excluded** for `--include smoke --include embeddings
+--include slow --include mtp` (Qwen3.5-0.8B-UD-Q4_K_XL,
+Qwen3-Embedding-0.6B-f16, Qwen3.6-35B-A3B-MTP-UD-Q4_K_XL); `--include
+embeddings` on embeddinggemma-2-Q8_0 **441 passed**; `--include decision` on
+tinylaya + tinyopenjev **442 passed**; `--include decision_clef` on
+Cloudflare_clef-flash-Q8_0 **3 of 3**, fully offloaded; `--include
+mtp_sidecar` on the Qwen 3.8 27B pair **436 passed, 6 skipped** (the Gemma 4
+E4B pair was not on disk). `scripts/decision_compare.exs` against upstream
+`llama-server` built from the same commit with Metal, with the three new
+requests: tinylaya (≤ 3.2e-6), tinyopenjev (0), Clef Flash Q8_0 (0), d1-3B
+Q8_0 (≤ 7e-4) and d1-omni-600M Q8_0 (≤ 6.6e-4) all **ALL MATCH**, every
+token count identical, the invalid-request cases agreeing. **CPU build**:
+`--include decision` **442 passed**. Format and dialyzer (0 errors) clean;
+the Hex source build clones `23b0202a1` and compiles. `rpc_live` and the
+CPU smoke/MTP suites were not run.
+
 ## v0.8.56
 
 llama.cpp bumped to `88dcc460d`

@@ -206,6 +206,14 @@ upstream in #30100 (`7e8324f5f`, with a `mm2+mm` mode in `test-backend-ops`
 that fails 27 of 28 cases without it). Nothing to remove here: the workaround
 was a README note, now gone.
 
+Re-checked at `23b0202a1` (b11552), covering the 69 commits from `88dcc460d`
+in one source diff: #1, #2 and #3 are as above. `ggml-rpc.cpp` and
+`ggml-rpc.h` were not touched (`RPC_PROTO_MAJOR_VERSION` stays 8). The
+`ggml-cpu/CMakeLists.txt` diff is #30297, which maps the s390x z17
+cross-compile target to `-march=arch15`; the `-mcpu=native` probe is
+untouched. The `ggml-cuda.cu` diff is GDN cache fusion and `supports_op`
+changes, none of it near `ggml_backend_cuda_comm_init`.
+
 | # | Upstream defect | Our workaround | Still needed? |
 |---|---|---|---|
 | 1 | `GGML_NATIVE=ON` makes ggml's `-mcpu=native` probe resolve to **base ARMv8-A** on Cortex-X925/A725 with GCC 13.3 — silently, with a soft CMake warning and exit 0. Costs every `sdot`/`smmla`/SVE kernel. | `LLAMA_CPU_ARM_ARCH` + `LLAMA_CUDA_ARCH` in the `Makefile`, which must be set together. See [DGX Spark](dgx-spark.md) and [Cross-Platform Builds](cross-platform-builds.md). | `scripts/spark/verify-build-flags.sh` on an aarch64 host. If a default build (no `LLAMA_CPU_ARM_ARCH`) now reports non-zero `sdot`/`smmla`, upstream fixed the probe. |
@@ -256,9 +264,10 @@ GGML_METAL_NO_RESIDENCY=1 \
 LLAMA_SMOKE_DECISION_CLEF_MODEL=~/Downloads/Cloudflare_clef-flash-Q8_0.gguf \
   mix test --include decision_clef
 
-# lfm2-d1 has no tag: check it with scripts/decision_compare.exs (below) on a
-# d1-3B GGUF whose lfm2.decision.type reads "lfm2-d1" — the quants published
-# before upstream's rename say "d1" and are refused by both sides.
+# lfm2-d1 and lfm2-d1-omni have no tag: check them with
+# scripts/decision_compare.exs (below) on d1-3B and d1-omni-600M. The d1-3B
+# quants published before upstream's rename say "d1" and are refused by both
+# sides; LiquidAI/d1-omni-600M-GGUF already says "lfm2-d1-omni".
 
 GGML_METAL_NO_RESIDENCY=1 \
 LLAMA_SMOKE_MTP_MODEL=~/Downloads/Qwen3.8-27B-Q4_K_M.gguf \
