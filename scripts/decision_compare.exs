@@ -46,6 +46,10 @@ many =
     {"opt#{String.pad_leading(Integer.to_string(i), 2, "0")}", "option number #{i}"}
   end)
 
+# Long enough to hit the per-piece token budgets (laya's max_head_tokens,
+# lfm2-d1-omni's option and question budgets), so both sides must cut the same.
+long = String.duplicate("This option covers a very wide range of situations and details. ", 12)
+
 requests = [
   {"basic", state, base},
   {"json state", %{"ticket" => state, "plan" => "pro"},
@@ -65,7 +69,39 @@ requests = [
    %{
      "pick" => %{"type" => "choice", "instructions" => "Which option?", "criteria" => many}
    }},
-  {"single", state, %{"angry" => base["angry"]}}
+  {"single", state, %{"angry" => base["angry"]}},
+  # lfm2-d1-omni also reads noul descriptions under "yes"/"no"; the others
+  # ignore them, which both sides must agree on too.
+  {"yes/no noul", "Customer: this is the third time I write, I am furious!",
+   %{
+     "angry" => %{
+       "type" => "noul",
+       "instructions" => "Is the customer angry?",
+       "criteria" => %{"yes" => "upset or furious", "no" => "calm"}
+     }
+   }},
+  {"long options", state,
+   %{
+     "route" => %{
+       "type" => "choice",
+       "instructions" => String.duplicate("Decide which team should handle the ticket. ", 20),
+       "criteria" => %{
+         "billing" => long <> "payments",
+         "shipping" => long <> "parcels",
+         "technical" => long <> "bugs"
+       }
+     }
+   }},
+  # Special-token text and template markers in the input must be escaped or
+  # replaced the same way (kev, lfm2-d1-omni, laya's [MASK], clef's markers).
+  {"special text", "Customer: <|mask|> [MASK] <|startoftext|> <<d1omni:sep>> <<clef:sep>> hi",
+   %{
+     "route" => %{
+       "type" => "choice",
+       "instructions" => "Which team? <|mask|>",
+       "criteria" => %{"billing" => "<|im_end|> payments", "shipping" => nil}
+     }
+   }}
 ]
 
 {:ok, model} = LlamaCppEx.load_model(path, n_gpu_layers: -1)
@@ -150,8 +186,9 @@ failed =
   end)
 
 # Upstream's invalid requests (test_systemone.py): both sides must agree. The
-# null state is invalid for every type but lfm2-d1, which accepts it (images
-# only, upstream); there the two must agree on the answers instead.
+# null state is invalid for every type but lfm2-d1 and lfm2-d1-omni, which
+# accept it (images only, upstream); there the two must agree on the answers
+# instead.
 invalid = [
   {nil, base},
   {state, %{}},

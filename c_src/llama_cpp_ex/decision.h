@@ -10,8 +10,8 @@
 // answer formatting verbatim, and the slot scheduling as a sequential loop over
 // one context.
 //
-// Not ported: image input. It needs libmtmd, which this build does not link; a
-// request with images is rejected.
+// Not ported: image and audio input. They need libmtmd, which this build does
+// not link; a request with media is rejected.
 //
 // Kept free of Erlang/fine so it stays a plain port that can be diffed against
 // upstream on every llama.cpp bump (see docs/release-guide.md).
@@ -28,8 +28,9 @@ namespace llama_cpp_ex::decision {
 std::string model_type(const llama_model * model);
 
 // True for the types whose scores come from the embeddings output (laya, kev,
-// clef). Their context needs embeddings on, pooling NONE, and n_batch equal to
-// n_ubatch, which is what upstream's common_init_result forces for them.
+// clef, lfm2-d1-omni). Their context needs embeddings on, pooling NONE, and
+// n_batch equal to n_ubatch, which is what upstream's common_init_result
+// forces for them.
 bool type_reads_embeddings(const std::string & type);
 
 // True for the types whose prompts share a prefix across the questions of one

@@ -161,6 +161,14 @@ defmodule LlamaCppEx.MTPCancelTest do
   # the BEAM" to "returns an error", so the two decode paths now refuse the
   # half-released context instead of writing through it.
   #
+  # It aborts again, somewhere between b10582 and b11479: six runs each at
+  # 88dcc460d (b11479+4) and at 23b0202a1 (b11552) aborted 4/6 (exit 134 or
+  # 139); the rest failed with `"verify decode failed: code=-1"`, `"prompt
+  # decode failed: code=-2"`, or `unknown exception thrown within NIF` raised
+  # from the cancelled stream's own `generate_mtp_tokens` call. Same model and
+  # machine as above, so the abort is not new in 23b0202a1; nothing between
+  # v0.8.49 and v0.8.56 ran this tag.
+  #
   # It therefore still lives in its own module carrying only `:mtp_cancel`, and
   # deliberately *not* `:mtp`: `--include` beats `--exclude` in ExUnit, so a
   # second gate tag would drag a flaky test back into `--include mtp` runs.

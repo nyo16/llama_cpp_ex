@@ -22,6 +22,10 @@ defmodule LlamaCppEx.Decision do
       `nil` state).
     * `:kev` - scores each option by a dot product of hidden states.
     * `:laya` - a ModernBERT encoder; one score per `[MASK]` marker.
+    * `:lfm2_d1_omni` - like `:laya` with another prompt layout: a non-causal
+      LFM2 trunk with a decision head, one score per `<|mask|>` marker. It has
+      no memory, so every prompt is evaluated in one batch. Accepts a `nil`
+      state, and also reads `:noul` descriptions under `"yes"` and `"no"`.
     * `:clef` - reads every question in one prompt and decides them jointly.
 
   Decision GGUFs are published in ggml-org's "Decision models" collection on
@@ -38,7 +42,7 @@ defmodule LlamaCppEx.Decision do
     * `:criteria` - depends on `:type`:
       * `:choice` - the options, mapping each option key to its description
         (`nil` for none). The number of options is capped by the model: 52
-        for openjev, 255 for laya, clef, pplx-decider and lfm2-d1.
+        for openjev, 255 for laya, clef, pplx-decider, lfm2-d1 and lfm2-d1-omni.
       * `:score` - a list of 2 to 10 level descriptions, lowest first.
       * `:noul` - optional; `%{"true" => ..., "false" => ...}` descriptions.
 
@@ -97,11 +101,11 @@ defmodule LlamaCppEx.Decision do
 
   ## Limits
 
-    * Text only. Upstream also takes images for openjev and clef through
-      libmtmd, which this build does not link; a request with images is
-      rejected.
-    * laya and clef evaluate the whole prompt in one batch, so it has to fit in
-      `:n_batch` (2048 tokens by default, see `new/2`).
+    * Text only. Upstream also takes images (openjev, clef, pplx-decider,
+      lfm2-d1, lfm2-d1-omni) and audio (lfm2-d1-omni) through libmtmd, which
+      this build does not link; a request with images or audio is rejected.
+    * laya, clef and lfm2-d1-omni evaluate the whole prompt in one batch, so
+      it has to fit in `:n_batch` (2048 tokens by default, see `new/2`).
     * A `%Decision{}` drives one context and is not safe to use from two
       processes at once, like `LlamaCppEx.Context`. Give each process its own,
       or serialize calls through one process.
@@ -113,7 +117,15 @@ defmodule LlamaCppEx.Decision do
   defstruct [:ref, :context, :type]
 
   @type decision_type ::
-          :openjev | :lev | :kev | :nimble | :laya | :clef | :pplx_decider | :lfm2_d1
+          :openjev
+          | :lev
+          | :kev
+          | :nimble
+          | :laya
+          | :clef
+          | :pplx_decider
+          | :lfm2_d1
+          | :lfm2_d1_omni
 
   @type t :: %__MODULE__{
           ref: reference(),
@@ -157,12 +169,13 @@ defmodule LlamaCppEx.Decision do
     "laya" => :laya,
     "clef" => :clef,
     "pplx-decider" => :pplx_decider,
-    "lfm2-d1" => :lfm2_d1
+    "lfm2-d1" => :lfm2_d1,
+    "lfm2-d1-omni" => :lfm2_d1_omni
   }
 
   # Mirror upstream's common_init_result and can_share_prompt; decision.cpp
   # checks the first of these against the context it is handed.
-  @reads_embeddings [:laya, :kev, :clef]
+  @reads_embeddings [:laya, :kev, :clef, :lfm2_d1_omni]
   @shares_prompt [:openjev, :lev, :kev, :nimble, :pplx_decider, :lfm2_d1]
 
   @default_n_ctx 4096
@@ -188,21 +201,21 @@ defmodule LlamaCppEx.Decision do
   @doc """
   Creates a decision engine on a new context for `model`.
 
-  The context is shaped for the model's decision type: laya, kev and clef read
-  the embeddings output, so their context has embeddings on and no pooling; the
-  types that share a prompt prefix across questions (openjev, lev, kev, nimble,
-  pplx-decider, lfm2-d1) get a second sequence to evaluate that prefix once per
-  request.
+  The context is shaped for the model's decision type: laya, kev, clef and
+  lfm2-d1-omni read the embeddings output, so their context has embeddings on
+  and no pooling; the types that share a prompt prefix across questions
+  (openjev, lev, kev, nimble, pplx-decider, lfm2-d1) get a second sequence to
+  evaluate that prefix once per request.
 
   ## Options
 
     * `:n_ctx` - Context size. Defaults to `#{@default_n_ctx}`. A prompt holds
       the state, one question and its options (all questions for clef and
       nimble), so a long state needs a larger context.
-    * `:n_batch` - Max tokens per batch. For laya, kev and clef it is also the
-      micro-batch size and caps the prompt that can be evaluated at once;
-      defaults to `min(n_ctx, #{@default_n_batch_embeddings})` for them and to
-      `LlamaCppEx.Context`'s default otherwise.
+    * `:n_batch` - Max tokens per batch. For laya, kev, clef and lfm2-d1-omni
+      it is also the micro-batch size and caps the prompt that can be evaluated
+      at once; defaults to `min(n_ctx, #{@default_n_batch_embeddings})` for
+      them and to `LlamaCppEx.Context`'s default otherwise.
 
   Any `LlamaCppEx.Context.tuning_option_keys/0` option (`:n_threads`,
   `:flash_attn`, ...) is passed through to `LlamaCppEx.Context.create/2`.
