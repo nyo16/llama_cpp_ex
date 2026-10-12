@@ -101,6 +101,22 @@ requests = [
        "instructions" => "Which team? <|mask|>",
        "criteria" => %{"billing" => "<|im_end|> payments", "shipping" => nil}
      }
+   }},
+  # vllm-decision2 and vllm-d3 return a non-string score level as its
+  # canonical JSON text (sorted keys); the others return it as given.
+  {"object levels", state,
+   %{
+     "severity" => %{
+       "type" => "score",
+       "instructions" => %{"ask" => "How severe is this?", "scale" => "1-5"},
+       "criteria" => [
+         %{"level" => "minor", "eta" => "week"},
+         "moderate",
+         %{"level" => "major", "eta" => "day"},
+         ["critical", "now"],
+         "outage"
+       ]
+     }
    }}
 ]
 
@@ -123,19 +139,21 @@ Enum.reduce_while(1..120, nil, fn _, _ ->
   end
 end) || raise "llama-server on port #{port} did not become healthy"
 
-post = fn body ->
+post_raw = fn body ->
   url = ~c"http://127.0.0.1:#{port}/v1/systemone"
 
   {:ok, {{_, status, _}, _, resp}} =
     :httpc.request(
       :post,
-      {url, [], ~c"application/json", JSON.encode!(body)},
+      {url, [], ~c"application/json", body},
       [timeout: 600_000],
       []
     )
 
   {status, JSON.decode!(to_string(resp))}
 end
+
+post = fn body -> post_raw.(JSON.encode!(body)) end
 
 # Upstream answers use string keys throughout; normalise ours to that shape.
 norm = fn answer ->
@@ -168,27 +186,67 @@ max_diff = fn a, b, f ->
   end)
 end
 
+compare = fn name, ours, {status, ref} ->
+  case {ours, status} do
+    {{:ok, ours}, 200} ->
+      ours_answers = Map.new(ours.answers, fn {id, a} -> {to_string(id), norm.(a)} end)
+      diff = max_diff.(ref["answers"], ours_answers, max_diff)
+      tokens_ok = ours.usage.input_tokens == ref["usage"]["input_tokens"]
+
+      IO.puts(
+        "#{String.pad_trailing(name, 16)} max|diff| = #{:erlang.float_to_binary(diff, [{:decimals, 7}])}  " <>
+          "tokens ours=#{ours.usage.input_tokens} ref=#{ref["usage"]["input_tokens"]}"
+      )
+
+      diff <= 1.0e-3 and tokens_ok
+
+    # vllm-decision2 rejects some of these (strict payloads); so must we.
+    {{:error, msg}, 400} ->
+      IO.puts("#{String.pad_trailing(name, 16)} rejected by both: #{msg}")
+      true
+
+    _ ->
+      IO.puts(
+        "#{String.pad_trailing(name, 16)} DISAGREE: ours=#{inspect(ours)} ref=#{status} #{inspect(ref)}"
+      )
+
+      false
+  end
+end
+
 failed =
   Enum.reduce(requests, 0, fn {name, st, qs}, failed ->
-    {:ok, ours} = LlamaCppEx.Decision.decide(decision, st, qs)
-    {200, ref} = post.(%{"state" => st, "questions" => qs})
+    ours = LlamaCppEx.Decision.decide(decision, st, qs)
 
-    ours_answers = Map.new(ours.answers, fn {id, a} -> {id, norm.(a)} end)
-    diff = max_diff.(ref["answers"], ours_answers, max_diff)
-    tokens_ok = ours.usage.input_tokens == ref["usage"]["input_tokens"]
-
-    IO.puts(
-      "#{String.pad_trailing(name, 16)} max|diff| = #{:erlang.float_to_binary(diff, [{:decimals, 7}])}  " <>
-        "tokens ours=#{ours.usage.input_tokens} ref=#{ref["usage"]["input_tokens"]}"
-    )
-
-    if diff > 1.0e-3 or not tokens_ok, do: failed + 1, else: failed
+    if compare.(name, ours, post.(%{"state" => st, "questions" => qs})),
+      do: failed,
+      else: failed + 1
   end)
 
+# A noul whose criteria list "true" before "false": vllm-decision2 shows the
+# options in that order. JSON.encode!/1 sorts map keys, so the reference body
+# is written by hand; ours keeps the keyword-list order.
+true_first =
+  ~s({"state":"Customer: this is the third time I write, I am furious!","questions":{"angry":) <>
+    ~s({"type":"noul","instructions":"Is the customer angry?","criteria":{"true":"upset or furious","false":"calm"}}}})
+
+ours =
+  LlamaCppEx.Decision.decide(
+    decision,
+    "Customer: this is the third time I write, I am furious!",
+    angry: [
+      type: :noul,
+      instructions: "Is the customer angry?",
+      criteria: [true: "upset or furious", false: "calm"]
+    ]
+  )
+
+failed = if compare.("noul true first", ours, post_raw.(true_first)), do: failed, else: failed + 1
+
 # Upstream's invalid requests (test_systemone.py): both sides must agree. The
-# null state is invalid for every type but lfm2-d1 and lfm2-d1-omni, which
-# accept it (images only, upstream); there the two must agree on the answers
-# instead.
+# null state is invalid for every type but lfm2-d1, lfm2-d1-omni and vllm-d3,
+# which accept it (images only, upstream), and vllm-d3 also accepts a question
+# without instructions; there the two must agree on the answers instead.
 invalid = [
   {nil, base},
   {state, %{}},

@@ -214,6 +214,15 @@ cross-compile target to `-march=arch15`; the `-mcpu=native` probe is
 untouched. The `ggml-cuda.cu` diff is GDN cache fusion and `supports_op`
 changes, none of it near `ggml_backend_cuda_comm_init`.
 
+Re-checked at `cbe28bb3c` (b11577), covering the 25 commits from `23b0202a1`:
+#1, #2 and #3 are as above. `ggml-cpu/CMakeLists.txt` and `ggml-cuda.cu` were
+not touched. The `ggml-rpc` diff is #29544 only — `GGML_RPC_DEBUG` becomes a
+0–3 verbosity level (`1` still means "on") and logging moves into
+`ggml-rpc/log.h`; `ggml_backend_rpc_start_server` keeps its `void` signature,
+and `RPC_PROTO_MAJOR_VERSION` stays 8. #30014 sets ggml's default symbol
+visibility to hidden, but only under `BUILD_SHARED_LIBS`; the NIF links the
+static archives, so nothing it calls disappears.
+
 | # | Upstream defect | Our workaround | Still needed? |
 |---|---|---|---|
 | 1 | `GGML_NATIVE=ON` makes ggml's `-mcpu=native` probe resolve to **base ARMv8-A** on Cortex-X925/A725 with GCC 13.3 — silently, with a soft CMake warning and exit 0. Costs every `sdot`/`smmla`/SVE kernel. | `LLAMA_CPU_ARM_ARCH` + `LLAMA_CUDA_ARCH` in the `Makefile`, which must be set together. See [DGX Spark](dgx-spark.md) and [Cross-Platform Builds](cross-platform-builds.md). | `scripts/spark/verify-build-flags.sh` on an aarch64 host. If a default build (no `LLAMA_CPU_ARM_ARCH`) now reports non-zero `sdot`/`smmla`, upstream fixed the probe. |
@@ -264,10 +273,16 @@ GGML_METAL_NO_RESIDENCY=1 \
 LLAMA_SMOKE_DECISION_CLEF_MODEL=~/Downloads/Cloudflare_clef-flash-Q8_0.gguf \
   mix test --include decision_clef
 
-# lfm2-d1 and lfm2-d1-omni have no tag: check them with
-# scripts/decision_compare.exs (below) on d1-3B and d1-omni-600M. The d1-3B
-# quants published before upstream's rename say "d1" and are refused by both
-# sides; LiquidAI/d1-omni-600M-GGUF already says "lfm2-d1-omni".
+# lfm2-d1, lfm2-d1-omni, vllm-decision2 and vllm-d3 have no tag: check them
+# with scripts/decision_compare.exs (below) on d1-3B, d1-omni-600M,
+# Decision-2.0-Kai-0.6B and vllm-d3-edge. The d1-3B quants published before
+# upstream's rename say "d1" and are refused by both sides;
+# LiquidAI/d1-omni-600M-GGUF already says "lfm2-d1-omni" and
+# ggml-org/vllm-d3-edge-GGUF says "vllm-d3". vllm-sr's own
+# Decision-2.0-*-GGUF files predate upstream support (arch qwen3, type
+# "decision2") and load on neither side; convert vllm-sr/Decision-2.0-Kai-0.6B
+# with the submodule's convert_hf_to_gguf.py (it needs transformers >= 5 for
+# that tokenizer_config.json).
 
 GGML_METAL_NO_RESIDENCY=1 \
 LLAMA_SMOKE_MTP_MODEL=~/Downloads/Qwen3.8-27B-Q4_K_M.gguf \

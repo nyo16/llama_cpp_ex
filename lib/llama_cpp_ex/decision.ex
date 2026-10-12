@@ -14,12 +14,14 @@ defmodule LlamaCppEx.Decision do
   The model file says what kind of decision model it is
   (`"<arch>.decision.type"`); `model_type/1` reads it. Supported types:
 
-    * `:openjev`, `:lev`, `:nimble`, `:pplx_decider`, `:lfm2_d1` - read the
-      logits of one label token per option (`:nimble` lists every question of
-      the request in each prompt, `:lev` asks each choice twice with the
-      options reversed, `:pplx_decider` uses one- or two-letter label codes
-      like `:lev`, `:lfm2_d1` picks label codes per question and accepts a
-      `nil` state).
+    * `:openjev`, `:lev`, `:nimble`, `:pplx_decider`, `:vllm_d3`, `:lfm2_d1` -
+      read the logits of one label token per option (`:nimble` lists every
+      question of the request in each prompt, `:lev` asks each choice twice
+      with the options reversed, `:pplx_decider` and `:vllm_d3` use one- or
+      two-letter label codes like `:lev`, `:lfm2_d1` picks label codes per
+      question and accepts a `nil` state). `:vllm_d3` is non-causal, so each
+      prompt is evaluated in one batch; it accepts a `nil` state and a
+      question without `:instructions` (its prompt has a default question).
     * `:kev` - scores each option by a dot product of hidden states.
     * `:laya` - a ModernBERT encoder; one score per `[MASK]` marker.
     * `:lfm2_d1_omni` - like `:laya` with another prompt layout: a non-causal
@@ -27,6 +29,11 @@ defmodule LlamaCppEx.Decision do
       no memory, so every prompt is evaluated in one batch. Accepts a `nil`
       state, and also reads `:noul` descriptions under `"yes"` and `"no"`.
     * `:clef` - reads every question in one prompt and decides them jointly.
+    * `:vllm_decision2` - clef's joint head, one question per prompt: a Qwen3
+      trunk scores each option span against the question span. Strict input:
+      the state, instructions and descriptions must be text, a map or a list,
+      a choice needs at least 2 options, and `:noul` criteria may only
+      describe `"true"` and `"false"`.
 
   Decision GGUFs are published in ggml-org's "Decision models" collection on
   Hugging Face, for example `ggml-org/Laya-GGUF`, `ggml-org/Clef-Flash-GGUF` and
@@ -42,7 +49,8 @@ defmodule LlamaCppEx.Decision do
     * `:criteria` - depends on `:type`:
       * `:choice` - the options, mapping each option key to its description
         (`nil` for none). The number of options is capped by the model: 52
-        for openjev, 255 for laya, clef, pplx-decider, lfm2-d1 and lfm2-d1-omni.
+        for openjev, 255 for laya, clef, pplx-decider, vllm-decision2, vllm-d3,
+        lfm2-d1 and lfm2-d1-omni.
       * `:score` - a list of 2 to 10 level descriptions, lowest first.
       * `:noul` - optional; `%{"true" => ..., "false" => ...}` descriptions.
 
@@ -70,9 +78,12 @@ defmodule LlamaCppEx.Decision do
     * `:noul` - `%{type: :noul, noul: p}`, the probability that the answer is
       true.
 
-  `confidence` runs from 0 (every option equally likely) to 1. Probabilities
-  are scaled with the temperatures stored in the model file; they are not
-  guaranteed to be calibrated for your data.
+  `confidence` runs from 0 (every option equally likely) to 1; vllm-decision2
+  and vllm-d3 compute it from the normalized entropy of the probabilities.
+  Probabilities are scaled with the temperatures (and, for scores, the
+  per-level biases) stored in the model file; they are not guaranteed to be
+  calibrated for your data. vllm-decision2 and vllm-d3 return a `legend`
+  entry that is not a string as its JSON text, with sorted keys.
 
   ## Example
 
@@ -102,10 +113,13 @@ defmodule LlamaCppEx.Decision do
   ## Limits
 
     * Text only. Upstream also takes images (openjev, clef, pplx-decider,
-      lfm2-d1, lfm2-d1-omni) and audio (lfm2-d1-omni) through libmtmd, which
-      this build does not link; a request with images or audio is rejected.
-    * laya, clef and lfm2-d1-omni evaluate the whole prompt in one batch, so
-      it has to fit in `:n_batch` (2048 tokens by default, see `new/2`).
+      vllm-d3, lfm2-d1, lfm2-d1-omni) and audio (lfm2-d1-omni) through
+      libmtmd, which this build does not link; a request with images or audio
+      is rejected.
+    * laya, clef, vllm-d3 and lfm2-d1-omni evaluate the whole prompt in one
+      batch, so it has to fit in `:n_batch` (2048 tokens by default, see
+      `new/2`); vllm-decision2 needs the question, its options and the end of
+      the prompt to fit in one.
     * A `%Decision{}` drives one context and is not safe to use from two
       processes at once, like `LlamaCppEx.Context`. Give each process its own,
       or serialize calls through one process.
@@ -126,6 +140,8 @@ defmodule LlamaCppEx.Decision do
           | :pplx_decider
           | :lfm2_d1
           | :lfm2_d1_omni
+          | :vllm_decision2
+          | :vllm_d3
 
   @type t :: %__MODULE__{
           ref: reference(),
@@ -170,13 +186,19 @@ defmodule LlamaCppEx.Decision do
     "clef" => :clef,
     "pplx-decider" => :pplx_decider,
     "lfm2-d1" => :lfm2_d1,
-    "lfm2-d1-omni" => :lfm2_d1_omni
+    "lfm2-d1-omni" => :lfm2_d1_omni,
+    "vllm-decision2" => :vllm_decision2,
+    "vllm-d3" => :vllm_d3
   }
 
   # Mirror upstream's common_init_result and can_share_prompt; decision.cpp
   # checks the first of these against the context it is handed.
-  @reads_embeddings [:laya, :kev, :clef, :lfm2_d1_omni]
-  @shares_prompt [:openjev, :lev, :kev, :nimble, :pplx_decider, :lfm2_d1]
+  @reads_embeddings [:laya, :kev, :clef, :lfm2_d1_omni, :vllm_decision2]
+  @shares_prompt [:openjev, :lev, :kev, :nimble, :pplx_decider, :vllm_decision2, :lfm2_d1]
+  # Non-causal models that read logits: the whole prompt goes in one
+  # micro-batch (upstream's server_slot::can_split), as for the embedding
+  # readers above.
+  @one_batch [:vllm_d3]
 
   @default_n_ctx 4096
   @default_n_batch_embeddings 2048
@@ -201,21 +223,22 @@ defmodule LlamaCppEx.Decision do
   @doc """
   Creates a decision engine on a new context for `model`.
 
-  The context is shaped for the model's decision type: laya, kev, clef and
-  lfm2-d1-omni read the embeddings output, so their context has embeddings on
-  and no pooling; the types that share a prompt prefix across questions
-  (openjev, lev, kev, nimble, pplx-decider, lfm2-d1) get a second sequence to
-  evaluate that prefix once per request.
+  The context is shaped for the model's decision type: laya, kev, clef,
+  lfm2-d1-omni and vllm-decision2 read the embeddings output, so their context
+  has embeddings on and no pooling; the types that share a prompt prefix
+  across questions (openjev, lev, kev, nimble, pplx-decider, vllm-decision2,
+  lfm2-d1) get a second sequence to evaluate that prefix once per request.
 
   ## Options
 
     * `:n_ctx` - Context size. Defaults to `#{@default_n_ctx}`. A prompt holds
       the state, one question and its options (all questions for clef and
       nimble), so a long state needs a larger context.
-    * `:n_batch` - Max tokens per batch. For laya, kev, clef and lfm2-d1-omni
-      it is also the micro-batch size and caps the prompt that can be evaluated
-      at once; defaults to `min(n_ctx, #{@default_n_batch_embeddings})` for
-      them and to `LlamaCppEx.Context`'s default otherwise.
+    * `:n_batch` - Max tokens per batch. For laya, kev, clef, lfm2-d1-omni,
+      vllm-decision2 and vllm-d3 it is also the micro-batch size and caps the
+      prompt that can be evaluated at once; defaults to
+      `min(n_ctx, #{@default_n_batch_embeddings})` for them and to
+      `LlamaCppEx.Context`'s default otherwise.
 
   Any `LlamaCppEx.Context.tuning_option_keys/0` option (`:n_threads`,
   `:flash_attn`, ...) is passed through to `LlamaCppEx.Context.create/2`.
@@ -246,19 +269,23 @@ defmodule LlamaCppEx.Decision do
   defp context_opts(type, opts) do
     n_ctx = Keyword.get(opts, :n_ctx, @default_n_ctx)
 
-    embeddings =
-      if type in @reads_embeddings do
+    one_batch =
+      if type in @reads_embeddings or type in @one_batch do
         n_batch = Keyword.get(opts, :n_batch, min(n_ctx, @default_n_batch_embeddings))
-        [embeddings: true, pooling_type: :none, n_batch: n_batch, n_ubatch: n_batch]
+        [n_batch: n_batch, n_ubatch: n_batch]
       else
         []
       end
+
+    embeddings =
+      if type in @reads_embeddings, do: [embeddings: true, pooling_type: :none], else: []
 
     sharing = if type in @shares_prompt, do: [n_seq_max: 2, kv_unified: true], else: []
 
     # Keyword.get/3 takes the first match, so these structural values win over
     # anything the caller forwards.
-    [n_ctx: n_ctx] ++ embeddings ++ sharing ++ Keyword.take(opts, Context.tuning_option_keys())
+    [n_ctx: n_ctx] ++
+      embeddings ++ one_batch ++ sharing ++ Keyword.take(opts, Context.tuning_option_keys())
   end
 
   @doc """

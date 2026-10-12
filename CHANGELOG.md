@@ -1,5 +1,109 @@
 # Changelog
 
+## v0.8.58
+
+llama.cpp bumped to `cbe28bb3c`
+([`b11577`](https://github.com/ggml-org/llama.cpp/releases/tag/b11577)),
+25 commits from `23b0202a1` (b11552). No source change was needed in
+`llama_nif.cpp`. Header changes are additive: `include/llama.h` gains
+`llama_perf_context_data.n_reallocs_same` / `n_reallocs_diff` (#30329),
+`ggml-backend.h` gains `ggml_backend_sched_realloc_callback` /
+`ggml_backend_sched_set_realloc_callback`, and `common/common.h` gains
+`COMMON_DECISION_TYPE_VLLM_DECISION2` and `COMMON_DECISION_TYPE_VLLM_D3`;
+`src/llama-ext.h` changes a comment. `llama_model_default_params` /
+`llama_context_default_params` are unchanged. RPC protocol stays at 8.0.0.
+Upstream versions: llama.cpp 0.6.0, ggml 0.26.0.
+
+### Added
+
+- **`vllm-decision2` decision type** (upstream #30378,
+  [vllm-sr/Decision-2.0](https://huggingface.co/vllm-sr/Decision-2.0-Kai-0.6B)):
+  a Qwen3 trunk with clef's joint head, one question per prompt — the head
+  scores the last token of each option span against the last token of the
+  question span, from the embeddings output. Ported into `decision.cpp`:
+  `init` (255 options, `noul_criteria_order`, `strict_payload`,
+  `canonical_legend`), the strict `parse_questions` checks (the state,
+  instructions and descriptions must be text, an object or an array; a
+  choice needs 2 options; `noul` criteria may only describe `"true"` /
+  `"false"`, and list them in that order if `"true"` comes first),
+  `fill_task` routing each question through `fill_task_joint`,
+  `pos_first` counting the decision order, `can_share_prompt` and
+  `reads_embeddings`.
+- **`vllm-d3` decision type** (upstream #30383,
+  [vllm-sr/d3](https://huggingface.co/vllm-sr/d3-edge), GGUFs in
+  `ggml-org/vllm-d3-*-GGUF`): pplx-decider's label-logit readout over a
+  non-causal Qwen3.5 trunk. Accepts a `null` state and a question without
+  `instructions` (the template has a default question). Every prompt is
+  evaluated in one micro-batch, as upstream's `server_slot::can_split`
+  refuses to split a decision over a non-causal context.
+- Both: `score_bias` metadata (`<arch>.decision.score_bias.<n>.<level>`)
+  added to the logits of an `n`-level score before the softmax, confidence
+  from the normalized entropy (`get_decision_confidence`), and a non-string
+  score level returned in `legend` as its canonical (sorted-keys) JSON text.
+  `LlamaCppEx.Decision` maps them to `:vllm_decision2` (embeddings context,
+  `n_batch = n_ubatch`, a second sequence for the shared prefix) and
+  `:vllm_d3` (new `@one_batch` list: `n_batch = n_ubatch`, no embeddings).
+  "Ported at" is now `cbe28bb3c`.
+- `scripts/decision_compare.exs` gains a score whose instructions and levels
+  are objects and lists (the canonical legend) and a `noul` whose criteria
+  list `"true"` first (sent to `llama-server` as hand-written JSON, since
+  `JSON.encode!/1` sorts keys); a request both sides reject counts as a
+  match, which vllm-decision2's strict payloads need.
+
+### Changed
+
+- `decision.cpp` separates the first output from the first position that
+  must share the last batch (`first_batched`): a non-causal context
+  (`llama_get_causal_attn`, i.e. laya, lfm2-d1-omni and vllm-d3) evaluates the
+  whole prompt in one batch, while a label readout still has only its last
+  token as an output. The types that read embeddings now mark every batch
+  entry as an output, as upstream's `need_embd` does — `llama_decode`
+  already forced that and logged "embeddings required but some input tokens
+  were not marked as outputs" — and a joint head's scores are read from the
+  first rows of the last batch, which is where vllm-decision2 writes them
+  when that batch starts before its first read position.
+- Upstream, from the 25 commits: vllm decision models (#30378, #30383,
+  #30408), Prism Bonsai 2 27B (#29600), graph-reallocation counters in the
+  perf report (#30329), the no-cache attention's KV dimension padded to 256
+  so CUDA flash attention takes head size 512 (#30416, clef pads its mask
+  the same way), ggml symbols hidden by default in shared builds (#30014 —
+  the NIF links the static archives), `GGML_RPC_DEBUG` as a 0–3 verbosity
+  level with more RPC logging (#29544; `=1` keeps working), AVX2 CPUs using
+  F16C (#30270), Metal `mul_mat_id` with duplicate ids (#30373) and
+  `kernel_mul_mm` on large tensors (#28748), Vulkan, OpenCL, SYCL and
+  Hexagon work, draft sampling fixes in the examples (#30095) and server
+  component tests (#30312).
+
+Upstream defects (`docs/release-guide.md`): #1, #2 and #3 are unchanged by
+source diff — `ggml-cpu/CMakeLists.txt` and `ggml-cuda.cu` are untouched,
+and the `ggml-rpc` diff is logging only, with
+`ggml_backend_rpc_start_server` still `void`. #2's tp=2 re-measurement on
+Spark is still owed.
+
+Verified on macOS, M1 Max, at `cbe28bb3c`. **Metal**
+(`GGML_METAL_NO_RESIDENCY=1`): default **430 passed, 173 excluded** with no
+model; **574 passed, 29 excluded** for `--include smoke --include embeddings
+--include slow --include mtp` (Qwen3.5-0.8B-UD-Q4_K_XL,
+Qwen3-Embedding-0.6B-f16, Qwen3.6-35B-A3B-MTP-UD-Q4_K_XL); `--include
+embeddings` on embeddinggemma-2-Q8_0 **441 passed**; `--include decision` on
+tinylaya + tinyopenjev **442 passed**; `--include decision_clef` on
+Cloudflare_clef-flash-Q8_0 **3 of 3**, fully offloaded; `--include
+mtp_sidecar` on the Qwen 3.8 27B pair **436 passed, 6 skipped**. `:mtp_cancel`
+fails as recorded (2 of 4 runs abort). `scripts/decision_compare.exs` against
+upstream `llama-server` built from the same commit with Metal:
+Decision-2.0-Kai-0.6B Q8_0 (converted from `vllm-sr/Decision-2.0-Kai-0.6B`
+with the submodule's converter) and vllm-d3-edge Q8_0 both **ALL MATCH** —
+every token count identical, every single-question request exactly equal,
+the three-question request within 5.7e-4, the invalid-request cases
+agreeing — and tinylaya, tinyopenjev, Clef Flash Q8_0, d1-3B Q8_0 and
+d1-omni-600M Q8_0 still **ALL MATCH** after the batching change. A
+665-token vllm-decision2 request split over `n_batch: 128` agrees with the
+one-batch run within 1.5e-4, and vllm-d3 with `n_batch: 128` refuses a
+358-token prompt with "must be evaluated in one batch". **CPU build**:
+`--include decision` **442 passed**. Format and dialyzer (0 errors) clean;
+the Hex source build clones `cbe28bb3c` and compiles. `rpc_live` and the CPU
+smoke/MTP suites were not run.
+
 ## v0.8.57
 
 llama.cpp bumped to `23b0202a1`

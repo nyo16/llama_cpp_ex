@@ -28,13 +28,13 @@ namespace llama_cpp_ex::decision {
 std::string model_type(const llama_model * model);
 
 // True for the types whose scores come from the embeddings output (laya, kev,
-// clef, lfm2-d1-omni). Their context needs embeddings on, pooling NONE, and
+// clef, lfm2-d1-omni, vllm-decision2). Their context needs embeddings on, pooling NONE, and
 // n_batch equal to n_ubatch, which is what upstream's common_init_result
 // forces for them.
 bool type_reads_embeddings(const std::string & type);
 
 // True for the types whose prompts share a prefix across the questions of one
-// request (openjev, lev, kev, nimble, pplx-decider, lfm2-d1). The prefix is
+// request (openjev, lev, kev, nimble, pplx-decider, vllm-decision2, lfm2-d1). The prefix is
 // evaluated once when the context has n_seq_max >= 2.
 bool type_shares_prompt(const std::string & type);
 
