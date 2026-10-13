@@ -16,9 +16,10 @@
 #                 `--include mtp` is green. Cancelling an MTP stream is
 #                 fire-and-forget, so reusing the session immediately afterwards
 #                 races the still-running draft loop over shared contexts. At
-#                 b10435 that aborted the VM; at b10582 it fails racily instead
-#                 (3 of 4 runs) and no longer aborts. Either way it does not
-#                 belong in a green run. See test/mtp_model_test.exs.
+#                 b10435 that aborted the VM; at b10582 it failed racily instead
+#                 (3 of 4 runs) and did not abort; by b11479 it aborts again
+#                 (4 of 6 runs at 23b0202a1). Either way it does not belong in
+#                 a green run. See test/mtp_model_test.exs.
 #   :slow       — long-running comparison matrices (F16 vs Q8_0 KV cache);
 #                 needs LLAMA_SMOKE_GEN_MODEL
 #   :decision   — decision models (LlamaCppEx.Decision); needs both

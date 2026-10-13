@@ -2,7 +2,7 @@
 // of tools/server/server-context.cpp (send_decision, the batch layout rules and
 // the /v1/systemone handler). See decision.h for scope.
 //
-// Ported at 88dcc460d. Functions that are upstream's carry its name in a
+// Ported at cbe28bb3c. Functions that are upstream's carry its name in a
 // trailing comment so a bump can diff them one by one; everything below the
 // "evaluation" banner replaces server slots and is ours.
 
@@ -72,6 +72,11 @@ struct decision_task {
         int32_t pos = pointer;
         for (const int32_t marker : markers) {
             pos = pos < 0 ? marker : std::min(pos, marker);
+        }
+        for (size_t i = 0; i < order.size(); i++) {
+            if (order[i] != 0) {
+                return pos < 0 ? (int32_t) i : std::min(pos, (int32_t) i);
+            }
         }
         return pos;
     }
@@ -188,6 +193,29 @@ std::string kev_text(const json & val) { // decision_kev_text
     return std::regex_replace(kev_render(val), re_special, "<\xC2\xA6$1\xC2\xA6>");
 }
 
+// lfm2-d1-omni: special tokens written in the input must not be parsed as such, in keys too (d1-omni prompt.py: escape)
+json d1omni_escape(const json & val) { // decision_d1omni_escape
+    static const std::regex re_special("<\\|([A-Za-z0-9_]+)\\|>");
+    if (val.is_string()) {
+        return std::regex_replace(val.get<std::string>(), re_special, "<\xC2\xA6$1\xC2\xA6>");
+    }
+    if (val.is_array()) {
+        json out = json::array();
+        for (const auto & item : val) {
+            out.push_back(d1omni_escape(item));
+        }
+        return out;
+    }
+    if (val.is_object()) {
+        json out = json::object();
+        for (const auto & [key, item] : val.items()) {
+            out[std::regex_replace(key, re_special, "<\xC2\xA6$1\xC2\xA6>")] = d1omni_escape(item);
+        }
+        return out;
+    }
+    return val;
+}
+
 // confidence formulas are the ones published by TypeSafe
 
 double confidence_choice(const std::vector<double> & probs) { // decision_confidence_choice
@@ -216,11 +244,40 @@ double confidence_score(const std::vector<double> & probs) { // decision_confide
     return std::max(0.0, 1.0 - dist / dist_uniform);
 }
 
+// VLLM_DECISION2, VLLM_D3: normalized entropy, as in the reference implementation
+double confidence_entropy(const std::vector<double> & probs) { // decision_confidence_entropy
+    if (probs.size() < 2) {
+        return 1.0;
+    }
+    double entropy = 0.0;
+    for (const double p : probs) {
+        if (p > 0.0) {
+            entropy -= p * std::log(p);
+        }
+    }
+    return std::max(0.0, std::min(1.0, 1.0 - entropy / std::log((double) probs.size())));
+}
+
+bool is_payload(const json & val) { // decision_is_payload
+    return val.is_string() || val.is_object() || val.is_array();
+}
+
 // given to the template: text between the pieces of the prompt, and at the start of the span of a question or of an option
 const std::string CLEF_MARKER        = "<<clef:";
 const std::string CLEF_SEP           = "<<clef:sep>>";
 const std::string CLEF_MARK_QUESTION = "<<clef:question>>";
 const std::string CLEF_MARK_OPTION   = "<<clef:option>>";
+
+// given to the lfm2-d1-omni template: text between the pieces of the prompt, and at the start of the pieces that are cut to a token budget
+const std::string D1OMNI_MARKER        = "<<d1omni:";
+const std::string D1OMNI_SEP           = "<<d1omni:sep>>";
+const std::string D1OMNI_MARK_STATE    = "<<d1omni:state>>";
+const std::string D1OMNI_MARK_QUESTION = "<<d1omni:question>>";
+const std::string D1OMNI_MARK_OPTION   = "<<d1omni:option>>";
+
+// max_length of the model config, the converter checks it. Upstream also has
+// the image and audio budgets, which only apply to media.
+const size_t D1OMNI_MAX_TOKENS = 16384;
 
 } // namespace
 
@@ -234,12 +291,13 @@ std::string model_type(const llama_model * model) {
 
 // Mirrors the decision branch of common_init_result::common_init_result.
 bool type_reads_embeddings(const std::string & type) {
-    return type == "laya" || type == "kev" || type == "clef";
+    return type == "laya" || type == "kev" || type == "clef" || type == "lfm2-d1-omni" || type == "vllm-decision2";
 }
 
 // Mirrors server_decision_context::can_share_prompt.
 bool type_shares_prompt(const std::string & type) {
-    return type == "openjev" || type == "lev" || type == "kev" || type == "nimble" || type == "pplx-decider" || type == "lfm2-d1";
+    return type == "openjev" || type == "lev" || type == "kev" || type == "nimble" || type == "pplx-decider" ||
+           type == "vllm-decision2" || type == "lfm2-d1";
 }
 
 struct Engine::Impl {
@@ -253,11 +311,15 @@ struct Engine::Impl {
     std::shared_ptr<const common_chat_template> tmpl; // the "systemone" template
 
     std::map<std::string, float> temperatures; // "<type>" or "<type>.<n_options bucket>"
+    std::map<size_t, std::vector<float>> score_bias; // added to the scores of a score question, by number of levels
     size_t n_options_max   = 0;
     bool   noul_true_first = false; // noul options are [true, false] instead of [false, true]
+    bool   noul_criteria_order = false; // noul options are in the order of the criteria keys, if given
     bool   choice_sorted   = false; // choice options are in the order of their keys
+    bool   strict_payload  = false; // state, instructions and descriptions must be text, an object or an array
+    bool   canonical_legend = false; // non-string score descriptions are returned as canonical JSON text
 
-    // OPENJEV, LEV, NIMBLE, PPLX_DECIDER
+    // OPENJEV, LEV, NIMBLE, PPLX_DECIDER, VLLM_D3
     std::vector<llama_token> labels;
     std::vector<std::string> label_texts; // only if the label of an option is given to the template
 
@@ -281,6 +343,7 @@ struct Engine::Impl {
             case COMMON_DECISION_TYPE_KEV:
             case COMMON_DECISION_TYPE_NIMBLE:
             case COMMON_DECISION_TYPE_PPLX_DECIDER:
+            case COMMON_DECISION_TYPE_VLLM_DECISION2:
             case COMMON_DECISION_TYPE_LFM2_D1:
                 return true;
             default:
@@ -293,7 +356,8 @@ struct Engine::Impl {
     }
 
     bool reads_embeddings() const {
-        return type == COMMON_DECISION_TYPE_LAYA || type == COMMON_DECISION_TYPE_KEV || type == COMMON_DECISION_TYPE_CLEF;
+        return type == COMMON_DECISION_TYPE_LAYA || type == COMMON_DECISION_TYPE_KEV || type == COMMON_DECISION_TYPE_CLEF ||
+               type == COMMON_DECISION_TYPE_LFM2_D1_OMNI || type == COMMON_DECISION_TYPE_VLLM_DECISION2;
     }
 
     void init() { // server_decision_context::init
@@ -330,6 +394,28 @@ struct Engine::Impl {
             temperatures[key + prefix_temp.size()] = temp;
         }
 
+        // "<n_levels>.<level>" -> offset
+        const std::string prefix_bias = prefix + "score_bias.";
+        for (int32_t i = 0; i < llama_model_meta_count(model); i++) {
+            char key[256];
+            char val[64];
+            if (llama_model_meta_key_by_index(model, i, key, sizeof(key)) < 0 || !string_starts_with(key, prefix_bias)) {
+                continue;
+            }
+            if (llama_model_meta_val_str_by_index(model, i, val, sizeof(val)) < 0) {
+                continue;
+            }
+            const auto parts = string_split<std::string>(key + prefix_bias.size(), '.');
+            const size_t n     = parts.size() == 2 ? std::strtoul(parts[0].c_str(), nullptr, 10) : 0;
+            const size_t level = parts.size() == 2 ? std::strtoul(parts[1].c_str(), nullptr, 10) : 0;
+            if (n < 2 || n > 255 || level >= n) {
+                throw std::runtime_error(string_format("invalid decision score bias: %s", key));
+            }
+            auto & bias = score_bias[n];
+            bias.resize(n, 0.0f);
+            bias[level] = std::strtof(val, nullptr);
+        }
+
         if (model_type == COMMON_DECISION_TYPE_OPENJEV) {
             // one letter per option, each must be a single token
             const std::string letters = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
@@ -342,7 +428,7 @@ struct Engine::Impl {
             }
             n_options_max   = labels.size();
             noul_true_first = true;
-        } else if (model_type == COMMON_DECISION_TYPE_LEV || model_type == COMMON_DECISION_TYPE_NIMBLE || model_type == COMMON_DECISION_TYPE_PPLX_DECIDER) {
+        } else if (model_type == COMMON_DECISION_TYPE_LEV || model_type == COMMON_DECISION_TYPE_NIMBLE || model_type == COMMON_DECISION_TYPE_PPLX_DECIDER || model_type == COMMON_DECISION_TYPE_VLLM_D3) {
             // label codes are A..Z then AA..ZZ, only the ones that are a single token are used
             std::vector<std::string> codes;
             for (char a = 'A'; a <= 'Z'; a++) {
@@ -361,6 +447,9 @@ struct Engine::Impl {
                 }
             }
             n_options_max = labels.size();
+            if (model_type == COMMON_DECISION_TYPE_VLLM_D3) {
+                canonical_legend = true;
+            }
         } else if (model_type == COMMON_DECISION_TYPE_KEV) {
             // the hidden state of an option is read at the token that ends it
             const auto toks = common_tokenize(vocab, "<|box_end|>", false, true);
@@ -387,9 +476,20 @@ struct Engine::Impl {
             n_options_max   = 255;
             noul_true_first = true;
             choice_sorted   = true;
+        } else if (model_type == COMMON_DECISION_TYPE_VLLM_DECISION2) {
+            n_options_max       = 255;
+            noul_criteria_order = true;
+            strict_payload      = true;
+            canonical_legend    = true;
         } else if (model_type == COMMON_DECISION_TYPE_LFM2_D1) {
             n_options_max   = 255;
             noul_true_first = true;
+        } else if (model_type == COMMON_DECISION_TYPE_LFM2_D1_OMNI) {
+            token_marker = llama_vocab_mask(vocab);
+            if (token_marker == LLAMA_TOKEN_NULL) {
+                throw std::runtime_error("decision model has no mask token");
+            }
+            n_options_max = 255;
         } else {
             throw std::runtime_error("unsupported decision model type: " + type_name);
         }
@@ -407,9 +507,12 @@ struct Engine::Impl {
     //
 
     std::vector<decision_question> parse_questions(const json & body) const { // server_decision_context::parse_questions
-        // d1 accepts a null state (images only upstream; here it just asks about nothing but the questions)
-        if (!body.contains("state") || (body.at("state").is_null() && type != COMMON_DECISION_TYPE_LFM2_D1)) {
+        // lfm2-d1, lfm2-d1-omni and vllm-d3 accept a null state (for images only upstream; here it just asks about nothing but the questions)
+        if (!body.contains("state") || (body.at("state").is_null() && type != COMMON_DECISION_TYPE_LFM2_D1 && type != COMMON_DECISION_TYPE_LFM2_D1_OMNI && type != COMMON_DECISION_TYPE_VLLM_D3)) {
             throw std::invalid_argument("\"state\" must be provided");
+        }
+        if (strict_payload && !is_payload(body.at("state"))) {
+            throw std::invalid_argument("\"state\" must be text, an object or an array");
         }
         if (!body.contains("questions") || !body.at("questions").is_object() || body.at("questions").empty()) {
             throw std::invalid_argument("\"questions\" must be a non-empty object");
@@ -423,13 +526,18 @@ struct Engine::Impl {
             if (!q.is_object()) {
                 throw err("must be an object");
             }
-            if (!q.contains("instructions") || q.at("instructions").is_null()) {
+            // the vllm-d3 prompt has a default question
+            const json instructions = q.contains("instructions") ? q.at("instructions") : json();
+            if (instructions.is_null() && type != COMMON_DECISION_TYPE_VLLM_D3) {
                 throw err("\"instructions\" must be provided");
+            }
+            if (strict_payload && (!is_payload(instructions) || instructions == "")) {
+                throw err("\"instructions\" must be non-empty text, an object or an array");
             }
 
             decision_question question;
             question.id           = id;
-            question.instructions = q.at("instructions");
+            question.instructions = instructions;
 
             const std::string type_name = json_string(q, "type");
             const json        criteria  = q.contains("criteria") ? q.at("criteria") : json();
@@ -440,7 +548,13 @@ struct Engine::Impl {
                     throw err("\"criteria\" must be a non-empty object");
                 }
                 for (const auto & [key, description] : criteria.items()) {
+                    if (strict_payload && (key.empty() || !(description.is_null() || is_payload(description)))) {
+                        throw err("option keys must be non-empty, descriptions must be null, text, an object or an array");
+                    }
                     question.options.push_back({key, description});
+                }
+                if (strict_payload && question.options.size() < 2) {
+                    throw err("\"criteria\" must have at least 2 options");
                 }
                 if (choice_sorted) {
                     std::sort(question.options.begin(), question.options.end(), [](const auto & a, const auto & b) {
@@ -453,6 +567,9 @@ struct Engine::Impl {
                     throw err("\"criteria\" must be an array of 2 to 10 levels");
                 }
                 for (size_t i = 0; i < criteria.size(); i++) {
+                    if (strict_payload && !is_payload(criteria.at(i))) {
+                        throw err("level descriptions must be text, an object or an array");
+                    }
                     question.options.push_back({std::to_string(i), criteria.at(i)});
                 }
             } else if (type_name == "noul") {
@@ -460,10 +577,25 @@ struct Engine::Impl {
                 if (!criteria.is_null() && !criteria.is_object()) {
                     throw err("\"criteria\" must be an object");
                 }
-                for (const char * key : {"false", "true"}) {
-                    question.options.push_back({key, criteria.is_object() && criteria.contains(key) ? criteria.at(key) : json()});
+                if (strict_payload && criteria.is_object()) {
+                    for (const auto & [key, description] : criteria.items()) {
+                        if ((key != "false" && key != "true") || !is_payload(description)) {
+                            throw err("\"criteria\" may only describe \"false\" and \"true\" with text, an object or an array");
+                        }
+                    }
                 }
-                if (noul_true_first) {
+                for (const char * key : {"false", "true"}) {
+                    json description;
+                    if (criteria.is_object() && criteria.contains(key)) {
+                        description = criteria.at(key);
+                    } else if (criteria.is_object() && type == COMMON_DECISION_TYPE_LFM2_D1_OMNI) {
+                        // lfm2-d1-omni also reads the descriptions under "no" and "yes"
+                        const char * alias = std::string(key) == "true" ? "yes" : "no";
+                        description = criteria.contains(alias) ? criteria.at(alias) : json();
+                    }
+                    question.options.push_back({key, description});
+                }
+                if (noul_true_first || (noul_criteria_order && criteria.is_object() && criteria.size() == 2 && criteria.begin().key() == "true")) {
                     std::swap(question.options[0], question.options[1]);
                 }
             } else {
@@ -479,22 +611,27 @@ struct Engine::Impl {
         return questions;
     }
 
-    // server_decision_context::parse_state, without image loading: this build
-    // has no libmtmd, so any image is an error instead of being taken out of
-    // the state. A state without images comes back unchanged, as upstream.
+    // server_decision_context::parse_state, without media loading: this build
+    // has no libmtmd, so any image or audio clip is an error instead of being
+    // taken out of the state. A state without media comes back unchanged, as
+    // upstream.
     json parse_state(const json & body) const {
-        auto reject = []() {
-            return std::invalid_argument("image input is not supported: LlamaCppEx is built without libmtmd");
+        auto reject = [](const char * kind) {
+            return std::invalid_argument(std::string(kind) + " input is not supported: LlamaCppEx is built without libmtmd");
         };
         if (body.contains("videos") && !body.at("videos").is_null() && !body.at("videos").empty()) {
             throw std::invalid_argument("\"videos\" is not supported");
         }
-        if (body.contains("images") && !body.at("images").is_null()) {
-            if (!body.at("images").is_array()) {
-                throw std::invalid_argument("\"images\" must be an array");
+        // "images" is an alias of "files"
+        for (const char * key : {"files", "images"}) {
+            if (!body.contains(key) || body.at(key).is_null()) {
+                continue;
             }
-            if (!body.at("images").empty()) {
-                throw reject();
+            if (!body.at(key).is_array()) {
+                throw std::invalid_argument(string_format("\"%s\" must be an array", key));
+            }
+            if (!body.at(key).empty()) {
+                throw reject("image");
             }
         }
 
@@ -510,7 +647,10 @@ struct Engine::Impl {
             }
             for (const auto & part : msg.at("content")) {
                 if (part.is_object() && json_string(part, "type") == "image_url" && part.contains("image_url")) {
-                    throw reject();
+                    throw reject("image");
+                }
+                if (part.is_object() && json_string(part, "type") == "input_audio" && part.contains("input_audio")) {
+                    throw reject("audio");
                 }
             }
         }
@@ -674,7 +814,7 @@ struct Engine::Impl {
         return jinja::runtime::gather_string_parts(results)->as_string().str();
     }
 
-    // server_decision_context::render with n_images == 0
+    // server_decision_context::render with n_images == 0 (so is_audio == false)
     std::string render(
             const json & state,
             const std::vector<decision_question> & questions,
@@ -718,6 +858,15 @@ struct Engine::Impl {
             inp = replace_text(inp, text_marker, " ");
         }
 
+        if (type == COMMON_DECISION_TYPE_LFM2_D1_OMNI) {
+            inp = replace_text(d1omni_escape(inp), D1OMNI_MARKER, "<<d1omni ");
+            inp["audio"]         = false;
+            inp["sep"]           = D1OMNI_SEP;
+            inp["mark_state"]    = D1OMNI_MARK_STATE;
+            inp["mark_question"] = D1OMNI_MARK_QUESTION;
+            inp["mark_option"]   = D1OMNI_MARK_OPTION;
+        }
+
         inp["images"] = json::array();
 
         return run_template(inp);
@@ -729,10 +878,18 @@ struct Engine::Impl {
             const std::vector<decision_question> & questions,
             const decision_question & question,
             size_t variant) const {
+        // each question has its own prompt, with the spans that the head reads
+        if (type == COMMON_DECISION_TYPE_VLLM_DECISION2) {
+            return fill_task_joint(state, { question });
+        }
+        if (type == COMMON_DECISION_TYPE_LFM2_D1_OMNI) {
+            return fill_task_d1omni(state, questions, question, variant);
+        }
+
         decision_task task;
         const std::string prompt = render(state, questions, question, variant);
 
-        if (type == COMMON_DECISION_TYPE_OPENJEV || type == COMMON_DECISION_TYPE_LEV || type == COMMON_DECISION_TYPE_NIMBLE || type == COMMON_DECISION_TYPE_PPLX_DECIDER) {
+        if (type == COMMON_DECISION_TYPE_OPENJEV || type == COMMON_DECISION_TYPE_LEV || type == COMMON_DECISION_TYPE_NIMBLE || type == COMMON_DECISION_TYPE_PPLX_DECIDER || type == COMMON_DECISION_TYPE_VLLM_D3) {
             // lev reads the ratings of a noul question at its first labels, not at the digits
             task.labels.assign(labels.begin(), labels.begin() + n_outputs(question));
         }
@@ -821,6 +978,94 @@ struct Engine::Impl {
 
         // the output has one score per question type
         task.column = question.type;
+    }
+
+    // server_decision_context::fill_task_d1omni without files: no media
+    // prefix, so the text gets the whole D1OMNI_MAX_TOKENS budget.
+    // each piece is cut to its budget as the model was trained (d1-omni prompt.py: encode), the state gets the room that is left
+    decision_task fill_task_d1omni(
+            const json & state,
+            const std::vector<decision_question> & questions,
+            const decision_question & question,
+            size_t variant) const {
+        decision_task task;
+        const auto invalid = std::runtime_error("unexpected layout of the decision prompt");
+
+        // with no files the media markers before the first separator are empty
+        const std::string prompt = render(state, questions, question, variant);
+        const std::vector<std::string> pieces = string_split(prompt, D1OMNI_SEP);
+        if (pieces.empty() || !pieces[0].empty()) {
+            throw invalid;
+        }
+
+        const size_t n_max = D1OMNI_MAX_TOKENS;
+
+        // the options get max(96, min(24 n + 32, max / 2)) tokens, shared evenly
+        const int64_t n_options      = question.options.size();
+        const int64_t n_budget       = std::max<int64_t>(96, std::min<int64_t>(24 * n_options + 32, n_max / 2));
+        const int64_t n_option_max   = std::max<int64_t>(2, (n_budget - 3 * n_options) / n_options);
+        const int64_t n_question_max = std::max<int64_t>(16, n_budget);
+
+        llama_tokens head;  // before the state
+        llama_tokens body;  // the state
+        llama_tokens tail;  // after the state
+        bool has_state = false;
+        for (size_t i_piece = 1; i_piece < pieces.size(); i_piece++) {
+            std::string piece = pieces[i_piece];
+            int64_t n_piece_max = -1;
+            bool is_state = false;
+            if (string_starts_with(piece, D1OMNI_MARK_STATE)) {
+                piece    = piece.substr(D1OMNI_MARK_STATE.size());
+                is_state = true;
+            } else if (string_starts_with(piece, D1OMNI_MARK_QUESTION)) {
+                piece = piece.substr(D1OMNI_MARK_QUESTION.size());
+                n_piece_max = n_question_max;
+            } else if (string_starts_with(piece, D1OMNI_MARK_OPTION)) {
+                piece = piece.substr(D1OMNI_MARK_OPTION.size());
+                n_piece_max = n_option_max;
+            }
+
+            llama_tokens tokens = common_tokenize(vocab, piece, false, true);
+            if (n_piece_max >= 0 && (int64_t) tokens.size() > n_piece_max) {
+                tokens.resize(n_piece_max);
+            }
+
+            if (is_state) {
+                if (has_state) {
+                    throw invalid;
+                }
+                body      = std::move(tokens);
+                has_state = true;
+            } else {
+                llama_tokens & dst = has_state ? tail : head;
+                dst.insert(dst.end(), tokens.begin(), tokens.end());
+            }
+        }
+        if (!has_state) {
+            throw invalid;
+        }
+
+        const size_t n_room = n_max - std::min(n_max, head.size() + tail.size());
+        body.resize(std::min(body.size(), n_room));
+
+        llama_tokens tokens = std::move(head);
+        tokens.insert(tokens.end(), body.begin(), body.end());
+        tokens.insert(tokens.end(), tail.begin(), tail.end());
+        tokens.resize(std::min(tokens.size(), n_max));
+
+        for (size_t i = 0; i < tokens.size(); i++) {
+            if (tokens[i] == token_marker) {
+                task.markers.push_back(i);
+            }
+        }
+        if ((int64_t) task.markers.size() != n_options) {
+            throw std::invalid_argument("the options do not fit in the context");
+        }
+
+        // the output has one score per question type
+        task.column = question.type;
+        task.tokens = std::move(tokens);
+        return task;
     }
 
     // server_decision_context::fill_task_joint without files
@@ -926,6 +1171,8 @@ struct Engine::Impl {
         return 1.0f;
     }
 
+    // server_decision_context::format_answer with has_media == false, so
+    // lfm2-d1-omni keeps its calibrated temperatures (upstream uses 1.0 for media)
     json format_answer(const decision_question & question, const std::vector<std::vector<float>> & scores) const { // server_decision_context::format_answer
         const size_t n = n_outputs(question);
         if (scores.size() != n_variants(question)) {
@@ -944,11 +1191,17 @@ struct Engine::Impl {
             if (std::any_of(s.begin(), s.end(), [](float v) { return std::isnan(v); })) {
                 throw std::runtime_error("the model could not evaluate the decision");
             }
-            const float score_max = *std::max_element(s.begin(), s.end());
+            std::vector<double> logits(s.begin(), s.end());
+            if (question.type == QUESTION_SCORE && score_bias.count(n) > 0) {
+                for (size_t i = 0; i < n; i++) {
+                    logits[i] += score_bias.at(n)[i];
+                }
+            }
+            const double logit_max = *std::max_element(logits.begin(), logits.end());
             std::vector<double> p(n);
             double sum = 0.0;
             for (size_t i = 0; i < n; i++) {
-                p[i] = std::exp((double) (s[i] - score_max) / temperature);
+                p[i] = std::exp((logits[i] - logit_max) / temperature);
                 sum += p[i];
             }
             for (size_t i = 0; i < n; i++) {
@@ -985,20 +1238,33 @@ struct Engine::Impl {
             const size_t best = std::max_element(probs.begin(), probs.end()) - probs.begin();
             answer["choice"]        = question.options[best].key;
             answer["probabilities"] = probabilities;
-            answer["confidence"]    = confidence_choice(probs);
+            answer["confidence"]    = get_confidence(question.type, probs);
         } else {
             double expected = 0.0;
             json legend = json::object();
             for (size_t i = 0; i < n; i++) {
                 expected += i * probs[i];
-                legend[question.options[i].key] = question.options[i].description;
+                const json & description = question.options[i].description;
+                legend[question.options[i].key] = canonical_legend && !description.is_string() ? json(sort_keys(description).dump()) : description;
             }
             answer["score"]         = expected;
             answer["legend"]        = legend;
             answer["probabilities"] = probabilities;
-            answer["confidence"]    = confidence_score(probs);
+            answer["confidence"]    = get_confidence(question.type, probs);
         }
         return answer;
+    }
+
+    double get_confidence(question_type qtype, const std::vector<double> & probs) const { // server_decision_context::get_decision_confidence
+        if (type == COMMON_DECISION_TYPE_VLLM_DECISION2 || type == COMMON_DECISION_TYPE_VLLM_D3) {
+            return confidence_entropy(probs);
+        }
+        switch (qtype) {
+            case QUESTION_CHOICE: return confidence_choice(probs);
+            case QUESTION_SCORE:  return confidence_score(probs);
+            case QUESTION_NOUL:   break;
+        }
+        throw std::runtime_error("no confidence for this question type");
     }
 
     //
@@ -1017,16 +1283,25 @@ struct Engine::Impl {
     // upstream's batch layout rules (server-context.cpp, "the outputs of a
     // decision are read from one batch"): the last token for label readouts,
     // everything from the first read position for embedding readouts, and the
-    // whole prompt for the models that see it at once (laya is a non-causal
-    // encoder, clef's joint head reads the whole batch).
+    // whole prompt for the models that read every position (laya and
+    // lfm2-d1-omni score markers anywhere in it; clef's joint head reads the
+    // whole batch).
     int32_t first_output(const decision_task & task) const {
-        if (type == COMMON_DECISION_TYPE_LAYA || type == COMMON_DECISION_TYPE_CLEF) {
+        if (type == COMMON_DECISION_TYPE_LAYA || type == COMMON_DECISION_TYPE_CLEF || type == COMMON_DECISION_TYPE_LFM2_D1_OMNI) {
             return 0;
         }
         if (!task.labels.empty()) {
             return (int32_t) task.tokens.size() - 1;
         }
         return task.pos_first();
+    }
+
+    // The position from which the prompt must be in the last batch: the first
+    // output, or the whole prompt over a non-causal context (laya,
+    // lfm2-d1-omni, vllm-d3), whose tokens only attend within their batch
+    // (server_slot::can_split).
+    int32_t first_batched(const decision_task & task) const {
+        return llama_get_causal_attn(ctx) ? first_output(task) : 0;
     }
 
     void check_fits(const decision_task & task) const {
@@ -1042,7 +1317,7 @@ struct Engine::Impl {
             throw std::invalid_argument(string_format(
                 "the prompt (%d tokens) does not fit in the context, increase n_ctx (current: %d)", n_tokens, n_ctx));
         }
-        if (first_output(task) == 0) {
+        if (first_batched(task) == 0) {
             const int32_t n_max = std::min(n_batch, n_ubatch);
             if (n_tokens > n_max) {
                 throw std::invalid_argument(string_format(
@@ -1050,7 +1325,7 @@ struct Engine::Impl {
             }
             return;
         }
-        const int32_t n_read = n_tokens - first_output(task);
+        const int32_t n_read = n_tokens - first_batched(task);
         if (n_read > n_batch) {
             throw std::invalid_argument(string_format(
                 "the question and its options (%d tokens) are too large to process. "
@@ -1059,17 +1334,20 @@ struct Engine::Impl {
     }
 
     // Decodes tokens [from, to) of `task` on `seq`, at positions equal to their
-    // index. Every position from `out_from` on is an output, and all of them
-    // land in the last batch (check_fits guarantees they fit in one). Returns
-    // the position of the first entry of that last batch.
-    int32_t decode(const decision_task & task, int32_t from, int32_t to, llama_seq_id seq, int32_t out_from) {
+    // index. Every position from `batch_from` on lands in the last batch
+    // (check_fits guarantees they fit in one). Every position from `out_from`
+    // (>= batch_from) on is an output, and every position is for the types that
+    // read embeddings: upstream's server_task::need_embd, and what
+    // llama_decode forces anyway when embeddings are on. Returns the position
+    // of the first entry of that last batch.
+    int32_t decode(const decision_task & task, int32_t from, int32_t to, llama_seq_id seq, int32_t batch_from, int32_t out_from) {
         const int32_t n_batch = (int32_t) llama_n_batch(ctx);
-        const int32_t last    = std::max(from, std::min(out_from, to - n_batch));
+        const int32_t last    = std::max(from, std::min(batch_from, to - n_batch));
 
         auto run = [&](int32_t off, int32_t end) {
             batch.clear();
             for (int32_t i = off; i < end; i++) {
-                batch.add(task.tokens[i], i, seq, i >= out_from);
+                batch.add(task.tokens[i], i, seq, reads_embeddings() || i >= out_from);
                 if (!task.order.empty()) {
                     batch.tokens.back().decision_order = task.order[i];
                 }
@@ -1124,9 +1402,10 @@ struct Engine::Impl {
             return pos >= out_from && pos < n_tokens ? llama_get_embeddings_ith(ctx, pos - batch_start) : nullptr;
         };
 
-        // joint head (decision model): the scores are the first rows
+        // joint head (decision model): the scores are the first output rows of
+        // the batch, and every entry of the batch is an output
         for (int32_t i = 0; i < task.n_scores; i++) {
-            const float * embd = get_embd(i);
+            const float * embd = batch_start + i < n_tokens ? llama_get_embeddings_ith(ctx, i) : nullptr;
             if (embd == nullptr) {
                 throw std::runtime_error("failed to get embeddings");
             }
@@ -1173,7 +1452,7 @@ struct Engine::Impl {
                 n_common++;
             }
             n_shared = std::min({n_shared, n_common, task.tokens.size() - 1});
-            n_shared = std::min(n_shared, (size_t) first_output(task));
+            n_shared = std::min(n_shared, (size_t) first_batched(task));
         }
         return (int32_t) n_shared;
     }
@@ -1197,7 +1476,7 @@ struct Engine::Impl {
         const int32_t n_shared = mem != nullptr ? shared_prefix(tasks) : 0;
         clear();
         if (n_shared > 0) {
-            decode(tasks[0], 0, n_shared, 0, n_shared);
+            decode(tasks[0], 0, n_shared, 0, n_shared, n_shared);
         }
 
         for (const auto & task : tasks) {
@@ -1209,7 +1488,7 @@ struct Engine::Impl {
             } else {
                 clear();
             }
-            const int32_t start = decode(task, n_shared, (int32_t) task.tokens.size(), seq, first_output(task));
+            const int32_t start = decode(task, n_shared, (int32_t) task.tokens.size(), seq, first_batched(task), first_output(task));
             results.push_back(read_scores(task, start));
         }
         clear();
