@@ -96,7 +96,10 @@ defmodule LlamaCppEx.Context do
     * `:n_threads` - Number of threads for generation. Defaults to system CPU count.
     * `:n_threads_batch` - Number of threads for prompt processing. Defaults to `:n_threads`.
     * `:n_seq_max` - Max number of concurrent sequences. Defaults to `1`.
-    * `:embeddings` - Enable embedding extraction. Defaults to `false`.
+    * `:embeddings` - Enable embedding extraction. Defaults to `false`. With a
+      pooling type other than `:none` the context computes pooled embeddings
+      only, no logits: sampling on it raises `:invalid_index`, and `generate/4`
+      returns an error.
     * `:pooling_type` - Pooling type for embeddings: `:unspecified`, `:none`, `:mean`,
       `:cls`, `:last`, `:rank`. Defaults to `:unspecified`.
 

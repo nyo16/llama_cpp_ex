@@ -68,6 +68,12 @@ Watch for two harder ones:
   that field explicitly, behaviour did not change -- but a field we left at its
   default would have shifted silently. Diff
   `llama_model_default_params` / `llama_context_default_params` on every bump.
+- **An output stops existing** with no header change at all. At `a0e6dc738`
+  (#30445, #30255) a context with `embeddings: true` and a pooling type other
+  than NONE skips the LM head and allocates no logits buffer, so sampling on
+  it went from working to `GGML_ASSERT(logits != nullptr)`. The `llama.h`
+  diff was one comment. Read `src/llama-context.cpp` and `src/llama-graph.cpp`
+  commits for anything that changes what a decode outputs.
 
 The NIF uses these key APIs (grep `llama_nif.cpp` for the full list):
 - `llama_model_*`, `llama_context_*`, `llama_vocab_*` — model/context/vocab management
@@ -222,6 +228,15 @@ not touched. The `ggml-rpc` diff is #29544 only — `GGML_RPC_DEBUG` becomes a
 and `RPC_PROTO_MAJOR_VERSION` stays 8. #30014 sets ggml's default symbol
 visibility to hidden, but only under `BUILD_SHARED_LIBS`; the NIF links the
 static archives, so nothing it calls disappears.
+
+Re-checked at `a0e6dc738` (b11630+9), covering the 62 commits from
+`cbe28bb3c`: #1, #2 and #3 are as above. The `ggml-cpu/CMakeLists.txt` diff
+is #29219, which moves KleidiAI from v1.24.0 to v1.31.0; the `-mcpu=native`
+probe is untouched. The `ggml-rpc` diff is #30481 (transfer logging) only:
+`ggml_backend_rpc_start_server` keeps its `void` signature and
+`RPC_PROTO_MAJOR_VERSION` stays 8. The `ggml-cuda.cu` diff is #30327
+(`GGML_CUDA_GRAPH_DEBUG`, env vars read once) and #30441 (warnings), none of
+it near `ggml_backend_cuda_comm_init`.
 
 | # | Upstream defect | Our workaround | Still needed? |
 |---|---|---|---|

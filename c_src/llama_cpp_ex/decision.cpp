@@ -2,7 +2,7 @@
 // of tools/server/server-context.cpp (send_decision, the batch layout rules and
 // the /v1/systemone handler). See decision.h for scope.
 //
-// Ported at cbe28bb3c. Functions that are upstream's carry its name in a
+// Ported at a0e6dc738. Functions that are upstream's carry its name in a
 // trailing comment so a bump can diff them one by one; everything below the
 // "evaluation" banner replaces server slots and is ours.
 
@@ -20,7 +20,6 @@
 #include <cctype>
 #include <cmath>
 #include <map>
-#include <regex>
 #include <stdexcept>
 #include <vector>
 
@@ -187,17 +186,43 @@ std::string kev_render(const json & val, int indent = 0) { // decision_kev_rende
     return val.dump();
 }
 
+// same result as std::regex_replace with <\|([A-Za-z0-9_]+)\|>
+// std::regex is not used: libstdc++ recurses for each char, a long input overflows the stack
+std::string escape_special_tokens(const std::string & text) { // server_decision_escape_special_tokens
+    const auto is_name = [](char c) {
+        return (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '_';
+    };
+    std::string out;
+    size_t n_done = 0; // the chars of text that are in out
+    for (size_t i = text.find("<|"); i != std::string::npos; i = text.find("<|", std::max(i + 1, n_done))) {
+        size_t j = i + 2;
+        while (j < text.size() && is_name(text[j])) {
+            j++;
+        }
+        if (j > i + 2 && text.compare(j, 2, "|>") == 0) {
+            out.append(text, n_done, i - n_done);
+            out += "<\xC2\xA6";
+            out.append(text, i + 2, j - i - 2);
+            out += "\xC2\xA6>";
+            n_done = j + 2;
+        }
+    }
+    if (n_done == 0) {
+        return text;
+    }
+    out.append(text, n_done, std::string::npos);
+    return out;
+}
+
 // kev text input: special tokens written in the text must not be parsed as such
 std::string kev_text(const json & val) { // decision_kev_text
-    static const std::regex re_special("<\\|([A-Za-z0-9_]+)\\|>");
-    return std::regex_replace(kev_render(val), re_special, "<\xC2\xA6$1\xC2\xA6>");
+    return escape_special_tokens(kev_render(val));
 }
 
 // lfm2-d1-omni: special tokens written in the input must not be parsed as such, in keys too (d1-omni prompt.py: escape)
 json d1omni_escape(const json & val) { // decision_d1omni_escape
-    static const std::regex re_special("<\\|([A-Za-z0-9_]+)\\|>");
     if (val.is_string()) {
-        return std::regex_replace(val.get<std::string>(), re_special, "<\xC2\xA6$1\xC2\xA6>");
+        return escape_special_tokens(val.get<std::string>());
     }
     if (val.is_array()) {
         json out = json::array();
@@ -209,7 +234,7 @@ json d1omni_escape(const json & val) { // decision_d1omni_escape
     if (val.is_object()) {
         json out = json::object();
         for (const auto & [key, item] : val.items()) {
-            out[std::regex_replace(key, re_special, "<\xC2\xA6$1\xC2\xA6>")] = d1omni_escape(item);
+            out[escape_special_tokens(key)] = d1omni_escape(item);
         }
         return out;
     }

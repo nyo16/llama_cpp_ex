@@ -167,7 +167,9 @@ defmodule LlamaCppEx.MTPCancelTest do
   # decode failed: code=-2"`, or `unknown exception thrown within NIF` raised
   # from the cancelled stream's own `generate_mtp_tokens` call. Same model and
   # machine as above, so the abort is not new in 23b0202a1; nothing between
-  # v0.8.49 and v0.8.56 ran this tag.
+  # v0.8.49 and v0.8.56 ran this tag. At a0e6dc738 (b11630+9) four runs aborted
+  # 2/4 (exit 134); the other two failed with the same `unknown exception` and
+  # `"prompt decode failed: code=-2"` as above.
   #
   # It therefore still lives in its own module carrying only `:mtp_cancel`, and
   # deliberately *not* `:mtp`: `--include` beats `--exclude` in ExUnit, so a

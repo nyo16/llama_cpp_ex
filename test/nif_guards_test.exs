@@ -340,6 +340,51 @@ defmodule LlamaCppEx.NIFGuardsTest do
     end
   end
 
+  # Since llama.cpp cb55ffe6e a pooled-embeddings context skips the LM head and
+  # keeps no logits buffer, so sampling on one hit GGML_ASSERT(logits != nullptr).
+  # Every NIF that samples refuses it before decoding anything, and the context
+  # still serves the pooled embeddings it was made for.
+  describe "pooled-embeddings context" do
+    test "every sampling NIF refuses it", %{model: model, tokens: tokens} do
+      {:ok, ctx} = Context.create(model, n_ctx: 512, embeddings: true, pooling_type: :mean)
+      {:ok, sampler} = Sampler.create(model, temp: 0.0)
+      [first | _] = tokens
+
+      assert :ok = NIF.decode(ctx.ref, tokens)
+      assert_erlang_error(:invalid_index, fn -> NIF.sampler_sample(sampler.ref, ctx.ref) end)
+
+      assert_erlang_error(:invalid_index, fn ->
+        NIF.sampler_sample_at(sampler.ref, ctx.ref, -1)
+      end)
+
+      assert {:error, "context has no logits" <> _} = Context.generate(ctx, sampler, tokens)
+
+      assert {:error, "context has no logits" <> _} =
+               NIF.decode_batch(ctx.ref, sampler.ref, [{0, first, 0}])
+
+      assert {:error, "context has no logits" <> _} =
+               NIF.batch_eval_sample(ctx.ref, [{first, 0, 0, true}], [{0, sampler.ref}], [])
+
+      ref = make_ref()
+      cancel = NIF.cancel_flag_new()
+      NIF.generate_tokens(ctx.ref, sampler.ref, tokens, 4, self(), ref, cancel)
+      assert_receive {^ref, {:error, "context has no logits" <> _}}
+
+      assert NIF.memory_seq_rm(ctx.ref, 0, 0, -1) == true
+      assert :ok = NIF.embed_decode(ctx.ref, tokens, 0)
+      assert {:ok, bin} = NIF.get_embeddings(ctx.ref, 0, 2)
+      assert byte_size(bin) == 4 * Model.n_embd_out(model)
+    end
+
+    test "pooling :none keeps the logits", %{model: model, tokens: tokens} do
+      {:ok, ctx} = Context.create(model, n_ctx: 512, embeddings: true, pooling_type: :none)
+      {:ok, sampler} = Sampler.create(model, temp: 0.0)
+
+      assert :ok = NIF.decode(ctx.ref, tokens)
+      assert is_integer(NIF.sampler_sample(sampler.ref, ctx.ref))
+    end
+  end
+
   # Deserializing an untrusted binary straight into the KV cache. A short or
   # corrupt blob used to be read as though it were a valid header.
   describe "state_seq_set_data/3 blob validation" do

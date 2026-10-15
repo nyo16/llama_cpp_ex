@@ -1,5 +1,79 @@
 # Changelog
 
+## v0.8.59
+
+llama.cpp bumped to `a0e6dc738`
+([`b11630`](https://github.com/ggml-org/llama.cpp/releases/tag/b11630)+9),
+62 commits from `cbe28bb3c` (b11577). `common/chat.h` changes
+`common_chat_params.prompt` from a `std::string` to a `common_chat_prompt`
+(#30389: template parts and user-input parts, so a caller can tokenize user
+text without parsing special tokens); `chat_apply_template_jinja` returns the
+joined text, as upstream's own string consumers do. The rest is additive:
+`src/llama-ext.h` gains `llama_memory_get_buffers` and
+`llama_model_set_attn_rot`, `common_params_speculative_draft` gains `n_ubatch`
+(default 0 keeps following the target's), and `include/llama.h` changes one
+comment. `llama_model_default_params` / `llama_context_default_params` are
+unchanged. RPC protocol stays at 8.0.0. Upstream versions: llama.cpp 0.6.0,
+ggml 0.26.0.
+
+### Fixed
+
+- **Sampling on a pooled-embeddings context aborted the VM.** Since #30445
+  (with #30255) a context with `embeddings: true` and a pooling type other
+  than `:none` skips the LM head and keeps no logits buffer, so
+  `llama_sampler_sample` on it hits `GGML_ASSERT(logits != nullptr)`; before
+  this pin it computed logits beside the embeddings and sampling worked. The
+  context now records whether it is pooled, `sampler_sample/2` and
+  `sampler_sample_at/3` raise `:invalid_index` on it, and `Context.generate/4`,
+  the streaming generator, `decode_batch/3`, `batch_eval_sample/4` and
+  `speculative_init/3` return `"context has no logits: ..."` before decoding.
+  `decision_decide/2` clears the flag, since a decision leaves either
+  embeddings off or pooling `:none`. Covered in `test/nif_guards_test.exs`.
+
+### Changed
+
+- `decision.cpp` escapes special tokens in kev text and lfm2-d1-omni input
+  with upstream's new `server_decision_escape_special_tokens` (#30243) instead
+  of `std::regex`, whose libstdc++ implementation recurses per character and
+  overflows the stack on a long input. Same output. "Ported at" is now
+  `a0e6dc738`.
+- Upstream, from the 62 commits: pooled embedding contexts skip the LM head
+  and its logits buffer (#30445, #30255), chat templates render
+  `bos_token`/`eos_token` from the model and return prompt parts (#30389),
+  `tojson` writes floats as Python does (#30362), opt-in NFC normalization for
+  Unigram tokenizers (#30390, #30540), `--spec-draft-n-ubatch` (#30459),
+  layers split evenly when no device reports free memory (#29677), the
+  no-cache attention's KQ bias padded (#30446) and its reallocations avoided
+  (#30439), YaRN beta metadata for laguna (#30331), Qwen3.8 Flash Next MTP
+  image embeddings (#30397), KleidiAI v1.31.0 with SME2 Q4_K/Q6_K matmul
+  (#29219), the CPU FP16 lookup table kept on x86 with F16C (#30343),
+  `set_rows` conversion buffer sized for all threads (#30454), batched
+  `conv_1d` layout fix (#28738), CUDA GDN chunked kernel (#29353) and
+  `GGML_CUDA_GRAPH_DEBUG` (#30327), RPC transfer logging (#30481), and
+  Vulkan, OpenCL, SYCL, WebGPU, Hexagon and zDNN work.
+
+Upstream defects (`docs/release-guide.md`): #1, #2 and #3 are unchanged by
+source diff — the `ggml-cpu/CMakeLists.txt` diff is the KleidiAI version
+only, the `ggml-rpc` diff is logging, and `ggml_backend_cuda_comm_init` is
+untouched. #2's tp=2 re-measurement on Spark is still owed.
+
+Verified on macOS, M1 Max, at `a0e6dc738`. **Metal**
+(`GGML_METAL_NO_RESIDENCY=1`): default **430 passed, 175 excluded** with no
+model; **576 passed, 29 excluded** for `--include smoke --include embeddings
+--include slow --include mtp` (Qwen3.5-0.8B-UD-Q4_K_XL,
+Qwen3-Embedding-0.6B-f16, Qwen3.6-35B-A3B-MTP-UD-Q4_K_XL); `--include
+embeddings` on embeddinggemma-2-Q8_0 **441 passed**; `--include decision` on
+tinylaya + tinyopenjev **442 passed**; `--include decision_clef` on
+Cloudflare_clef-flash-Q8_0 **3 of 3**; `--include mtp_sidecar` on the Qwen 3.8
+27B pair **436 passed, 6 skipped**. `:mtp_cancel` fails as recorded (2 of 4
+runs abort). `scripts/decision_compare.exs` against upstream `llama-server`
+built from the same commit with Metal: tinylaya, tinyopenjev, d1-omni-600M,
+d1-3B, Decision-2.0-Kai-0.6B, vllm-d3-edge and Clef Flash (all Q8_0) **ALL
+MATCH**. Before the fix, `sampler_sample/2` on a `pooling_type: :mean`
+context aborted the VM (exit 134); after it, it raises `:invalid_index`.
+Format and dialyzer (0 errors) clean; the Hex source build clones
+`a0e6dc738` and compiles. `rpc_live` and the CPU suites were not run.
+
 ## v0.8.58
 
 llama.cpp bumped to `cbe28bb3c`
