@@ -64,6 +64,13 @@ public:
     // side effect, so it must never be called on a live context.
     bool kv_unified = false;
 
+    // embeddings: true with a pooling type other than NONE. Since cb55ffe6e
+    // such a context skips the LM head and keeps no logits buffer, so every
+    // llama_sampler_sample on it aborts (GGML_ASSERT(logits != nullptr)). Set
+    // at creation; only llama_set_embeddings changes it afterwards, and its one
+    // caller, the decision engine, leaves either embeddings off or pooling NONE.
+    bool pooled_embeddings = false;
+
     // Shape of the last *successful* llama_decode on this context.
     //
     // `sampler_sample_at/3` takes its index straight from Elixir, and
@@ -104,8 +111,12 @@ public:
         logits_last.clear();
     }
 
-    // Mirrors output_resolve_row's accept set. -1 means "last output row".
+    // Mirrors output_resolve_row's accept set, plus get_logits_ith's "no
+    // logits" for a pooled-embeddings context. -1 means "last output row".
     bool valid_logits_idx(int64_t idx) const {
+        if (pooled_embeddings) {
+            return false;
+        }
         if (idx < 0) {
             return idx == -1 && n_outputs_last > 0;
         }

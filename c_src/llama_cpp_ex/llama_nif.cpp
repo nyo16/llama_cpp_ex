@@ -160,6 +160,13 @@ static void check_logits_idx(ErlNifEnv* env, const LlamaContext& c, int64_t idx)
     }
 }
 
+// The NIFs that decode and then sample in one call reject a pooled-embeddings
+// context up front (see LlamaContext::pooled_embeddings): its first sample
+// would abort the VM.
+static const std::string kNoLogitsMessage =
+    "context has no logits: it extracts pooled embeddings "
+    "(embeddings: true with a pooling_type other than :none)";
+
 // Bounds for untrusted grammar and JSON-schema text. Both of llama.cpp's
 // parsers are recursive descent over the input text, so the text's nesting
 // depth bounds the C stack depth — unbounded nesting is a stack overflow
@@ -945,6 +952,7 @@ context_create(
         res = fine::make_resource<LlamaContext>(ctx, model);
     }
     res->kv_unified = kv_unified;
+    res->pooled_embeddings = embeddings && llama_pooling_type(ctx) != LLAMA_POOLING_TYPE_NONE;
     return fine::Ok(std::move(res));
 }
 FINE_NIF(context_create, ERL_NIF_DIRTY_JOB_CPU_BOUND);
@@ -1514,6 +1522,9 @@ decode_batch(
     if (n == 0) {
         return fine::Error(std::string("empty entries list"));
     }
+    if (ctx->pooled_embeddings) {
+        return fine::Error(kNoLogitsMessage);
+    }
 
     const auto* vocab = ctx->model->vocab();
 
@@ -1788,6 +1799,9 @@ batch_eval_sample(
     if (entries.empty()) {
         return fine::Error(std::string("empty entries list"));
     }
+    if (ctx->pooled_embeddings) {
+        return fine::Error(kNoLogitsMessage);
+    }
 
     const auto* vocab = ctx->model->vocab();
 
@@ -2008,8 +2022,11 @@ std::string chat_apply_template_jinja(
         inputs.chat_template_kwargs[std::get<0>(kv)] = std::get<1>(kv);
     }
 
+    // The prompt comes back as template/user-input parts; the NIF returns the
+    // joined text, as upstream's own string consumers do (.str()).
     auto result = common_chat_templates_apply(model->chat_templates.get(), inputs);
-    return result.prompt;
+    auto& parts = result.prompt.parts;
+    return parts.size() == 1 ? std::move(parts[0].text) : result.prompt.str();
 }
 // Dirty: minja template rendering allocates and walks a full AST per call —
 // multi-ms for large templates/histories.
@@ -2026,6 +2043,9 @@ speculative_init(
 {
     if (n_draft <= 0) {
         return fine::Error(std::string("n_draft must be > 0"));
+    }
+    if (ctx_tgt->pooled_embeddings || ctx_dft->pooled_embeddings) {
+        return fine::Error(kNoLogitsMessage);
     }
 
     // Probe partial-rollback support on the target context BEFORE
@@ -2665,6 +2685,16 @@ fine::Ok<> generate_tokens(
         enif_send(env, &caller_pid, msg_env, msg);
         return fine::Ok();
     }
+    if (ctx_res->pooled_embeddings) {
+        MsgEnvGuard msg_env;
+        ERL_NIF_TERM ref_copy = enif_make_copy(msg_env, ref);
+        ERL_NIF_TERM msg = enif_make_tuple2(msg_env, ref_copy,
+            enif_make_tuple2(msg_env,
+                enif_make_atom(msg_env, "error"),
+                make_binary_term(msg_env, kNoLogitsMessage.data(), kNoLogitsMessage.size())));
+        enif_send(env, &caller_pid, msg_env, msg);
+        return fine::Ok();
+    }
 
     // Process prompt in chunks
     int n_batch = llama_n_batch(ctx);
@@ -2801,6 +2831,9 @@ generate(
     if (prompt_tokens.empty()) {
         return fine::Error(std::string("prompt cannot be empty"));
     }
+    if (ctx_res->pooled_embeddings) {
+        return fine::Error(kNoLogitsMessage);
+    }
 
     // Process prompt in chunks of n_batch
     int n_batch = llama_n_batch(ctx);
@@ -2935,6 +2968,10 @@ decision_decide(ErlNifEnv* env, fine::ResourcePtr<LlamaDecision> dec, std::strin
     try {
         std::string response = dec->engine.decide(request);
         dec->ctx->forget_batch();
+        // decide() set embeddings to the type's need, and the engine refuses a
+        // pooled context for the types that read embeddings, so the context
+        // now has logits whatever it was created with.
+        dec->ctx->pooled_embeddings = false;
         return fine::Ok(std::move(response));
     } catch (const std::exception& e) {
         dec->ctx->forget_batch();
