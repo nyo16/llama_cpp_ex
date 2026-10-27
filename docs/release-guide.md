@@ -131,6 +131,10 @@ the NIF runs the same model fine. On Metal all three agree to 1.5e-6 or
 exactly. Keep question *order* identical on both sides: clef decides jointly,
 so `[route, angry]` and `[angry, route]` are different prompts — build the
 server's JSON from the same keyword list, not from a map (which sorts).
+Serve with `-np 1`: the server's default of four slots sizes its KV cache and
+batches the questions of a request across slots differently from the NIF's one
+context, and at `7aca0d2ea` that alone put Julia-1 (laya) 3.3e-3 and Granite
+Switch 1.4e-3 off, both exact on single-question requests with `-np 1`.
 
 ### Upstream defects we work around
 
@@ -238,6 +242,17 @@ probe is untouched. The `ggml-rpc` diff is #30481 (transfer logging) only:
 (`GGML_CUDA_GRAPH_DEBUG`, env vars read once) and #30441 (warnings), none of
 it near `ggml_backend_cuda_comm_init`.
 
+Re-checked at `7aca0d2ea` (b11913), covering the 274 commits from
+`a0e6dc738`: #1, #2 and #3 are as above. The `ggml-cpu/CMakeLists.txt` diff
+moves KleidiAI to v1.32.0; the `-mcpu=native` probe is untouched. The
+`ggml-rpc` diff is a bounds check in `rdma_recv` (#30399) and
+`RPC_PROTO_PATCH_VERSION` 0 → 1 for the new `GGML_OP_TOP_K_MASK` (#30640);
+`ggml_backend_rpc_start_server` keeps its `void` signature. The op is inserted
+before `GGML_OP_UNARY`, so every later op renumbers, while the handshake only
+compares major and minor: a worker from v0.8.59 accepts a client from this
+build and misreads its graphs. The `ggml-cuda.cu` diff is graph chunking
+(#30804), fusions and pool work, none of it near `ggml_backend_cuda_comm_init`.
+
 | # | Upstream defect | Our workaround | Still needed? |
 |---|---|---|---|
 | 1 | `GGML_NATIVE=ON` makes ggml's `-mcpu=native` probe resolve to **base ARMv8-A** on Cortex-X925/A725 with GCC 13.3 — silently, with a soft CMake warning and exit 0. Costs every `sdot`/`smmla`/SVE kernel. | `LLAMA_CPU_ARM_ARCH` + `LLAMA_CUDA_ARCH` in the `Makefile`, which must be set together. See [DGX Spark](dgx-spark.md) and [Cross-Platform Builds](cross-platform-builds.md). | `scripts/spark/verify-build-flags.sh` on an aarch64 host. If a default build (no `LLAMA_CPU_ARM_ARCH`) now reports non-zero `sdot`/`smmla`, upstream fixed the probe. |
@@ -297,7 +312,10 @@ LLAMA_SMOKE_DECISION_CLEF_MODEL=~/Downloads/Cloudflare_clef-flash-Q8_0.gguf \
 # Decision-2.0-*-GGUF files predate upstream support (arch qwen3, type
 # "decision2") and load on neither side; convert vllm-sr/Decision-2.0-Kai-0.6B
 # with the submodule's convert_hf_to_gguf.py (it needs transformers >= 5 for
-# that tokenizer_config.json).
+# that tokenizer_config.json). granite-switch and h2o-lightning have no tag
+# either: ibm-granite/granite-switch-4.1-8b-GGUF (converted at b11798, after
+# upstream added the type) and h2oai/h2o-lightning-4b-gguf (the files without
+# "stock-" in the name; the stock- ones carry no decision metadata).
 
 GGML_METAL_NO_RESIDENCY=1 \
 LLAMA_SMOKE_MTP_MODEL=~/Downloads/Qwen3.8-27B-Q4_K_M.gguf \

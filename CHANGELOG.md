@@ -1,5 +1,90 @@
 # Changelog
 
+## v0.8.60
+
+llama.cpp bumped to `7aca0d2ea`
+([`b11913`](https://github.com/ggml-org/llama.cpp/releases/tag/b11913)),
+274 commits from `a0e6dc738` (b11630+9). No change was needed in
+`llama_nif.cpp`: header changes are additive. `src/llama-ext.h` gains
+architecture queries (`llama_arch_*`, and now includes `llama-arch.h`),
+`llama_model_decision_label`, `llama_model_get_tok_embd_rows` and
+`llama_model_n_tokens_delay`; `common/chat.h` gains
+`common_chat_msg::extra_json`; `common/common.h` gains two decision types and
+`COMMON_RECURSIVE_LIMIT`; `include/llama.h` gains
+`LLAMA_DRY_MAX_SEQ_BREAKERS` (64; the NIF does not build a DRY sampler).
+`llama_model_default_params` / `llama_context_default_params` are unchanged.
+Upstream versions: llama.cpp 0.7.0, ggml 0.27.0.
+
+### Added
+
+- **`granite-switch` and `h2o-lightning` decision types** (#30676, #30693,
+  #30361), ported into `decision.cpp`; `Decision.model_type/1` returns
+  `:granite_switch` / `:h2o_lightning` and `Decision.new/2` accepts them.
+  Granite Switch reads `lev`-style label codes (up to 255, `true` first in a
+  `noul`) and stays a chat model. H2O-Lightning reads the labels listed in its
+  GGUF, re-renders the state, instructions and descriptions as Python's
+  `json.dumps` would (floats keep `.0`, `ensure_ascii` for the instructions),
+  quotes special-token text, strips the end of the turn like `str.strip`, cuts
+  a state over 32000 tokens to its first and last 16000, defaults a missing
+  `:type` to `:choice` and `:instructions` to `""`, takes 1 to 255 score
+  levels and reads `"yes"`/`"no"` noul descriptions. Both share the state
+  prefix across questions.
+
+### Changed
+
+- `decision.cpp` ports upstream's 128-level depth guards on its recursive
+  JSON walks (#30242). Unreachable through `decision_decide/2`, which refuses
+  a request nested deeper than 64 before parsing it. "Ported at" is now
+  `7aca0d2ea`.
+- `scripts/decision_compare.exs` adds requests for the h2o-lightning defaults
+  and Python rendering, and its serve command adds `-np 1`: with the server's
+  default four slots, Julia-1 (laya) and Granite Switch differ by up to
+  3.3e-3 from batching alone, and are exact on single-question requests with
+  one slot.
+- **RPC: workers and clients must come from the same build.** A new op,
+  `GGML_OP_TOP_K_MASK` (#30640), is inserted before `GGML_OP_UNARY`, so every
+  later op renumbers, while `RPC_PROTO_PATCH_VERSION` only goes 0 → 1 and the
+  handshake compares major and minor: a v0.8.59 worker accepts a v0.8.60
+  client and misreads its graphs.
+- Upstream, from the 274 commits: DeepSeek V4.1 Flash (#31086), Flint,
+  Beam, Kolibri-1, SenseNova U1, Nemotron-3(.5)-Embed and Mellum 2.1 MTP
+  models; grammar sampling rejects candidates without recursion and grammar
+  and chat JSON get depth limits (#31153, #29755, #30242); DRY sequence
+  breakers deduplicated and capped at 64 (#31035); `llama_set_embeddings`
+  re-reserves the graph on every toggle, pooled or not (in #31086);
+  embedding-only graphs without logits stay non-empty (#30522); faster
+  vocabulary loading (#30679); MoE down projection scaled per expert token
+  (#30861); tokenizer fixes for Tekken/GPT-4o regexes (#30845), pixtral
+  (#30960) and Nemotron-3.5-Embed (#30974); jinja `unique`, hex escapes and
+  `select`/`selectattr` fixes; KleidiAI v1.32.0 with SVE Q8_0 kernels
+  (#30808); CPU concat rewrite (#31179) and vectorized SiLU/exp (#30791);
+  Metal argmax/pool_1d (#30862), MoE fusion race (#30795) and large-offset
+  overflow (#30072) fixes; CUDA graph chunking (#30804), FFN gate/up + GLU
+  fusion in MMQ (#29948) and faster low-bit MMVQ (#30517); RDMA bounds check
+  (#30399); and Vulkan, SYCL, HIP, CANN, WebGPU and Hexagon work.
+
+Upstream defects (`docs/release-guide.md`): #1, #2 and #3 are unchanged by
+source diff — the `ggml-cpu/CMakeLists.txt` diff is the KleidiAI version only,
+the `ggml-rpc` diff is the RDMA bounds check and the patch version, and
+`ggml_backend_cuda_comm_init` is untouched. #2's tp=2 re-measurement on Spark
+is still owed.
+
+Verified on macOS, M4 Max, at `7aca0d2ea`. **Metal**
+(`GGML_METAL_NO_RESIDENCY=1`): default **430 passed, 175 excluded** with no
+model; **576 passed, 29 excluded** for `--include smoke --include embeddings
+--include slow --include mtp` (Qwen3.5-0.8B-Q4_K_M,
+Qwen3-Embedding-0.6B-f16, Qwen3.5-0.8B-MTP-Q8_0); `--include decision` on
+tinylaya + tinyopenjev **442 passed**; `--include decision_clef` on
+Clef-Flash-Q4_K_M **3 of 3**. `scripts/decision_compare.exs` against
+upstream `llama-server` built from the same commit with Metal (`-np 1`):
+tinylaya, tinyopenjev, Laya, Julia-1 (Q8_0), Clef Flash,
+h2o-lightning-4b and granite-switch-4.1-8b (Q4_K_M) **ALL MATCH**, identical
+token counts, every probability exact except granite-switch (7.0e-4 on the
+three-question request). Granite Switch also chats from the same loaded
+model. Format and dialyzer (0 errors) clean; the Hex source build clones
+`7aca0d2ea` and compiles. Not run this time: `mtp_sidecar`, `mtp_cancel`,
+`rpc_live`, embeddinggemma-2, the d1/vllm decision models, and the CPU suites.
+
 ## v0.8.59
 
 llama.cpp bumped to `a0e6dc738`

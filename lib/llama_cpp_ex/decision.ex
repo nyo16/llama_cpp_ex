@@ -14,14 +14,22 @@ defmodule LlamaCppEx.Decision do
   The model file says what kind of decision model it is
   (`"<arch>.decision.type"`); `model_type/1` reads it. Supported types:
 
-    * `:openjev`, `:lev`, `:nimble`, `:pplx_decider`, `:vllm_d3`, `:lfm2_d1` -
-      read the logits of one label token per option (`:nimble` lists every
-      question of the request in each prompt, `:lev` asks each choice twice
-      with the options reversed, `:pplx_decider` and `:vllm_d3` use one- or
-      two-letter label codes like `:lev`, `:lfm2_d1` picks label codes per
-      question and accepts a `nil` state). `:vllm_d3` is non-causal, so each
-      prompt is evaluated in one batch; it accepts a `nil` state and a
-      question without `:instructions` (its prompt has a default question).
+    * `:openjev`, `:lev`, `:nimble`, `:pplx_decider`, `:vllm_d3`, `:lfm2_d1`,
+      `:granite_switch`, `:h2o_lightning` - read the logits of one label token
+      per option (`:nimble` lists every question of the request in each
+      prompt, `:lev` asks each choice twice with the options reversed,
+      `:pplx_decider`, `:vllm_d3` and `:granite_switch` use one- or two-letter
+      label codes like `:lev`, `:lfm2_d1` picks label codes per question and
+      accepts a `nil` state). `:vllm_d3` is non-causal, so each prompt is
+      evaluated in one batch; it accepts a `nil` state and a question without
+      `:instructions` (its prompt has a default question). `:granite_switch`
+      is IBM's Granite Switch, whose decision adapter is built into the model;
+      the same model also generates text through the rest of the API.
+      `:h2o_lightning` reads the labels its model file lists, after an answer
+      prefill: `:instructions` and `:type` may be left out (`:choice` by
+      default), a `:score` takes 1 to 255 levels, `:noul` descriptions are also
+      read under `"yes"` and `"no"`, and a state longer than 32000 tokens keeps
+      its first and last 16000.
     * `:kev` - scores each option by a dot product of hidden states.
     * `:laya` - a ModernBERT encoder; one score per `[MASK]` marker.
     * `:lfm2_d1_omni` - like `:laya` with another prompt layout: a non-causal
@@ -50,8 +58,9 @@ defmodule LlamaCppEx.Decision do
       * `:choice` - the options, mapping each option key to its description
         (`nil` for none). The number of options is capped by the model: 52
         for openjev, 255 for laya, clef, pplx-decider, vllm-decision2, vllm-d3,
-        lfm2-d1 and lfm2-d1-omni.
-      * `:score` - a list of 2 to 10 level descriptions, lowest first.
+        lfm2-d1, lfm2-d1-omni, granite-switch and h2o-lightning.
+      * `:score` - a list of 2 to 10 level descriptions, lowest first (1 to
+        255 for h2o-lightning).
       * `:noul` - optional; `%{"true" => ..., "false" => ...}` descriptions.
 
   The questions of a request are answered independently, except with clef,
@@ -142,6 +151,8 @@ defmodule LlamaCppEx.Decision do
           | :lfm2_d1_omni
           | :vllm_decision2
           | :vllm_d3
+          | :granite_switch
+          | :h2o_lightning
 
   @type t :: %__MODULE__{
           ref: reference(),
@@ -188,13 +199,25 @@ defmodule LlamaCppEx.Decision do
     "lfm2-d1" => :lfm2_d1,
     "lfm2-d1-omni" => :lfm2_d1_omni,
     "vllm-decision2" => :vllm_decision2,
-    "vllm-d3" => :vllm_d3
+    "vllm-d3" => :vllm_d3,
+    "granite-switch" => :granite_switch,
+    "h2o-lightning" => :h2o_lightning
   }
 
   # Mirror upstream's common_init_result and can_share_prompt; decision.cpp
   # checks the first of these against the context it is handed.
   @reads_embeddings [:laya, :kev, :clef, :lfm2_d1_omni, :vllm_decision2]
-  @shares_prompt [:openjev, :lev, :kev, :nimble, :pplx_decider, :vllm_decision2, :lfm2_d1]
+  @shares_prompt [
+    :openjev,
+    :granite_switch,
+    :lev,
+    :kev,
+    :nimble,
+    :pplx_decider,
+    :vllm_decision2,
+    :lfm2_d1,
+    :h2o_lightning
+  ]
   # Non-causal models that read logits: the whole prompt goes in one
   # micro-batch (upstream's server_slot::can_split), as for the embedding
   # readers above.
@@ -226,8 +249,9 @@ defmodule LlamaCppEx.Decision do
   The context is shaped for the model's decision type: laya, kev, clef,
   lfm2-d1-omni and vllm-decision2 read the embeddings output, so their context
   has embeddings on and no pooling; the types that share a prompt prefix
-  across questions (openjev, lev, kev, nimble, pplx-decider, vllm-decision2,
-  lfm2-d1) get a second sequence to evaluate that prefix once per request.
+  across questions (openjev, granite-switch, lev, kev, nimble, pplx-decider,
+  vllm-decision2, lfm2-d1, h2o-lightning) get a second sequence to evaluate
+  that prefix once per request.
 
   ## Options
 

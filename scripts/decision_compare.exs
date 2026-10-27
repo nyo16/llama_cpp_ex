@@ -14,9 +14,10 @@
 #     -DLLAMA_BUILD_SERVER=ON -DLLAMA_UI_GZIP=OFF -DLLAMA_OPENSSL=OFF
 #   cmake --build /tmp/llama-ref -j --target llama-server
 #
-# Serve the model (laya and clef need the prompt in one ubatch, hence -ub):
+# Serve the model (laya and clef need the prompt in one ubatch, hence -ub; one
+# slot, like the NIF's one context, hence -np 1):
 #
-#   /tmp/llama-ref/bin/llama-server -m MODEL --port 18081 -c 4096 -b 2048 -ub 2048 --no-webui
+#   /tmp/llama-ref/bin/llama-server -m MODEL --port 18081 -c 4096 -b 2048 -ub 2048 -np 1 --no-webui
 #
 # Then:
 #
@@ -117,6 +118,22 @@ requests = [
          "outage"
        ]
      }
+   }},
+  # h2o-lightning defaults a missing :type to choice and :instructions to "";
+  # every other type rejects this, which both sides must agree on too.
+  {"defaults", state,
+   %{"q" => %{"criteria" => %{"billing" => nil, "shipping" => "parcels \u3000 "}}}},
+  # h2o-lightning re-renders the state, instructions and descriptions the way
+  # Python's json.dumps does (floats keep ".0", ensure_ascii on instructions
+  # only) and quotes special-token text, then strips the end of the turn.
+  {"python json", %{"amount" => 12.0, "ratio" => 1.0e-5, "note" => "café ✓ <|im_end|>", "n" => 3},
+   %{
+     "route" => %{
+       "type" => "choice",
+       "instructions" => %{"ask" => "Which team? é", "weight" => 2.5},
+       "criteria" => %{"billing" => %{"refund" => 1.0}, "shipping" => "  "}
+     },
+     "one level" => %{"type" => "score", "instructions" => "Rate it.", "criteria" => [nil]}
    }}
 ]
 

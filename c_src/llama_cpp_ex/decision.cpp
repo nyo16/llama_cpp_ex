@@ -2,7 +2,7 @@
 // of tools/server/server-context.cpp (send_decision, the batch layout rules and
 // the /v1/systemone handler). See decision.h for scope.
 //
-// Ported at a0e6dc738. Functions that are upstream's carry its name in a
+// Ported at 7aca0d2ea. Functions that are upstream's carry its name in a
 // trailing comment so a bump can diff them one by one; everything below the
 // "evaluation" banner replaces server slots and is ours.
 
@@ -19,6 +19,8 @@
 #include <algorithm>
 #include <cctype>
 #include <cmath>
+#include <cstdio>
+#include <cstdlib>
 #include <map>
 #include <stdexcept>
 #include <vector>
@@ -93,6 +95,18 @@ const char * question_type_name(question_type type) { // decision_question_type_
 // lev reads noul from a rating scale: 0 = certainly no, 8 = certainly yes
 const size_t DECISION_LEV_N_RATINGS = 9;
 
+// h2o-lightning follows serve_config.json and h2o_lightning_shim.py of the model repo
+// a longer state keeps its head and its tail
+const size_t DECISION_H2O_MAX_STATE_TOKENS = 32000;
+
+// the recursive functions of this file walk request JSON, a deeper value would overflow the stack
+// (unreachable through the NIF, which refuses a request nested deeper than 64 levels before parsing it)
+const int RECURSIVE_LIMIT = 128;
+
+std::invalid_argument too_deep() {
+    return std::invalid_argument("JSON is nested more than " + std::to_string(RECURSIVE_LIMIT) + " levels deep");
+}
+
 std::string meta_str(const llama_model * model, const std::string & key) { // decision_meta_str
     char buf[256];
     const int32_t n = llama_model_meta_val_str(model, key.c_str(), buf, sizeof(buf));
@@ -109,7 +123,10 @@ std::string json_string(const json & body, const std::string & key) {
 }
 
 // replace text in all strings of a JSON value
-json replace_text(const json & val, const std::string & search, const std::string & replace) { // decision_replace_text
+json replace_text(const json & val, const std::string & search, const std::string & replace, int depth = 0) { // decision_replace_text
+    if (depth >= RECURSIVE_LIMIT) {
+        throw too_deep();
+    }
     if (val.is_string()) {
         std::string str = val.get<std::string>();
         string_replace_all(str, search, replace);
@@ -118,14 +135,14 @@ json replace_text(const json & val, const std::string & search, const std::strin
     if (val.is_array()) {
         json out = json::array();
         for (const auto & item : val) {
-            out.push_back(replace_text(item, search, replace));
+            out.push_back(replace_text(item, search, replace, depth + 1));
         }
         return out;
     }
     if (val.is_object()) {
         json out = json::object();
         for (const auto & [key, item] : val.items()) {
-            out[key] = replace_text(item, search, replace);
+            out[key] = replace_text(item, search, replace, depth + 1);
         }
         return out;
     }
@@ -133,18 +150,21 @@ json replace_text(const json & val, const std::string & search, const std::strin
 }
 
 // sort the keys of all objects of a JSON value
-json sort_keys(const json & val) { // decision_sort_keys
+json sort_keys(const json & val, int depth = 0) { // decision_sort_keys
+    if (depth >= RECURSIVE_LIMIT) {
+        throw too_deep();
+    }
     if (val.is_array()) {
         json out = json::array();
         for (const auto & item : val) {
-            out.push_back(sort_keys(item));
+            out.push_back(sort_keys(item, depth + 1));
         }
         return out;
     }
     if (val.is_object()) {
         std::map<std::string, json> sorted;
         for (const auto & [key, item] : val.items()) {
-            sorted[key] = sort_keys(item);
+            sorted[key] = sort_keys(item, depth + 1);
         }
         json out = json::object();
         for (const auto & [key, item] : sorted) {
@@ -156,7 +176,10 @@ json sort_keys(const json & val) { // decision_sort_keys
 }
 
 // kev flattens a JSON value into text, the keys of an object are kept as labels (kev/api.py: render)
-std::string kev_render(const json & val, int indent = 0) { // decision_kev_render
+std::string kev_render(const json & val, int indent = 0, int depth = 0) { // decision_kev_render
+    if (depth >= RECURSIVE_LIMIT) {
+        throw too_deep();
+    }
     const std::string pad(2 * indent, ' ');
     if (val.is_null()) {
         return "";
@@ -170,7 +193,7 @@ std::string kev_render(const json & val, int indent = 0) { // decision_kev_rende
     if (val.is_array()) {
         std::string out;
         for (const auto & item : val) {
-            const std::string text = kev_render(item, indent + 1);
+            const std::string text = kev_render(item, indent + 1, depth + 1);
             out += (out.empty() ? "" : "\n") + pad + "- " + text.substr(std::min(text.size(), text.find_first_not_of(" \t\n\r")));
         }
         return out;
@@ -179,7 +202,7 @@ std::string kev_render(const json & val, int indent = 0) { // decision_kev_rende
         std::string out;
         for (const auto & [key, item] : val.items()) {
             const bool is_nested = item.is_object() || item.is_array();
-            out += (out.empty() ? "" : "\n") + pad + key + (is_nested ? ":\n" : ": ") + kev_render(item, is_nested ? indent + 1 : 0);
+            out += (out.empty() ? "" : "\n") + pad + key + (is_nested ? ":\n" : ": ") + kev_render(item, is_nested ? indent + 1 : 0, depth + 1);
         }
         return out;
     }
@@ -220,25 +243,203 @@ std::string kev_text(const json & val) { // decision_kev_text
 }
 
 // lfm2-d1-omni: special tokens written in the input must not be parsed as such, in keys too (d1-omni prompt.py: escape)
-json d1omni_escape(const json & val) { // decision_d1omni_escape
+json d1omni_escape(const json & val, int depth = 0) { // decision_d1omni_escape
+    if (depth >= RECURSIVE_LIMIT) {
+        throw too_deep();
+    }
     if (val.is_string()) {
         return escape_special_tokens(val.get<std::string>());
     }
     if (val.is_array()) {
         json out = json::array();
         for (const auto & item : val) {
-            out.push_back(d1omni_escape(item));
+            out.push_back(d1omni_escape(item, depth + 1));
         }
         return out;
     }
     if (val.is_object()) {
         json out = json::object();
         for (const auto & [key, item] : val.items()) {
-            out[escape_special_tokens(key)] = d1omni_escape(item);
+            out[escape_special_tokens(key)] = d1omni_escape(item, depth + 1);
         }
         return out;
     }
     return val;
+}
+
+//
+// h2o-lightning: the texts are rendered the way the reference shim renders them with Python (json.dumps, str.lstrip)
+//
+
+// one code point of UTF-8 text at s[i], i moves past it; an invalid byte is read as is
+uint32_t utf8_next(const std::string & s, size_t & i) { // decision_utf8_next
+    const unsigned char c = s[i];
+    size_t n = c < 0x80 ? 1 : (c >> 5) == 0x6 ? 2 : (c >> 4) == 0xe ? 3 : (c >> 3) == 0x1e ? 4 : 1;
+    if (i + n > s.size()) {
+        n = 1;
+    }
+    uint32_t cp = n == 1 ? c : n == 2 ? (c & 0x1f) : n == 3 ? (c & 0x0f) : (c & 0x07);
+    for (size_t k = 1; k < n; k++) {
+        cp = (cp << 6) | (s[i + k] & 0x3f);
+    }
+    i += n;
+    return cp;
+}
+
+// str.isspace() of Python
+bool py_isspace(uint32_t cp) { // decision_py_isspace
+    return (cp >= 0x09 && cp <= 0x0d) || (cp >= 0x1c && cp <= 0x20) || cp == 0x85 || cp == 0xa0 || cp == 0x1680 ||
+           (cp >= 0x2000 && cp <= 0x200a) || cp == 0x2028 || cp == 0x2029 || cp == 0x202f || cp == 0x205f || cp == 0x3000;
+}
+
+std::string py_rstrip(const std::string & s) { // decision_py_rstrip
+    size_t end = 0;
+    for (size_t i = 0; i < s.size();) {
+        if (!py_isspace(utf8_next(s, i))) {
+            end = i;
+        }
+    }
+    return s.substr(0, end);
+}
+
+std::string py_lstrip(const std::string & s) { // decision_py_lstrip
+    size_t i = 0;
+    while (i < s.size()) {
+        size_t next = i;
+        if (!py_isspace(utf8_next(s, next))) {
+            break;
+        }
+        i = next;
+    }
+    return s.substr(i);
+}
+
+// a code point as JSON escapes, a surrogate pair above the BMP
+std::string py_escape_cp(uint32_t cp) { // decision_py_escape_cp
+    if (cp < 0x10000) {
+        return string_format("\\u%04x", cp);
+    }
+    cp -= 0x10000;
+    return string_format("\\u%04x\\u%04x", 0xd800 + (cp >> 10), 0xdc00 + (cp & 0x3ff));
+}
+
+// repr() of a Python float: the shortest digits that read back the same, in exponent form below 1e-4 and from 1e16
+std::string py_float(double v) { // decision_py_float
+    char buf[64];
+    // the fewest digits that read back the same
+    for (int prec = 0; prec < 17; prec++) {
+        snprintf(buf, sizeof(buf), "%.*e", prec, v);
+        if (std::strtod(buf, nullptr) == v) {
+            break;
+        }
+    }
+    const std::string sci(buf); // for example "-1.25e+03"
+    const size_t pos_e = sci.find('e');
+    const int    exp   = std::atoi(sci.c_str() + pos_e + 1);
+    std::string sign;
+    std::string digits;
+    for (size_t i = 0; i < pos_e; i++) {
+        if (sci[i] == '-') {
+            sign = "-";
+        } else if (sci[i] != '.') {
+            digits += sci[i];
+        }
+    }
+    const int n = (int) digits.size();
+    if (exp < -4 || exp >= 16) {
+        return sign + digits.substr(0, 1) + (n > 1 ? "." + digits.substr(1) : "") + string_format("e%c%02d", exp < 0 ? '-' : '+', std::abs(exp));
+    }
+    if (exp >= n - 1) {
+        return sign + digits + std::string(exp - (n - 1), '0') + ".0";
+    }
+    if (exp >= 0) {
+        return sign + digits.substr(0, exp + 1) + "." + digits.substr(exp + 1);
+    }
+    return sign + "0." + std::string(-exp - 1, '0') + digits;
+}
+
+void py_str(std::string & out, const std::string & s, bool ensure_ascii) { // decision_py_str
+    out += '"';
+    for (size_t i = 0; i < s.size();) {
+        const unsigned char c = s[i];
+        switch (c) {
+            case '"':  out += "\\\""; i++; continue;
+            case '\\': out += "\\\\"; i++; continue;
+            case '\b': out += "\\b";  i++; continue;
+            case '\f': out += "\\f";  i++; continue;
+            case '\n': out += "\\n";  i++; continue;
+            case '\r': out += "\\r";  i++; continue;
+            case '\t': out += "\\t";  i++; continue;
+            default:   break;
+        }
+        if (c < 0x20 || (ensure_ascii && c == 0x7f)) {
+            out += string_format("\\u%04x", c);
+            i++;
+        } else if (c < 0x80 || !ensure_ascii) {
+            out += (char) c;
+            i++;
+        } else {
+            out += py_escape_cp(utf8_next(s, i));
+        }
+    }
+    out += '"';
+}
+
+// json.dumps() of Python: indent < 0 is no indent, keys stay in their order
+void py_dump(std::string & out, const json & val, int indent, int level, const std::string & item_sep, const std::string & key_sep, bool ensure_ascii) { // decision_py_dump
+    if (level >= RECURSIVE_LIMIT) {
+        throw too_deep();
+    }
+    const auto newline = [&](int lvl) {
+        return indent < 0 ? std::string() : "\n" + std::string(indent * lvl, ' ');
+    };
+    if (val.is_null()) {
+        out += "null";
+    } else if (val.is_boolean()) {
+        out += val.get<bool>() ? "true" : "false";
+    } else if (val.is_number_float()) {
+        out += py_float(val.get<double>());
+    } else if (val.is_number()) {
+        out += val.dump();
+    } else if (val.is_string()) {
+        py_str(out, val.get<std::string>(), ensure_ascii);
+    } else if (val.is_array()) {
+        if (val.empty()) {
+            out += "[]";
+            return;
+        }
+        out += "[" + newline(level + 1);
+        for (size_t i = 0; i < val.size(); i++) {
+            if (i > 0) {
+                out += item_sep + newline(level + 1);
+            }
+            py_dump(out, val.at(i), indent, level + 1, item_sep, key_sep, ensure_ascii);
+        }
+        out += newline(level) + "]";
+    } else if (val.is_object()) {
+        if (val.empty()) {
+            out += "{}";
+            return;
+        }
+        out += "{" + newline(level + 1);
+        bool first = true;
+        for (const auto & [key, item] : val.items()) {
+            if (!first) {
+                out += item_sep + newline(level + 1);
+            }
+            first = false;
+            py_str(out, key, ensure_ascii);
+            out += key_sep;
+            py_dump(out, item, indent, level + 1, item_sep, key_sep, ensure_ascii);
+        }
+        out += newline(level) + "}";
+    }
+}
+
+std::string py_dumps(const json & val, int indent, const std::string & item_sep, const std::string & key_sep, bool ensure_ascii) { // decision_py_dumps
+    std::string out;
+    py_dump(out, val, indent, 0, item_sep, key_sep, ensure_ascii);
+    return out;
 }
 
 // confidence formulas are the ones published by TypeSafe
@@ -321,8 +522,8 @@ bool type_reads_embeddings(const std::string & type) {
 
 // Mirrors server_decision_context::can_share_prompt.
 bool type_shares_prompt(const std::string & type) {
-    return type == "openjev" || type == "lev" || type == "kev" || type == "nimble" || type == "pplx-decider" ||
-           type == "vllm-decision2" || type == "lfm2-d1";
+    return type == "openjev" || type == "granite-switch" || type == "lev" || type == "kev" || type == "nimble" ||
+           type == "pplx-decider" || type == "vllm-decision2" || type == "lfm2-d1" || type == "h2o-lightning";
 }
 
 struct Engine::Impl {
@@ -344,7 +545,7 @@ struct Engine::Impl {
     bool   strict_payload  = false; // state, instructions and descriptions must be text, an object or an array
     bool   canonical_legend = false; // non-string score descriptions are returned as canonical JSON text
 
-    // OPENJEV, LEV, NIMBLE, PPLX_DECIDER, VLLM_D3
+    // OPENJEV, LEV, NIMBLE, PPLX_DECIDER, VLLM_D3, H2O_LIGHTNING
     std::vector<llama_token> labels;
     std::vector<std::string> label_texts; // only if the label of an option is given to the template
 
@@ -355,6 +556,10 @@ struct Engine::Impl {
     size_t      max_head_tokens   = 0; // question + options
     size_t      max_option_tokens = 48;
 
+    // H2O_LIGHTNING
+    std::vector<std::string> quoted_spellings; // texts of the special tokens, quoted in the input, longest first
+    std::string              quoted_first;     // the first bytes of these texts
+
     common_batch batch;
 
     explicit Impl(llama_context * c) : ctx(c), model(llama_get_model(c)), batch(c) {
@@ -364,12 +569,14 @@ struct Engine::Impl {
     bool can_share_prompt() const {
         switch (type) {
             case COMMON_DECISION_TYPE_OPENJEV:
+            case COMMON_DECISION_TYPE_GRANITE_SWITCH:
             case COMMON_DECISION_TYPE_LEV:
             case COMMON_DECISION_TYPE_KEV:
             case COMMON_DECISION_TYPE_NIMBLE:
             case COMMON_DECISION_TYPE_PPLX_DECIDER:
             case COMMON_DECISION_TYPE_VLLM_DECISION2:
             case COMMON_DECISION_TYPE_LFM2_D1:
+            case COMMON_DECISION_TYPE_H2O_LIGHTNING:
                 return true;
             default:
                 return false;
@@ -453,7 +660,7 @@ struct Engine::Impl {
             }
             n_options_max   = labels.size();
             noul_true_first = true;
-        } else if (model_type == COMMON_DECISION_TYPE_LEV || model_type == COMMON_DECISION_TYPE_NIMBLE || model_type == COMMON_DECISION_TYPE_PPLX_DECIDER || model_type == COMMON_DECISION_TYPE_VLLM_D3) {
+        } else if (model_type == COMMON_DECISION_TYPE_LEV || model_type == COMMON_DECISION_TYPE_GRANITE_SWITCH || model_type == COMMON_DECISION_TYPE_NIMBLE || model_type == COMMON_DECISION_TYPE_PPLX_DECIDER || model_type == COMMON_DECISION_TYPE_VLLM_D3) {
             // label codes are A..Z then AA..ZZ, only the ones that are a single token are used
             std::vector<std::string> codes;
             for (char a = 'A'; a <= 'Z'; a++) {
@@ -474,6 +681,9 @@ struct Engine::Impl {
             n_options_max = labels.size();
             if (model_type == COMMON_DECISION_TYPE_VLLM_D3) {
                 canonical_legend = true;
+            }
+            if (model_type == COMMON_DECISION_TYPE_GRANITE_SWITCH) {
+                noul_true_first = true;
             }
         } else if (model_type == COMMON_DECISION_TYPE_KEV) {
             // the hidden state of an option is read at the token that ends it
@@ -515,6 +725,39 @@ struct Engine::Impl {
                 throw std::runtime_error("decision model has no mask token");
             }
             n_options_max = 255;
+        } else if (model_type == COMMON_DECISION_TYPE_H2O_LIGHTNING) {
+            // the answer is read at the token of a label, its text is given to the template
+            for (uint32_t i = 0; llama_model_decision_label(model, i) != nullptr; i++) {
+                const std::string text = llama_model_decision_label(model, i);
+                const auto toks = common_tokenize(vocab, text, false, false);
+                if (toks.size() != 1 || std::find(labels.begin(), labels.end(), toks[0]) != labels.end()) {
+                    throw std::runtime_error(string_format("decision label \"%s\" is not a single distinct token", text.c_str()));
+                }
+                labels.push_back(toks[0]);
+                label_texts.push_back(text);
+            }
+            if (labels.empty()) {
+                throw std::runtime_error("decision model has no labels");
+            }
+            // the texts of the control and user-defined tokens are quoted in the input, so that they stay text
+            for (llama_token id = 0; id < llama_vocab_n_tokens(vocab); id++) {
+                if (llama_vocab_get_attr(vocab, id) & (LLAMA_TOKEN_ATTR_CONTROL | LLAMA_TOKEN_ATTR_USER_DEFINED)) {
+                    const std::string text = llama_vocab_get_text(vocab, id);
+                    if (!text.empty()) {
+                        quoted_spellings.push_back(text);
+                    }
+                }
+            }
+            std::stable_sort(quoted_spellings.begin(), quoted_spellings.end(), [](const std::string & a, const std::string & b) {
+                return a.size() > b.size();
+            });
+            for (const auto & spelling : quoted_spellings) {
+                if (quoted_first.find(spelling[0]) == std::string::npos) {
+                    quoted_first += spelling[0];
+                }
+            }
+            n_options_max   = labels.size();
+            noul_true_first = true;
         } else {
             throw std::runtime_error("unsupported decision model type: " + type_name);
         }
@@ -552,8 +795,10 @@ struct Engine::Impl {
                 throw err("must be an object");
             }
             // the vllm-d3 prompt has a default question
-            const json instructions = q.contains("instructions") ? q.at("instructions") : json();
-            if (instructions.is_null() && type != COMMON_DECISION_TYPE_VLLM_D3) {
+            // h2o-lightning: the instructions can be left out, the template has a default, and the type defaults to choice
+            const bool is_h2o = type == COMMON_DECISION_TYPE_H2O_LIGHTNING;
+            const json instructions = q.contains("instructions") ? q.at("instructions") : (is_h2o ? json(std::string()) : json());
+            if (instructions.is_null() && type != COMMON_DECISION_TYPE_VLLM_D3 && !is_h2o) {
                 throw err("\"instructions\" must be provided");
             }
             if (strict_payload && (!is_payload(instructions) || instructions == "")) {
@@ -564,7 +809,8 @@ struct Engine::Impl {
             question.id           = id;
             question.instructions = instructions;
 
-            const std::string type_name = json_string(q, "type");
+            // server-common's json_value(q, "type", default): the default when the key is missing, null, or not a string
+            const std::string type_name = q.contains("type") && q.at("type").is_string() ? q.at("type").get<std::string>() : std::string(is_h2o ? "choice" : "");
             const json        criteria  = q.contains("criteria") ? q.at("criteria") : json();
 
             if (type_name == "choice") {
@@ -588,7 +834,11 @@ struct Engine::Impl {
                 }
             } else if (type_name == "score") {
                 question.type = QUESTION_SCORE;
-                if (!criteria.is_array() || criteria.size() < 2 || criteria.size() > 10) {
+                // h2o-lightning: from 1 level, the maximum is n_options_max
+                if (is_h2o && (!criteria.is_array() || criteria.empty())) {
+                    throw err("\"criteria\" must be a non-empty array");
+                }
+                if (!is_h2o && (!criteria.is_array() || criteria.size() < 2 || criteria.size() > 10)) {
                     throw err("\"criteria\" must be an array of 2 to 10 levels");
                 }
                 for (size_t i = 0; i < criteria.size(); i++) {
@@ -613,8 +863,8 @@ struct Engine::Impl {
                     json description;
                     if (criteria.is_object() && criteria.contains(key)) {
                         description = criteria.at(key);
-                    } else if (criteria.is_object() && type == COMMON_DECISION_TYPE_LFM2_D1_OMNI) {
-                        // lfm2-d1-omni also reads the descriptions under "no" and "yes"
+                    } else if (criteria.is_object() && (type == COMMON_DECISION_TYPE_LFM2_D1_OMNI || is_h2o)) {
+                        // lfm2-d1-omni and h2o-lightning also read the descriptions under "no" and "yes"
                         const char * alias = std::string(key) == "true" ? "yes" : "no";
                         description = criteria.contains(alias) ? criteria.at(alias) : json();
                     }
@@ -680,6 +930,65 @@ struct Engine::Impl {
             }
         }
         return state;
+    }
+
+    // a state longer than max_state_tokens keeps its head and its tail around a "..." line
+    std::string h2o_cut_state(const std::string & text) const { // server_decision_context::h2o_cut_state
+        // a byte-level BPE never has more tokens than bytes
+        const size_t max_state_tokens = DECISION_H2O_MAX_STATE_TOKENS;
+        if (text.size() <= max_state_tokens) {
+            return text;
+        }
+        const llama_tokens tokens = common_tokenize(vocab, text, false, true);
+        if (tokens.size() <= max_state_tokens) {
+            return text;
+        }
+        // each half is the text of its token pieces, a cut inside a character gives U+FFFD as in a JSON response of the server
+        const size_t half = max_state_tokens / 2;
+        auto text_of = [&](llama_tokens::const_iterator begin, llama_tokens::const_iterator end) {
+            std::string out;
+            for (auto it = begin; it != end; ++it) {
+                out += common_token_to_piece(vocab, *it, true);
+            }
+            return json::parse(json::make(out).dump_safe()).get<std::string>();
+        };
+        return text_of(tokens.begin(), tokens.begin() + half) + "\n...\n" + text_of(tokens.end() - half, tokens.end());
+    }
+
+    // the special token texts written in the input are quoted with JSON escapes, so they stay text
+    std::string h2o_quote(const std::string & text) const { // server_decision_context::h2o_quote
+        std::string out;
+        for (size_t i = 0; i < text.size();) {
+            bool is_quoted = false;
+            if (quoted_first.find(text[i]) == std::string::npos) {
+                out += text[i++];
+                continue;
+            }
+            for (const auto & spelling : quoted_spellings) {
+                if (text.compare(i, spelling.size(), spelling) == 0) {
+                    std::string quoted = spelling;
+                    string_replace_all(quoted, "<", "\\u003c");
+                    string_replace_all(quoted, ">", "\\u003e");
+                    out += quoted;
+                    i += spelling.size();
+                    is_quoted = true;
+                    break;
+                }
+            }
+            if (!is_quoted) {
+                out += text[i++];
+            }
+        }
+        return out;
+    }
+
+    // the state as the model reads it, done once per request; returns the state for most models
+    json prepare_state(const json & state) const { // server_decision_context::prepare_state
+        if (type != COMMON_DECISION_TYPE_H2O_LIGHTNING) {
+            return state;
+        }
+        // done once per request: compact JSON, the cut, the quoting
+        return h2o_quote(h2o_cut_state(state.is_string() ? state.get<std::string>() : py_dumps(state, -1, ",", ":", false)));
     }
 
     //
@@ -831,6 +1140,51 @@ struct Engine::Impl {
         return options;
     }
 
+    // H2O_LIGHTNING: the input of the template, its texts are rendered as the reference shim does
+    json render_h2o(const json & state, const decision_question & question) const { // server_decision_context::render_h2o
+        // the instructions are JSON with an indent of 1, the descriptions are default JSON, the state is from prepare_state()
+        const std::string instructions = py_lstrip(question.instructions.is_string() ?
+                question.instructions.get<std::string>() : py_dumps(question.instructions, 1, ",", ": ", true));
+
+        json options = json::array();
+        for (size_t i = 0; i < question.options.size(); i++) {
+            const auto & opt = question.options[i];
+            json description; // null if not provided, the template has a default, except a score level that is shown as JSON null
+            if (question.type == QUESTION_SCORE && opt.description.is_null()) {
+                description = "null";
+            } else if (!opt.description.is_null()) {
+                description = h2o_quote(opt.description.is_string() ? opt.description.get<std::string>() : py_dumps(opt.description, -1, ", ", ": ", false));
+            }
+            const std::string key = h2o_quote(opt.key);
+
+            // the user turn is stripped like Python's str.strip(), the template only trims ASCII whitespace
+            // so the text that ends the turn is stripped here, a space keeps a description that is only whitespace
+            if (i + 1 == question.options.size()) {
+                const bool is_key = question.type == QUESTION_CHOICE && description.is_null();
+                if (is_key || description.is_string()) {
+                    const std::string text = is_key ? key : description.get<std::string>();
+                    const std::string stripped = py_rstrip(text);
+                    if (stripped != text) {
+                        description = stripped.empty() ? " " : stripped;
+                    }
+                }
+            }
+
+            json option = json::object();
+            option["label"]       = label_texts[i];
+            option["key"]         = key;
+            option["description"] = description;
+            options.push_back(option);
+        }
+
+        json inp = json::object();
+        inp["type"]         = question_type_name(question.type);
+        inp["state"]        = state;
+        inp["instructions"] = h2o_quote(instructions);
+        inp["options"]      = options;
+        return inp;
+    }
+
     std::string run_template(const json & inp) const {
         jinja::context jctx(tmpl->source());
         jinja::global_from_json(jctx, inp, false);
@@ -846,7 +1200,8 @@ struct Engine::Impl {
             const decision_question & question,
             size_t variant) const {
         // the template is given raw JSON values, it serializes the ones that are not strings
-        json inp = json{
+        // h2o-lightning: the template is given texts
+        json inp = type == COMMON_DECISION_TYPE_H2O_LIGHTNING ? render_h2o(state, question) : json{
             {"id",           question.id},
             {"type",         question_type_name(question.type)},
             {"instructions", question.instructions},
@@ -914,7 +1269,8 @@ struct Engine::Impl {
         decision_task task;
         const std::string prompt = render(state, questions, question, variant);
 
-        if (type == COMMON_DECISION_TYPE_OPENJEV || type == COMMON_DECISION_TYPE_LEV || type == COMMON_DECISION_TYPE_NIMBLE || type == COMMON_DECISION_TYPE_PPLX_DECIDER || type == COMMON_DECISION_TYPE_VLLM_D3) {
+        if (type == COMMON_DECISION_TYPE_OPENJEV || type == COMMON_DECISION_TYPE_GRANITE_SWITCH || type == COMMON_DECISION_TYPE_LEV || type == COMMON_DECISION_TYPE_NIMBLE || type == COMMON_DECISION_TYPE_PPLX_DECIDER || type == COMMON_DECISION_TYPE_VLLM_D3 ||
+            type == COMMON_DECISION_TYPE_H2O_LIGHTNING) {
             // lev reads the ratings of a noul question at its first labels, not at the digits
             task.labels.assign(labels.begin(), labels.begin() + n_outputs(question));
         }
@@ -1197,7 +1553,8 @@ struct Engine::Impl {
     }
 
     // server_decision_context::format_answer with has_media == false, so
-    // lfm2-d1-omni keeps its calibrated temperatures (upstream uses 1.0 for media)
+    // lfm2-d1-omni keeps its calibrated temperatures (upstream uses 1.0 for
+    // media) and a model's "image" temperature is never used
     json format_answer(const decision_question & question, const std::vector<std::vector<float>> & scores) const { // server_decision_context::format_answer
         const size_t n = n_outputs(question);
         if (scores.size() != n_variants(question)) {
@@ -1534,7 +1891,7 @@ struct Engine::Impl {
         }
 
         const auto questions = parse_questions(body);
-        const json state     = parse_state(body);
+        const json state     = prepare_state(parse_state(body));
 
         std::vector<decision_task> tasks;
         if (is_joint()) {
