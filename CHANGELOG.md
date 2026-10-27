@@ -69,7 +69,7 @@ the `ggml-rpc` diff is the RDMA bounds check and the patch version, and
 `ggml_backend_cuda_comm_init` is untouched. #2's tp=2 re-measurement on Spark
 is still owed.
 
-Verified on macOS, M1 Max, at `7aca0d2ea`. **Metal**
+Verified on macOS, M4 Max, at `7aca0d2ea`. **Metal**
 (`GGML_METAL_NO_RESIDENCY=1`): default **430 passed, 175 excluded** with no
 model; **576 passed, 29 excluded** for `--include smoke --include embeddings
 --include slow --include mtp` (Qwen3.5-0.8B-Q4_K_M,
