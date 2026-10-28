@@ -1,5 +1,97 @@
 # Changelog
 
+## v0.8.61
+
+llama.cpp bumped to `d4f1b18b3`
+([`b11957`](https://github.com/ggml-org/llama.cpp/releases/tag/b11957)+2),
+46 commits from `7aca0d2ea` (b11913). No change was needed in
+`llama_nif.cpp`: `include/llama.h` and `ggml/include` are untouched.
+`common/chat.h` changes `common_chat_templates_get_caps` to return JSON,
+gains `common_chat_get_tts_prompt` and a `language` argument on
+`common_chat_get_asr_prompt`, `tool_reference` content parts and deferred
+tools — none of which the NIF calls. `common/common.h` gains three decision
+types, `common_fit_apply` and two server params.
+`llama_model_default_params` / `llama_context_default_params` are unchanged.
+Upstream versions: llama.cpp 0.7.0, ggml 0.28.0.
+
+### Added
+
+- **`lfm3-d1` and `lfm3-d1-omni` decision types** (#31275, #31283), ported
+  into `decision.cpp`; `Decision.model_type/1` returns `:lfm3_d1` /
+  `:lfm3_d1_omni` and `Decision.new/2` accepts them. LiquidAI's d1-2B and
+  d1-omni-2B: `lfm2-d1`'s label readout over a memoryless LFM3 whose
+  full-attention layers are non-causal, so each prompt is evaluated in one
+  batch (`n_batch == n_ubatch`, like vllm-d3). Label codes run `A`..`Z`, then
+  `AA`, `AB`.. past 26 options; special-token text in the input gets a
+  zero-width space after its first character (`d1_break`); a score answer is
+  the median level and `confidence` is the probability of the answer. A `nil`
+  state is accepted. Spoken questions and video parts need libmtmd and are
+  refused (`"video input is not supported: ..."`).
+
+### Changed
+
+- `decision.cpp`: the special-token spelling table is built by
+  `init_quoted_spellings`, shared by h2o-lightning and lfm3-d1;
+  `d1omni_escape` became the generic `escape_json` (upstream's
+  `decision_escape`); a score of `+inf` is refused like `NaN` (#31275). A
+  question whose `instructions` is an `input_audio` part is refused for every
+  type with the libmtmd message (lfm3-d1: upstream's own "spoken instructions
+  need a model with audio input") — upstream reads its clip through libmtmd
+  for every type. "Ported at" is now `d4f1b18b3`.
+- **Not supported: `openbmb-minicpm-ocr-jev`** (#30980). MiniCPM-OCR-Jev
+  scores an OCR text against the original image and one rendered from it;
+  every request needs exactly those two images, so without libmtmd it can
+  answer nothing. `model_type/1` returns `:unknown` and `new/2` returns
+  `{:error, "unsupported decision model type: openbmb-minicpm-ocr-jev"}`.
+- `scripts/decision_compare.exs` checks the port on a decision whose context
+  has one sequence, so it shares no prompt prefix and evaluates each prompt
+  whole, like `llama-server -np 1`; the shared decision's distance from the
+  reference is printed in a `sharing` column, unchecked. Decoding a short
+  shared prefix or tail as its own batch makes Metal pick other kernels (the
+  vector flash-attention kernel under 20 tokens, `mul_mv_ext` for 2 to 8), so
+  sharing moved d1-3B by up to 6.1e-4 and failed the old check. A score is
+  now compared as a fraction of its range (`levels - 1`). New requests: 30
+  options (lfm3-d1's `AA` codes, lfm2-d1's two-digit ones) and, on lfm3-d1,
+  the spoken-question refusal.
+- Upstream, from the 46 commits: LFM3-1.7B, LFM3-VL-2B, LFM3-Audio/Omni-2B
+  and MiniCPM-OCR-Jev models; GLM-5-Next QSA without `kq_mask` (#31009) and
+  k-pool sparse selection built independently of the mask shape (#31243);
+  memoryless decoders running through `encode` now output only the marked
+  tokens unless embeddings are on (in #31275); `n_pad` removed from the
+  memory modules (#31200); `GGML_OP_SCALE` relaxed to non-contiguous views
+  (#31146); Metal `GGML_OP_TOP_K_MASK` (#31230); CUDA top-k MoE fusion for 384
+  experts (#31288); qwen3-coder reasoning/content split fix (#30557); RPC
+  `recv_msg` catches `std::length_error` (#31204); server realtime API, ASR
+  and reasoning-effort work; and OpenCL, Vulkan and HIP fixes.
+
+Upstream defects (`docs/release-guide.md`): #1, #2 and #3 are unchanged by
+source diff — `ggml-cpu/CMakeLists.txt` is untouched, the `ggml-rpc` diff is
+#31204 only, and `ggml_backend_cuda_comm_init` is untouched. No op
+renumbering this time (`ggml/include` untouched), so RPC workers from v0.8.60
+and clients from this build agree on op ids. #2's tp=2 re-measurement on
+Spark is still owed.
+
+Verified on macOS, M1 Max, at `d4f1b18b3`. **Metal**
+(`GGML_METAL_NO_RESIDENCY=1`): default **430 passed, 175 excluded** with no
+model; **576 passed, 29 excluded** for `--include smoke --include embeddings
+--include slow --include mtp` (Qwen3.5-0.8B-UD-Q4_K_XL,
+Qwen3-Embedding-0.6B-f16, Qwen3.6-35B-A3B-MTP-UD-Q4_K_XL); `--include
+embeddings` on embeddinggemma-2-Q8_0 **441 passed**; `--include decision` on
+tinylaya + tinyopenjev **442 passed**; `--include decision_clef` on Clef
+Flash Q8_0 **3 of 3**. `scripts/decision_compare.exs` against upstream
+`llama-server` built from the same commit with Metal (`-np 1`): d1-2B
+(lfm3-d1), d1-3B (lfm2-d1), d1-omni-600M, vllm-decision2-Kai-0.6B,
+vllm-d3-edge, tinylaya, tinyopenjev, Clef Flash (Q8_0) and h2o-lightning-4b
+(Q4_K_M, the refactored `init_quoted_spellings` path) **ALL MATCH**: every
+answer exact and every token count identical, including 30 options,
+special-token text and lfm3-d1's spoken refusal. Prefix sharing (the
+`sharing` column) moves d1-3B by 6.1e-4 on `basic` and 4.5e-4 on the `nil`
+state request, Kai by 6.4e-4 on `basic`, and nothing else.
+Format and dialyzer (0 errors) clean; the Hex source build clones
+`d4f1b18b3` and compiles. Not run this time: `mtp_sidecar`, `mtp_cancel`,
+`rpc_live`, granite-switch (its decision path is unchanged), d1-omni-2B (no
+GGUF published yet), and the CPU suites.
+
 ## v0.8.60
 
 llama.cpp bumped to `7aca0d2ea`

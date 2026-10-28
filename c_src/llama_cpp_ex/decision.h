@@ -10,8 +10,9 @@
 // answer formatting verbatim, and the slot scheduling as a sequential loop over
 // one context.
 //
-// Not ported: image and audio input. They need libmtmd, which this build does
-// not link; a request with media is rejected.
+// Not ported: image, video and audio input (and so the openbmb-minicpm-ocr-jev
+// type, which needs two images per request). They need libmtmd, which this
+// build does not link; a request with media is rejected.
 //
 // Kept free of Erlang/fine so it stays a plain port that can be diffed against
 // upstream on every llama.cpp bump (see docs/release-guide.md).
