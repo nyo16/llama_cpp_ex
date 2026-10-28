@@ -15,14 +15,19 @@ defmodule LlamaCppEx.Decision do
   (`"<arch>.decision.type"`); `model_type/1` reads it. Supported types:
 
     * `:openjev`, `:lev`, `:nimble`, `:pplx_decider`, `:vllm_d3`, `:lfm2_d1`,
-      `:granite_switch`, `:h2o_lightning` - read the logits of one label token
-      per option (`:nimble` lists every question of the request in each
-      prompt, `:lev` asks each choice twice with the options reversed,
-      `:pplx_decider`, `:vllm_d3` and `:granite_switch` use one- or two-letter
-      label codes like `:lev`, `:lfm2_d1` picks label codes per question and
-      accepts a `nil` state). `:vllm_d3` is non-causal, so each prompt is
-      evaluated in one batch; it accepts a `nil` state and a question without
-      `:instructions` (its prompt has a default question). `:granite_switch`
+      `:lfm3_d1`, `:lfm3_d1_omni`, `:granite_switch`, `:h2o_lightning` - read
+      the logits of one label token per option (`:nimble` lists every
+      question of the request in each prompt, `:lev` asks each choice twice
+      with the options reversed, `:pplx_decider`, `:vllm_d3` and
+      `:granite_switch` use one- or two-letter label codes like `:lev`,
+      `:lfm2_d1` picks label codes per question and accepts a `nil` state).
+      `:vllm_d3` is non-causal, so each prompt is evaluated in one batch; it
+      accepts a `nil` state and a question without `:instructions` (its
+      prompt has a default question). `:lfm3_d1` and `:lfm3_d1_omni` pick
+      label codes like `:lfm2_d1` (`A`..`Z`, then `AA`, `AB`.. past 26
+      options), accept a `nil` state, have no memory, so every prompt is
+      evaluated in one batch, and return the median level as a `:score` and
+      the probability of the answer as its confidence. `:granite_switch`
       is IBM's Granite Switch, whose decision adapter is built into the model;
       the same model also generates text through the rest of the API.
       `:h2o_lightning` reads the labels its model file lists, after an answer
@@ -58,7 +63,8 @@ defmodule LlamaCppEx.Decision do
       * `:choice` - the options, mapping each option key to its description
         (`nil` for none). The number of options is capped by the model: 52
         for openjev, 255 for laya, clef, pplx-decider, vllm-decision2, vllm-d3,
-        lfm2-d1, lfm2-d1-omni, granite-switch and h2o-lightning.
+        lfm2-d1, lfm2-d1-omni, lfm3-d1, lfm3-d1-omni, granite-switch and
+        h2o-lightning.
       * `:score` - a list of 2 to 10 level descriptions, lowest first (1 to
         255 for h2o-lightning).
       * `:noul` - optional; `%{"true" => ..., "false" => ...}` descriptions.
@@ -83,12 +89,14 @@ defmodule LlamaCppEx.Decision do
     * `:choice` - `%{type: :choice, choice: key, probabilities: %{key => p}, confidence: c}`
     * `:score` - `%{type: :score, score: s, legend: %{0 => desc, ...},
       probabilities: %{0 => p, ...}, confidence: c}`, where `score` is the
-      probability-weighted level index and can fall between two levels.
+      probability-weighted level index and can fall between two levels
+      (lfm3-d1 and lfm3-d1-omni: the median level, a whole number).
     * `:noul` - `%{type: :noul, noul: p}`, the probability that the answer is
       true.
 
   `confidence` runs from 0 (every option equally likely) to 1; vllm-decision2
-  and vllm-d3 compute it from the normalized entropy of the probabilities.
+  and vllm-d3 compute it from the normalized entropy of the probabilities, and
+  lfm3-d1 and lfm3-d1-omni return the probability of the answer.
   Probabilities are scaled with the temperatures (and, for scores, the
   per-level biases) stored in the model file; they are not guaranteed to be
   calibrated for your data. vllm-decision2 and vllm-d3 return a `legend`
@@ -122,13 +130,17 @@ defmodule LlamaCppEx.Decision do
   ## Limits
 
     * Text only. Upstream also takes images (openjev, clef, pplx-decider,
-      vllm-d3, lfm2-d1, lfm2-d1-omni) and audio (lfm2-d1-omni) through
-      libmtmd, which this build does not link; a request with images or audio
-      is rejected.
-    * laya, clef, vllm-d3 and lfm2-d1-omni evaluate the whole prompt in one
-      batch, so it has to fit in `:n_batch` (2048 tokens by default, see
-      `new/2`); vllm-decision2 needs the question, its options and the end of
-      the prompt to fit in one.
+      vllm-d3, lfm2-d1, lfm2-d1-omni, lfm3-d1, lfm3-d1-omni), videos (lfm3-d1,
+      lfm3-d1-omni) and audio (lfm2-d1-omni, lfm3-d1-omni spoken questions)
+      through libmtmd, which this build does not link; a request with any of
+      them is rejected. For the same reason upstream's
+      `openbmb-minicpm-ocr-jev` type, which scores an OCR text against two
+      images and nothing else, is not supported (`model_type/1` returns
+      `:unknown`).
+    * laya, clef, vllm-d3, lfm2-d1-omni, lfm3-d1 and lfm3-d1-omni evaluate the
+      whole prompt in one batch, so it has to fit in `:n_batch` (2048 tokens
+      by default, see `new/2`); vllm-decision2 needs the question, its
+      options and the end of the prompt to fit in one.
     * A `%Decision{}` drives one context and is not safe to use from two
       processes at once, like `LlamaCppEx.Context`. Give each process its own,
       or serialize calls through one process.
@@ -149,6 +161,8 @@ defmodule LlamaCppEx.Decision do
           | :pplx_decider
           | :lfm2_d1
           | :lfm2_d1_omni
+          | :lfm3_d1
+          | :lfm3_d1_omni
           | :vllm_decision2
           | :vllm_d3
           | :granite_switch
@@ -198,6 +212,8 @@ defmodule LlamaCppEx.Decision do
     "pplx-decider" => :pplx_decider,
     "lfm2-d1" => :lfm2_d1,
     "lfm2-d1-omni" => :lfm2_d1_omni,
+    "lfm3-d1" => :lfm3_d1,
+    "lfm3-d1-omni" => :lfm3_d1_omni,
     "vllm-decision2" => :vllm_decision2,
     "vllm-d3" => :vllm_d3,
     "granite-switch" => :granite_switch,
@@ -220,8 +236,8 @@ defmodule LlamaCppEx.Decision do
   ]
   # Non-causal models that read logits: the whole prompt goes in one
   # micro-batch (upstream's server_slot::can_split), as for the embedding
-  # readers above.
-  @one_batch [:vllm_d3]
+  # readers above. lfm3-d1 also has no memory.
+  @one_batch [:vllm_d3, :lfm3_d1, :lfm3_d1_omni]
 
   @default_n_ctx 4096
   @default_n_batch_embeddings 2048
@@ -259,9 +275,9 @@ defmodule LlamaCppEx.Decision do
       the state, one question and its options (all questions for clef and
       nimble), so a long state needs a larger context.
     * `:n_batch` - Max tokens per batch. For laya, kev, clef, lfm2-d1-omni,
-      vllm-decision2 and vllm-d3 it is also the micro-batch size and caps the
-      prompt that can be evaluated at once; defaults to
-      `min(n_ctx, #{@default_n_batch_embeddings})` for them and to
+      vllm-decision2, vllm-d3, lfm3-d1 and lfm3-d1-omni it is also the
+      micro-batch size and caps the prompt that can be evaluated at once;
+      defaults to `min(n_ctx, #{@default_n_batch_embeddings})` for them and to
       `LlamaCppEx.Context`'s default otherwise.
 
   Any `LlamaCppEx.Context.tuning_option_keys/0` option (`:n_threads`,

@@ -118,7 +118,9 @@ Port every change except image input (libmtmd is not linked), update the
 upstream's own server with `scripts/decision_compare.exs` (its header has the
 build and serve commands) on tinylaya, tinyopenjev and any decision model on
 disk. A new decision *type* is a new branch in `init`, in `@types` in
-`lib/llama_cpp_ex/decision.ex`, and in the two type lists beside it.
+`lib/llama_cpp_ex/decision.ex`, and in the two type lists beside it — and if
+it both shares a prompt and reads embeddings, in the script's list of those
+(it builds the non-sharing context itself, see below).
 
 Run the comparison on the **Metal** build (NIF and reference server both). Two
 CPU builds with identical cmake flags still differ by up to 9e-4 on
@@ -135,6 +137,26 @@ Serve with `-np 1`: the server's default of four slots sizes its KV cache and
 batches the questions of a request across slots differently from the NIF's one
 context, and at `7aca0d2ea` that alone put Julia-1 (laya) 3.3e-3 and Granite
 Switch 1.4e-3 off, both exact on single-question requests with `-np 1`.
+The NIF's own prefix sharing is a second source, which the script keeps out
+of the check. For the types that share a prompt, `Decision.new/2` decodes the
+common prefix of a multi-question request once, as its own batch, and then
+each question's tail as another; upstream with `-np 1` evaluates each prompt
+whole. Metal picks kernels by batch size — the vector flash-attention kernel
+below 20 tokens (`ggml_metal_op_flash_attn_ext_use_vec`) and `mul_mv_ext` for
+2 to 8 rows of Q8_0/Q4_0-style weights — and those round differently from the
+kernels a whole prompt gets. At `d4f1b18b3` on d1-3B the `basic` request
+shares a 20-token prefix with tails of 17, 32 and 36 tokens: only the 17-token
+question moves (`angry` 6.1e-4), the other two are bit-identical, and with
+`flash_attn: :disabled` all three are. The `nil` state request shares 4
+tokens, which hits `mul_mv_ext` for every weight, so all three move (largest
+probability 4.2e-4); Kai's 6.4e-4 is a 19-token prefix. On CPU the effect is
+larger (5.5e-3 in probability on d1-3B, against 3.5e-3 between CPU and
+Metal). So the script checks the port on a decision whose context has one
+sequence — which shares nothing and matches `-np 1` exactly on every request
+of every model at `d4f1b18b3` — and prints the shared decision's distance from
+the reference in a `sharing` column, unchecked. It also compares a score as a
+fraction of its range (`levels - 1`): the score is an expected level, so on 4
+levels a 4.2e-4 probability shift was a 1.3e-3 score shift.
 
 ### Upstream defects we work around
 
@@ -253,6 +275,15 @@ compares major and minor: a worker from v0.8.59 accepts a client from this
 build and misreads its graphs. The `ggml-cuda.cu` diff is graph chunking
 (#30804), fusions and pool work, none of it near `ggml_backend_cuda_comm_init`.
 
+Re-checked at `d4f1b18b3` (b11957+2), covering the 46 commits from
+`7aca0d2ea`: #1, #2 and #3 are as above. `ggml-cpu/CMakeLists.txt` and
+`ggml/include` were not touched, so no op renumbers this time. The `ggml-rpc`
+diff is #31204 only (`recv_msg` also catches `std::length_error`);
+`ggml_backend_rpc_start_server` keeps its `void` signature and the protocol
+version is unchanged. The `ggml-cuda.cu` diff is a contiguity guard on the
+softcap fusion and on `GGML_OP_SCALE` support, none of it near
+`ggml_backend_cuda_comm_init`.
+
 | # | Upstream defect | Our workaround | Still needed? |
 |---|---|---|---|
 | 1 | `GGML_NATIVE=ON` makes ggml's `-mcpu=native` probe resolve to **base ARMv8-A** on Cortex-X925/A725 with GCC 13.3 — silently, with a soft CMake warning and exit 0. Costs every `sdot`/`smmla`/SVE kernel. | `LLAMA_CPU_ARM_ARCH` + `LLAMA_CUDA_ARCH` in the `Makefile`, which must be set together. See [DGX Spark](dgx-spark.md) and [Cross-Platform Builds](cross-platform-builds.md). | `scripts/spark/verify-build-flags.sh` on an aarch64 host. If a default build (no `LLAMA_CPU_ARM_ARCH`) now reports non-zero `sdot`/`smmla`, upstream fixed the probe. |
@@ -303,12 +334,13 @@ GGML_METAL_NO_RESIDENCY=1 \
 LLAMA_SMOKE_DECISION_CLEF_MODEL=~/Downloads/Cloudflare_clef-flash-Q8_0.gguf \
   mix test --include decision_clef
 
-# lfm2-d1, lfm2-d1-omni, vllm-decision2 and vllm-d3 have no tag: check them
-# with scripts/decision_compare.exs (below) on d1-3B, d1-omni-600M,
-# Decision-2.0-Kai-0.6B and vllm-d3-edge. The d1-3B quants published before
-# upstream's rename say "d1" and are refused by both sides;
-# LiquidAI/d1-omni-600M-GGUF already says "lfm2-d1-omni" and
-# ggml-org/vllm-d3-edge-GGUF says "vllm-d3". vllm-sr's own
+# lfm2-d1, lfm2-d1-omni, lfm3-d1, vllm-decision2 and vllm-d3 have no tag:
+# check them with scripts/decision_compare.exs (below) on d1-3B,
+# d1-omni-600M, d1-2B, Decision-2.0-Kai-0.6B and vllm-d3-edge. The d1-3B
+# quants published before upstream's rename say "d1" and are refused by both
+# sides; LiquidAI/d1-omni-600M-GGUF already says "lfm2-d1-omni",
+# LiquidAI/d1-2B-GGUF says "lfm3-d1" and ggml-org/vllm-d3-edge-GGUF says
+# "vllm-d3". vllm-sr's own
 # Decision-2.0-*-GGUF files predate upstream support (arch qwen3, type
 # "decision2") and load on neither side; convert vllm-sr/Decision-2.0-Kai-0.6B
 # with the submodule's convert_hf_to_gguf.py (it needs transformers >= 5 for
@@ -316,6 +348,8 @@ LLAMA_SMOKE_DECISION_CLEF_MODEL=~/Downloads/Cloudflare_clef-flash-Q8_0.gguf \
 # either: ibm-granite/granite-switch-4.1-8b-GGUF (converted at b11798, after
 # upstream added the type) and h2oai/h2o-lightning-4b-gguf (the files without
 # "stock-" in the name; the stock- ones carry no decision metadata).
+# openbmb-minicpm-ocr-jev is not supported (two images per request), so there
+# is nothing to compare.
 
 GGML_METAL_NO_RESIDENCY=1 \
 LLAMA_SMOKE_MTP_MODEL=~/Downloads/Qwen3.8-27B-Q4_K_M.gguf \

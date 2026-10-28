@@ -2,7 +2,7 @@
 // of tools/server/server-context.cpp (send_decision, the batch layout rules and
 // the /v1/systemone handler). See decision.h for scope.
 //
-// Ported at 7aca0d2ea. Functions that are upstream's carry its name in a
+// Ported at d4f1b18b3. Functions that are upstream's carry its name in a
 // trailing comment so a bump can diff them one by one; everything below the
 // "evaluation" banner replaces server slots and is ours.
 
@@ -242,29 +242,35 @@ std::string kev_text(const json & val) { // decision_kev_text
     return escape_special_tokens(kev_render(val));
 }
 
-// lfm2-d1-omni: special tokens written in the input must not be parsed as such, in keys too (d1-omni prompt.py: escape)
-json d1omni_escape(const json & val, int depth = 0) { // decision_d1omni_escape
+// lfm2-d1-omni, lfm3-d1: special tokens written in the input must not be parsed as such, in keys too
+template <typename F>
+json escape_json(const json & val, const F & escape, int depth = 0) { // decision_escape
     if (depth >= RECURSIVE_LIMIT) {
         throw too_deep();
     }
     if (val.is_string()) {
-        return escape_special_tokens(val.get<std::string>());
+        return escape(val.get<std::string>());
     }
     if (val.is_array()) {
         json out = json::array();
         for (const auto & item : val) {
-            out.push_back(d1omni_escape(item, depth + 1));
+            out.push_back(escape_json(item, escape, depth + 1));
         }
         return out;
     }
     if (val.is_object()) {
         json out = json::object();
         for (const auto & [key, item] : val.items()) {
-            out[escape_special_tokens(key)] = d1omni_escape(item, depth + 1);
+            out[escape(key)] = escape_json(item, escape, depth + 1);
         }
         return out;
     }
     return val;
+}
+
+// lfm3-d1-omni: a spoken question, its instructions are an input_audio part
+bool is_spoken(const json & instructions) { // decision_is_spoken
+    return instructions.is_object() && json_string(instructions, "type") == "input_audio";
 }
 
 //
@@ -556,7 +562,7 @@ struct Engine::Impl {
     size_t      max_head_tokens   = 0; // question + options
     size_t      max_option_tokens = 48;
 
-    // H2O_LIGHTNING
+    // H2O_LIGHTNING, LFM3_D1, LFM3_D1_OMNI
     std::vector<std::string> quoted_spellings; // texts of the special tokens, quoted in the input, longest first
     std::string              quoted_first;     // the first bytes of these texts
 
@@ -585,6 +591,10 @@ struct Engine::Impl {
 
     bool is_joint() const {
         return type == COMMON_DECISION_TYPE_CLEF;
+    }
+
+    bool is_lfm3_d1() const {
+        return type == COMMON_DECISION_TYPE_LFM3_D1 || type == COMMON_DECISION_TYPE_LFM3_D1_OMNI;
     }
 
     bool reads_embeddings() const {
@@ -716,9 +726,13 @@ struct Engine::Impl {
             noul_criteria_order = true;
             strict_payload      = true;
             canonical_legend    = true;
-        } else if (model_type == COMMON_DECISION_TYPE_LFM2_D1) {
+        } else if (model_type == COMMON_DECISION_TYPE_LFM2_D1 || model_type == COMMON_DECISION_TYPE_LFM3_D1 || model_type == COMMON_DECISION_TYPE_LFM3_D1_OMNI) {
             n_options_max   = 255;
             noul_true_first = true;
+            if (model_type != COMMON_DECISION_TYPE_LFM2_D1) {
+                // the texts of the special tokens are broken in the input
+                init_quoted_spellings(LLAMA_TOKEN_ATTR_CONTROL, 2);
+            }
         } else if (model_type == COMMON_DECISION_TYPE_LFM2_D1_OMNI) {
             token_marker = llama_vocab_mask(vocab);
             if (token_marker == LLAMA_TOKEN_NULL) {
@@ -740,22 +754,7 @@ struct Engine::Impl {
                 throw std::runtime_error("decision model has no labels");
             }
             // the texts of the control and user-defined tokens are quoted in the input, so that they stay text
-            for (llama_token id = 0; id < llama_vocab_n_tokens(vocab); id++) {
-                if (llama_vocab_get_attr(vocab, id) & (LLAMA_TOKEN_ATTR_CONTROL | LLAMA_TOKEN_ATTR_USER_DEFINED)) {
-                    const std::string text = llama_vocab_get_text(vocab, id);
-                    if (!text.empty()) {
-                        quoted_spellings.push_back(text);
-                    }
-                }
-            }
-            std::stable_sort(quoted_spellings.begin(), quoted_spellings.end(), [](const std::string & a, const std::string & b) {
-                return a.size() > b.size();
-            });
-            for (const auto & spelling : quoted_spellings) {
-                if (quoted_first.find(spelling[0]) == std::string::npos) {
-                    quoted_first += spelling[0];
-                }
-            }
+            init_quoted_spellings(LLAMA_TOKEN_ATTR_CONTROL | LLAMA_TOKEN_ATTR_USER_DEFINED, 1);
             n_options_max   = labels.size();
             noul_true_first = true;
         } else {
@@ -770,13 +769,34 @@ struct Engine::Impl {
         }
     }
 
+    // the texts of the tokens with these attributes, quoted_spellings and quoted_first
+    void init_quoted_spellings(uint32_t attrs, size_t min_size) { // server_decision_context::init_quoted_spellings
+        for (llama_token id = 0; id < llama_vocab_n_tokens(vocab); id++) {
+            if (llama_vocab_get_attr(vocab, id) & attrs) {
+                const std::string text = llama_vocab_get_text(vocab, id);
+                if (text.size() >= min_size) {
+                    quoted_spellings.push_back(text);
+                }
+            }
+        }
+        std::stable_sort(quoted_spellings.begin(), quoted_spellings.end(), [](const std::string & a, const std::string & b) {
+            return a.size() > b.size();
+        });
+        for (const auto & spelling : quoted_spellings) {
+            if (quoted_first.find(spelling[0]) == std::string::npos) {
+                quoted_first += spelling[0];
+            }
+        }
+    }
+
     //
     // request parsing
     //
 
     std::vector<decision_question> parse_questions(const json & body) const { // server_decision_context::parse_questions
-        // lfm2-d1, lfm2-d1-omni and vllm-d3 accept a null state (for images only upstream; here it just asks about nothing but the questions)
-        if (!body.contains("state") || (body.at("state").is_null() && type != COMMON_DECISION_TYPE_LFM2_D1 && type != COMMON_DECISION_TYPE_LFM2_D1_OMNI && type != COMMON_DECISION_TYPE_VLLM_D3)) {
+        // lfm2-d1, lfm2-d1-omni, lfm3-d1 and vllm-d3 accept a null state (for images only upstream; here it just asks about nothing but the questions)
+        const bool null_state = type == COMMON_DECISION_TYPE_LFM2_D1 || type == COMMON_DECISION_TYPE_LFM2_D1_OMNI || type == COMMON_DECISION_TYPE_VLLM_D3 || type == COMMON_DECISION_TYPE_LFM3_D1 || type == COMMON_DECISION_TYPE_LFM3_D1_OMNI;
+        if (!body.contains("state") || (body.at("state").is_null() && !null_state)) {
             throw std::invalid_argument("\"state\" must be provided");
         }
         if (strict_payload && !is_payload(body.at("state"))) {
@@ -803,6 +823,13 @@ struct Engine::Impl {
             }
             if (strict_payload && (!is_payload(instructions) || instructions == "")) {
                 throw err("\"instructions\" must be non-empty text, an object or an array");
+            }
+            if (type == COMMON_DECISION_TYPE_LFM3_D1 && is_spoken(instructions)) {
+                throw err("spoken instructions need a model with audio input");
+            }
+            // upstream's fill_task loads the clip of a spoken question for every type, through libmtmd
+            if (is_spoken(instructions)) {
+                throw err("audio input is not supported: LlamaCppEx is built without libmtmd");
             }
 
             decision_question question;
@@ -927,6 +954,10 @@ struct Engine::Impl {
                 if (part.is_object() && json_string(part, "type") == "input_audio" && part.contains("input_audio")) {
                     throw reject("audio");
                 }
+                // lfm3-d1 and lfm3-d1-omni also take videos
+                if (is_lfm3_d1() && part.is_object() && json_string(part, "type") == "video_url" && part.contains("video_url")) {
+                    throw reject("video");
+                }
             }
         }
         return state;
@@ -980,6 +1011,40 @@ struct Engine::Impl {
             }
         }
         return out;
+    }
+
+    // LFM3_D1: a zero-width space after the first character of each special token text (d1 prompt.py: plain)
+    std::string d1_break(const std::string & text) const { // server_decision_context::d1_break
+        static const std::string zwsp = "\xE2\x80\x8B";
+        std::string cur = text;
+        // again for a match that overlapped the one broken before it
+        for (bool changed = true; changed;) {
+            changed = false;
+            std::string out;
+            for (size_t i = 0; i < cur.size();) {
+                const std::string * hit = nullptr;
+                if (quoted_first.find(cur[i]) != std::string::npos) {
+                    for (const auto & spelling : quoted_spellings) {
+                        if (cur.compare(i, spelling.size(), spelling) == 0) {
+                            hit = &spelling;
+                            break;
+                        }
+                    }
+                }
+                if (hit == nullptr) {
+                    out += cur[i++];
+                    continue;
+                }
+                // after the first character, its UTF-8 bytes
+                const unsigned char c = (*hit)[0];
+                const size_t n = c < 0x80 ? 1 : c < 0xE0 ? 2 : c < 0xF0 ? 3 : 4;
+                out += hit->substr(0, n) + zwsp + hit->substr(n);
+                i += hit->size();
+                changed = true;
+            }
+            cur = std::move(out);
+        }
+        return cur;
     }
 
     // the state as the model reads it, done once per request; returns the state for most models
@@ -1055,6 +1120,9 @@ struct Engine::Impl {
                 codes.push_back(question.options[i].key);
             } else if (n_options <= 26) {
                 codes.push_back(std::string(1, 'A' + i));
+            } else if (is_lfm3_d1()) {
+                // A..Z, then AA, AB..
+                codes.push_back(i < 26 ? std::string(1, 'A' + i) : std::string{(char) ('A' + (i - 26) / 26), (char) ('A' + (i - 26) % 26)});
             } else {
                 codes.push_back(string_format("%02zu", i));
             }
@@ -1112,7 +1180,7 @@ struct Engine::Impl {
 
         std::vector<std::string>  d1_texts;
         std::vector<llama_tokens> d1_groups;
-        if (type == COMMON_DECISION_TYPE_LFM2_D1) {
+        if (type == COMMON_DECISION_TYPE_LFM2_D1 || is_lfm3_d1()) {
             d1_labels(question, d1_texts, d1_groups);
         }
         // the second variant shows the options in the reverse order
@@ -1238,8 +1306,13 @@ struct Engine::Impl {
             inp = replace_text(inp, text_marker, " ");
         }
 
+        // spoken questions are refused in parse_questions, so upstream's is_spoken branches never apply here
+        if (is_lfm3_d1()) {
+            inp = escape_json(inp, [this](const std::string & text) { return d1_break(text); });
+        }
+
         if (type == COMMON_DECISION_TYPE_LFM2_D1_OMNI) {
-            inp = replace_text(d1omni_escape(inp), D1OMNI_MARKER, "<<d1omni ");
+            inp = replace_text(escape_json(inp, escape_special_tokens), D1OMNI_MARKER, "<<d1omni ");
             inp["audio"]         = false;
             inp["sep"]           = D1OMNI_SEP;
             inp["mark_state"]    = D1OMNI_MARK_STATE;
@@ -1274,7 +1347,7 @@ struct Engine::Impl {
             // lev reads the ratings of a noul question at its first labels, not at the digits
             task.labels.assign(labels.begin(), labels.begin() + n_outputs(question));
         }
-        if (type == COMMON_DECISION_TYPE_LFM2_D1) {
+        if (type == COMMON_DECISION_TYPE_LFM2_D1 || is_lfm3_d1()) {
             std::vector<std::string>  texts;
             std::vector<llama_tokens> groups;
             d1_labels(question, texts, groups);
@@ -1569,8 +1642,8 @@ struct Engine::Impl {
             if (s.size() != n) {
                 throw std::runtime_error("decision result does not match the number of options");
             }
-            // a joint head returns NaN if it could not use the decision order
-            if (std::any_of(s.begin(), s.end(), [](float v) { return std::isnan(v); })) {
+            // a joint head returns NaN if it could not use the decision order, +inf would make the softmax NaN
+            if (std::any_of(s.begin(), s.end(), [](float v) { return std::isnan(v) || v == INFINITY; })) {
                 throw std::runtime_error("the model could not evaluate the decision");
             }
             std::vector<double> logits(s.begin(), s.end());
@@ -1629,6 +1702,16 @@ struct Engine::Impl {
                 const json & description = question.options[i].description;
                 legend[question.options[i].key] = canonical_legend && !description.is_string() ? json(sort_keys(description).dump()) : description;
             }
+            // lfm3-d1: the median level, the first whose cumulative probability reaches one half (d1 api.py)
+            if (is_lfm3_d1()) {
+                double mass = 0.0;
+                size_t level = n - 1;
+                for (size_t i = 0; i < n && mass < 0.5; i++) {
+                    mass += probs[i];
+                    level = i;
+                }
+                expected = (double) level;
+            }
             answer["score"]         = expected;
             answer["legend"]        = legend;
             answer["probabilities"] = probabilities;
@@ -1640,6 +1723,10 @@ struct Engine::Impl {
     double get_confidence(question_type qtype, const std::vector<double> & probs) const { // server_decision_context::get_decision_confidence
         if (type == COMMON_DECISION_TYPE_VLLM_DECISION2 || type == COMMON_DECISION_TYPE_VLLM_D3) {
             return confidence_entropy(probs);
+        }
+        // lfm3-d1: the probability of the answer (d1 api.py)
+        if (is_lfm3_d1()) {
+            return *std::max_element(probs.begin(), probs.end());
         }
         switch (qtype) {
             case QUESTION_CHOICE: return confidence_choice(probs);
@@ -1680,7 +1767,7 @@ struct Engine::Impl {
 
     // The position from which the prompt must be in the last batch: the first
     // output, or the whole prompt over a non-causal context (laya,
-    // lfm2-d1-omni, vllm-d3), whose tokens only attend within their batch
+    // lfm2-d1-omni, vllm-d3, lfm3-d1), whose tokens only attend within their batch
     // (server_slot::can_split).
     int32_t first_batched(const decision_task & task) const {
         return llama_get_causal_attn(ctx) ? first_output(task) : 0;
