@@ -2,7 +2,7 @@
 // of tools/server/server-context.cpp (send_decision, the batch layout rules and
 // the /v1/systemone handler). See decision.h for scope.
 //
-// Ported at d4f1b18b3. Functions that are upstream's carry its name in a
+// Ported at 418f905a4. Functions that are upstream's carry its name in a
 // trailing comment so a bump can diff them one by one; everything below the
 // "evaluation" banner replaces server slots and is ours.
 

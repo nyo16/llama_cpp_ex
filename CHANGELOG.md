@@ -1,5 +1,65 @@
 # Changelog
 
+## v0.8.62
+
+llama.cpp bumped to `418f905a4`
+([`b11986`](https://github.com/ggml-org/llama.cpp/releases/tag/b11986)+16),
+43 commits from `d4f1b18b3` (b11957+2). No change was needed in
+`llama_nif.cpp`. The header changes are additive: `include/llama.h` and
+`ggml.h` append the FP8 E4M3 type (`LLAMA_FTYPE_MOSTLY_F8_E4M3 = 42`,
+`GGML_TYPE_F8_E4M3 = 43`, #27512), `ggml-backend.h` gains the batched
+`ggml_backend_tensor_set_n` / `_get_n` / `_copy_n` (#30881), and
+`common_control_vector_load` takes the model's layer count (#31336) — none of
+which the NIF calls. `chat.h`, `speculative.h`, `src/llama-ext.h` and the
+upstream decision sources are untouched.
+`llama_model_default_params` / `llama_context_default_params` are unchanged.
+RPC protocol stays at 8.0.1. Upstream versions: llama.cpp 0.8.0, ggml 0.28.0.
+
+### Changed
+
+- `decision.cpp`: "Ported at" is now `418f905a4`; `server-decision.{h,cpp}`
+  and the decision paths of `server-context.cpp` and `common.cpp` did not
+  change, so nothing was ported.
+- Upstream, from the 43 commits: sequence state save/restore and the
+  on-device checkpoint copies now go through the batched tensor copy API,
+  implemented on Metal and CUDA (#30881) — the path `LlamaCppEx.MTP` uses
+  to checkpoint hybrid targets; OCP FP8 E4M3 quantization (#27512); Mistral
+  Large 4 ("le chonk", #31376) and Limite 1B (#29433) models; the model
+  loader reuses its staging buffer and skips the direct-io bounce buffer
+  (#31321); DSV4 simple batch splitting removed (#31300); control vector
+  layer indices bounded (#31336); Metal faster MXFP4 mat-vec and full
+  threadgroups for unary/binary/GLU (#31075, #31360); CUDA MMQ MoE gate/up
+  and GLU fusion (#31188) and sparse attention on CDNA (#31259); CPU SVE
+  kernels (#30585, #27472, #28141); and OpenCL, SYCL, Hexagon, OpenVINO and
+  HIP work. The server's spec checkpoint fix for drafts longer than
+  `n_rs_seq` (#31350) does not apply: `LlamaCppEx.MTP` creates its target
+  with `n_rs_seq: 0`, so it checkpoints only `:full` targets.
+
+Upstream defects (`docs/release-guide.md`): #1, #2 and #3 are unchanged by
+source diff — `ggml-cpu/CMakeLists.txt` is untouched, the `ggml-rpc` diff is
+the three `NULL` batched-copy slots, and `ggml_backend_cuda_comm_init` is
+untouched. No op renumbering (`GGML_OP_COUNT` stays 102); the new
+`GGML_TYPE_F8_E4M3` is appended, so a v0.8.61 RPC worker refuses only FP8
+tensors. #2's tp=2 re-measurement on Spark is still owed.
+
+Verified on macOS, M1 Max, at `418f905a4`. **Metal**
+(`GGML_METAL_NO_RESIDENCY=1`): default **430 passed, 175 excluded** with no
+model; **576 passed, 29 excluded** for `--include smoke --include embeddings
+--include slow --include mtp` (Qwen3.5-0.8B-UD-Q4_K_XL,
+Qwen3-Embedding-0.6B-f16, Qwen3.6-35B-A3B-MTP-UD-Q4_K_XL); `--include
+embeddings` on embeddinggemma-2-Q8_0 **441 passed**; `--include decision` on
+tinylaya + tinyopenjev **442 passed**; `--include decision_clef` on Clef
+Flash Q8_0 **3 of 3**; `--include mtp_sidecar` on the Qwen 3.8 27B pair
+**436 passed, 6 skipped**. `scripts/decision_compare.exs` against upstream
+`llama-server` built from the same commit with Metal (`-np 1`): tinylaya,
+tinyopenjev, d1-2B, d1-3B, d1-omni-600M, vllm-decision2-Kai-0.6B,
+vllm-d3-edge, Clef Flash (Q8_0) and h2o-lightning-4b (Q4_K_M) **ALL MATCH**,
+every answer exact and every token count identical; the `sharing` column is
+unchanged from v0.8.61 (d1-3B 6.1e-4, Kai 6.4e-4, nothing else).
+Format and dialyzer (0 errors) clean; the Hex source build clones
+`418f905a4` and compiles. Not run this time: `mtp_cancel`, `rpc_live`,
+granite-switch, and the CPU suites.
+
 ## v0.8.61
 
 llama.cpp bumped to `d4f1b18b3`
