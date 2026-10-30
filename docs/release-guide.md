@@ -284,6 +284,19 @@ version is unchanged. The `ggml-cuda.cu` diff is a contiguity guard on the
 softcap fusion and on `GGML_OP_SCALE` support, none of it near
 `ggml_backend_cuda_comm_init`.
 
+Re-checked at `418f905a4` (b11986+16), covering the 43 commits from
+`d4f1b18b3`: #1, #2 and #3 are as above. `ggml-cpu/CMakeLists.txt` was not
+touched. The `ggml-rpc` diff is #30881 only: three new buffer slots
+(`set_tensor_n`, `get_tensor_n`, `cpy_tensor_n`), all `NULL` on RPC, so the
+batched copies fall back to one transfer per tensor;
+`ggml_backend_rpc_start_server` keeps its `void` signature and the protocol
+version is unchanged. `ggml.h` appends `GGML_TYPE_F8_E4M3 = 43` (#27512) and
+adds no op, so op ids are unchanged; a v0.8.61 worker refuses a tensor of the
+new type (`type >= GGML_TYPE_COUNT` in `deserialize_tensor`) and handles
+everything else. The `ggml-cuda.cu` diff is the MMQ MoE gate/up/GLU fusion
+(#31188), RDNA4_M (#31373) and the batched copy hooks (#30881), none of it near
+`ggml_backend_cuda_comm_init`.
+
 | # | Upstream defect | Our workaround | Still needed? |
 |---|---|---|---|
 | 1 | `GGML_NATIVE=ON` makes ggml's `-mcpu=native` probe resolve to **base ARMv8-A** on Cortex-X925/A725 with GCC 13.3 — silently, with a soft CMake warning and exit 0. Costs every `sdot`/`smmla`/SVE kernel. | `LLAMA_CPU_ARM_ARCH` + `LLAMA_CUDA_ARCH` in the `Makefile`, which must be set together. See [DGX Spark](dgx-spark.md) and [Cross-Platform Builds](cross-platform-builds.md). | `scripts/spark/verify-build-flags.sh` on an aarch64 host. If a default build (no `LLAMA_CPU_ARM_ARCH`) now reports non-zero `sdot`/`smmla`, upstream fixed the probe. |
