@@ -80,6 +80,9 @@ tool calling for the OpenAI-shaped chat functions, and error tuples for a bad
   `:reasoning_content` and `content: nil`, and it accepts the tool options.
 - `Chat.message()` type widened accordingly; `ChatCompletion` and
   `ChatCompletionChunk` types describe tool calls.
+- The Metal artifacts are built on GitHub's `macos-15` image (`macos-14` is
+  retired on 2026-11-02 and was browned out for this release) with
+  `MACOSX_DEPLOYMENT_TARGET=14.0`, so they still load on macOS 14.
 
 ### Removed
 

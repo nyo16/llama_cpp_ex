@@ -52,7 +52,10 @@ jobs:
           # GitHub expression resolves through numeric coercion rather than
           # string comparison; being explicit keeps the `if:` guards below from
           # depending on that.
-          - os: macos-14
+          # macos-15: GitHub retires the macos-14 image on 2026-11-02 and browns
+          # it out before that. MACOSX_DEPLOYMENT_TARGET below keeps the artifact
+          # loading on macOS 14, which a macos-14 build targeted by default.
+          - os: macos-15
             target: aarch64-apple-darwin
             otp: '27.0'
             elixir: '1.18'
@@ -64,7 +67,7 @@ jobs:
           # erts/emulator/beam/erl_nif.h in the OTP source). So OTP 27 and OTP 29
           # are the two builds that produce distinct artifacts; adding 28 would
           # just overwrite the 27 one.
-          - os: macos-14
+          - os: macos-15
             target: aarch64-apple-darwin
             otp: '29.0'
             elixir: '1.20'
@@ -188,6 +191,9 @@ jobs:
           # artifact to whatever CPU the runner happened to have and hand users a
           # SIGILL on older hardware.
           LLAMA_PORTABLE: '1'
+          # The macOS 15 SDK would otherwise target macOS 15 and refuse to load
+          # on 14. clang and cmake both read it from the environment.
+          MACOSX_DEPLOYMENT_TARGET: ${{ matrix.backend == 'metal' && '14.0' || '' }}
           # Names the artifact. Detection cannot be trusted here: it requires a
           # driver before it will claim a CUDA target, and a release runner has
           # a toolkit and no driver, so an unset variant would silently publish
@@ -206,6 +212,19 @@ jobs:
           # `*-x86_64-linux-gnu-*` alone would happily match the cu12 artifact.
           ls cache/*-${{ matrix.target }}-"${TAG_VERSION}".tar.gz >/dev/null \
             || { echo "::error::this leg produced no artifact named for ${{ matrix.target }}"; exit 1; }
+      - name: The Metal artifact must load on macOS 14
+        if: matrix.backend == 'metal'
+        run: |
+          set -eu
+          # The runner's SDK is newer than the oldest macOS we ship for; a missed
+          # MACOSX_DEPLOYMENT_TARGET only shows on a user's machine, as a NIF that
+          # refuses to load.
+          d=$(mktemp -d)
+          tar -xzf cache/*-${{ matrix.target }}-"${TAG_VERSION}".tar.gz -C "$d"
+          so=$(find "$d" -name '*.so' | head -n 1)
+          minos=$(otool -l "$so" | awk '/LC_BUILD_VERSION/ { f = 1 } f && $1 == "minos" { print $2; exit }')
+          echo "minos: ${minos}"
+          [ "$minos" = "14.0" ] || { echo "::error::the artifact targets macOS ${minos}, not 14.0"; exit 1; }
       - name: Upload artifacts to the draft release
         env:
           GH_TOKEN: ${{ github.token }}
