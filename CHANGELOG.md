@@ -1,6 +1,9 @@
 # Changelog
 
-## Unreleased
+## v0.8.64
+
+Quieter llama.cpp logging with a configurable level, `:tools` coverage in
+CI, and dependency updates. llama.cpp stays at `418f905a4`.
 
 ### Added
 
@@ -31,6 +34,21 @@
 - Lock: decimal 2.4.1 → 3.2.0 and ecto 3.13.5 → 3.14.2, clearing
   EEF-CVE-2026-32686 and EEF-CVE-2026-97853 from `mix deps.get`. Both are
   optional dependencies, so this changes nothing a user resolves.
+
+Verified on macOS, M1 Max, Metal (`GGML_METAL_NO_RESIDENCY=1`): default
+**436 passed, 194 excluded**; `--include smoke --include embeddings --include
+slow --include mtp` (Qwen3.5-0.8B-UD-Q4_K_XL, Qwen3-Embedding-0.6B-f16,
+Qwen3.6-35B-A3B-MTP-UD-Q4_K_XL) **585 passed**; CI's set, `--include smoke
+--include embeddings --include slow --include decision --include tools`
+(SmolLM2-135M, bge-small, tinylaya, tinyopenjev, Qwen3.5-0.8B) **601
+passed**; `--include embeddings` on embeddinggemma-2-Q8_0 **447 passed**;
+`--include decision_clef` on Clef Flash Q8_0 **440 passed** (4 of 4 clef);
+`--include tools` on Qwen3.5-0.8B **447 passed** on Metal and on CPU (11 of
+11 tool tests; Llama-3.2-1B-Instruct passes 10 of 11, calling the tool again
+in the round trip); `--include mtp_sidecar` on Qwen3.8-27B-Q4_K_M +
+mtp-Qwen3.8-27B-Q4_0 **442 passed, 6 skipped** (the Gemma 4 E4B pair). The
+Hex package builds from source with `LLAMA_BACKEND=cpu`. Format, credo
+`--strict` and dialyzer (0 errors) clean.
 
 ## v0.8.63
 
