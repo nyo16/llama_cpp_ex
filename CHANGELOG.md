@@ -1,5 +1,14 @@
 # Changelog
 
+## Unreleased
+
+### Changed
+
+- `:req` (optional, for `LlamaCppEx.Hub`) now also accepts `~> 0.7`, and the
+  lock moves to elixir_make 0.10.1, req 0.7.5, finch 0.24.0 and mint 1.11.0.
+  Their older releases set `xref: [exclude: ...]`, which Elixir 1.20 reports
+  as deprecated on every build (three CI annotations per run).
+
 ## v0.8.63
 
 Security fixes for special-token text in caller input (chat and decisions),
