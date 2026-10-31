@@ -4,10 +4,10 @@
 #   :smoke      — generation/chat/grammar/server paths; needs LLAMA_SMOKE_GEN_MODEL
 #   :tools      — tool calling through chat_completion/3; needs
 #                 LLAMA_SMOKE_TOOLS_MODEL, a model whose chat template supports
-#                 tools (Qwen3.5-0.8B, Llama-3.2-1B-Instruct). Its own tag
-#                 because CI's smoke model (SmolLM2-135M) has a template without
-#                 tool support. Pick a different template from the :smoke model
-#                 and the chat special-token tests cover two templates.
+#                 tools. Its own tag because the :smoke model CI uses
+#                 (SmolLM2-135M) has a template without tool support; CI pins
+#                 Qwen3.5-0.8B-UD-Q4_K_XL for this one, which also gives the
+#                 chat special-token tests a second template.
 #   :embeddings — embedding paths;                      needs LLAMA_SMOKE_EMB_MODEL
 #   :mtp        — MTP speculative decoding;             needs LLAMA_SMOKE_MTP_MODEL
 #   :mtp_sidecar — MTP with the head in a *separate* sidecar GGUF. Qwen 3.8

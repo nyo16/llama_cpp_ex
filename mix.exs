@@ -187,7 +187,13 @@ defmodule LlamaCppEx.MixProject do
 
   defp deps do
     [
-      {:elixir_make, "~> 0.8", runtime: false},
+      # 0.10.1 raises httpc's response-header limit for the NIF download. OTP
+      # 29.0.6, 28.5.0.6 and 27.3.4.17 cap headers at 10,240 bytes, and a
+      # GitHub release redirect can exceed that, which fails the download on
+      # older elixir_make. On OTP patch releases before those, httpc does not
+      # know the option and logs "Invalid option {max_header_size,65536}
+      # ignored", which is harmless.
+      {:elixir_make, "~> 0.10.1", runtime: false},
       {:fine, "~> 0.1", runtime: false},
       {:telemetry, "~> 1.0"},
       {:ecto, "~> 3.0", optional: true},

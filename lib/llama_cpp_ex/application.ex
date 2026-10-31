@@ -22,12 +22,21 @@ defmodule LlamaCppEx.Application do
 
   This is separate from `LlamaCppEx.ModelSupervisor`, which is opt-in and starts
   the `Registry`/`DynamicSupervisor` pair that the multi-model manager needs.
+
+  When `config :llama_cpp_ex, log_level: level` is set, it is applied here with
+  `LlamaCppEx.set_log_level/1`. Unset, the NIF's own default (`:info`) stands
+  and starting the application does not touch the NIF.
   """
 
   use Application
 
   @impl true
   def start(_type, _args) do
+    case Application.fetch_env(:llama_cpp_ex, :log_level) do
+      {:ok, level} -> :ok = LlamaCppEx.set_log_level(level)
+      :error -> :ok
+    end
+
     children = [
       {Registry, keys: :unique, name: LlamaCppEx.Registry}
     ]

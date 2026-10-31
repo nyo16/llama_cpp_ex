@@ -728,6 +728,17 @@ CPU build at Q8_0 (one 324-token prompt). The opt-in
 `test/decision_clef_test.exs` runs against this model
 (`LLAMA_SMOKE_DECISION_CLEF_MODEL`, tag `:decision_clef`).
 
+## Logging
+
+llama.cpp, ggml and the chat-template code write their own log lines to stderr. `LlamaCppEx.set_log_level/1` sets the lowest level printed: `:debug`, `:info` (the default: everything except llama.cpp's DEBUG lines), `:warning`, `:error` or `:none`. Set it in config to have it applied when the application starts, before any backend or model is initialized:
+
+```elixir
+# config/config.exs
+config :llama_cpp_ex, log_level: :warning
+```
+
+Installing the precompiled NIF on an OTP patch release older than 29.0.6, 28.5.0.6 or 27.3.4.17 may log `Invalid option {max_header_size,65536} ignored`. That comes from `httpc` and is harmless: elixir_make sets the option because those OTP releases and newer limit response headers to 10 KB, which GitHub's download redirects can exceed.
+
 ## Lower-level API
 
 For fine-grained control over the inference pipeline:
