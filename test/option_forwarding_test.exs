@@ -299,12 +299,30 @@ defmodule LlamaCppEx.OptionForwardingTest do
       for {label, fun} <- [
             {"stream/3", fn -> LlamaCppEx.stream(@unowned, "x", [{@unknown_key, 1}]) end},
             {"chat/3", fn -> LlamaCppEx.chat(@unowned, [], [{@unknown_key, 1}]) end},
-            {"stream_chat/3",
-             fn -> LlamaCppEx.stream_chat(@unowned, [], [{@unknown_key, 1}]) end},
-            {"chat_completion/3",
-             fn -> LlamaCppEx.chat_completion(@unowned, [], [{@unknown_key, 1}]) end}
+            {"stream_chat/3", fn -> LlamaCppEx.stream_chat(@unowned, [], [{@unknown_key, 1}]) end}
           ] do
         assert accepted_keys(fun) == base, "#{label} accepts a different key set to generate/3"
+      end
+    end
+
+    # Tool calling needs somewhere to put a call, which only the OpenAI-shaped
+    # functions have: they take generate/3's set plus the tool options, nothing more.
+    test "chat_completion/3 and stream_chat_completion/3 add exactly the tool options" do
+      base = accepted_keys(fn -> LlamaCppEx.generate(@unowned, "x", [{@unknown_key, 1}]) end)
+
+      for {label, fun} <- [
+            {"chat_completion/3",
+             fn -> LlamaCppEx.chat_completion(@unowned, [], [{@unknown_key, 1}]) end},
+            {"stream_chat_completion/3",
+             fn -> LlamaCppEx.stream_chat_completion(@unowned, [], [{@unknown_key, 1}]) end}
+          ] do
+        accepted = accepted_keys(fun)
+
+        assert Enum.sort(MapSet.difference(accepted, base)) ==
+                 [:parallel_tool_calls, :tool_choice, :tools],
+               "#{label} accepts something other than generate/3's set and the tool options"
+
+        assert MapSet.subset?(base, accepted), "#{label} rejects a key generate/3 accepts"
       end
     end
 
@@ -341,7 +359,10 @@ defmodule LlamaCppEx.OptionForwardingTest do
                  :enable_thinking,
                  :json_schema,
                  :max_tokens,
-                 :timeout
+                 :parallel_tool_calls,
+                 :timeout,
+                 :tool_choice,
+                 :tools
                ],
                "#{label} accepts something that is neither a generation nor a request option"
       end
@@ -421,15 +442,18 @@ defmodule LlamaCppEx.OptionForwardingTest do
   # this file pins one instance. These pin the invariant, so instance five fails
   # here rather than in a user's ArgumentError.
   describe "no outer gate accepts a key its inner gate rejects" do
-    # Keys the facade reads and consumes before forwarding: chat templating is
-    # split off by `split_chat_opts/1` and `:json_schema` is rewritten into
-    # `:grammar` by `resolve_grammar_opts/1`. Everything else must survive the
-    # inner gate intact.
+    # Keys the facade reads and consumes before forwarding: chat templating and
+    # tool calling are split off by `split_chat_opts/1` and `:json_schema` is
+    # rewritten into `:grammar` by `resolve_grammar_opts/1`. Everything else must
+    # survive the inner gate intact.
     @facade_consumed [
       :add_assistant,
       :chat_template_kwargs,
       :enable_thinking,
-      :json_schema
+      :json_schema,
+      :parallel_tool_calls,
+      :tool_choice,
+      :tools
     ]
 
     # Held in a function rather than a module attribute: a `fn` cannot be escaped

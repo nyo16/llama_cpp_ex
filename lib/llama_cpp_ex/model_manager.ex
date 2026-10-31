@@ -289,15 +289,16 @@ defmodule LlamaCppEx.ModelManager do
   end
 
   # A server-backed model exposes generate/stream only, so chat templating
-  # happens here before handing the rendered prompt to the server.
+  # happens here before handing the prompt tokens to the server. Tokens, not
+  # the rendered string: only the template's own text may produce special
+  # tokens (see LlamaCppEx.Chat).
   defp server_chat(pid, messages, opts) do
-    {chat_opts, gen_opts} =
-      Keyword.split(opts, [:add_assistant, :enable_thinking, :chat_template_kwargs])
+    {chat_opts, gen_opts} = Keyword.split(opts, LlamaCppEx.Chat.template_option_keys())
 
     model = LlamaCppEx.Server.get_model(pid)
 
-    with {:ok, prompt} <- LlamaCppEx.Chat.apply_template(model, messages, chat_opts) do
-      LlamaCppEx.Server.generate(pid, prompt, gen_opts)
+    with {:ok, %{tokens: tokens}} <- LlamaCppEx.Chat.prepare(model, messages, chat_opts) do
+      LlamaCppEx.Server.generate_tokens(pid, tokens, gen_opts)
     end
   end
 

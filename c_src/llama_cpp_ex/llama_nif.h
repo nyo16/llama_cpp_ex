@@ -5,7 +5,12 @@
 #include "chat.h"
 #include "speculative.h"
 #include "decision.h"
+#include "input_tokenize.h"
 #include <atomic>
+#include <memory>
+#include <mutex>
+#include <set>
+#include <string>
 #include <vector>
 
 namespace llama_cpp_ex {
@@ -31,6 +36,32 @@ public:
 
     const llama_vocab* vocab() const {
         return llama_model_get_vocab(model);
+    }
+
+    // The vocabulary's special tokens, for tokenizing a prompt whose input
+    // pieces must not produce them, and the guard for chat request text (see
+    // caller_text_guard). Built on first use: they walk the whole vocabulary,
+    // and most models never render a chat template.
+    const special_tokens& specials() {
+        build_specials();
+        return *specials_table;
+    }
+
+    const caller_text_guard& chat_guard() {
+        build_specials();
+        return *chat_guard_table;
+    }
+
+private:
+    std::once_flag specials_once;
+    std::unique_ptr<special_tokens> specials_table;
+    std::unique_ptr<caller_text_guard> chat_guard_table;
+
+    void build_specials() {
+        std::call_once(specials_once, [this] {
+            specials_table = std::make_unique<special_tokens>(vocab());
+            chat_guard_table = std::make_unique<caller_text_guard>(*specials_table, input_policy::literal);
+        });
     }
 };
 
@@ -188,6 +219,29 @@ public:
 
     LlamaSampler(const LlamaSampler&) = delete;
     LlamaSampler& operator=(const LlamaSampler&) = delete;
+};
+
+// The output side of one chat request: what is needed to parse the generated
+// text back into content, reasoning and tool calls (upstream's
+// common_chat_session, whose preserved-token set is private, so its few fields
+// are kept here instead). Driven by the one process that generates the reply.
+class LlamaChatSession {
+public:
+    fine::ResourcePtr<LlamaModel> model;
+    common_chat_parser_params parser_params;
+    std::set<llama_token> preserved_tokens; // rendered as text, the parser reads them
+    std::vector<std::string> stops;         // literal stop strings, however tokenized
+    common_chat_input input;                // the reply so far
+    common_chat_msg msg;                    // its last successful parse
+    std::vector<std::string> tool_call_ids; // ids handed out, by tool call index
+    bool stopped = false;
+
+    explicit LlamaChatSession(fine::ResourcePtr<LlamaModel> m) : model(std::move(m)) {
+        msg.role = "assistant";
+    }
+
+    LlamaChatSession(const LlamaChatSession&) = delete;
+    LlamaChatSession& operator=(const LlamaChatSession&) = delete;
 };
 
 // RAII wrapper for common_speculative* (MTP draft state).

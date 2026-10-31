@@ -153,6 +153,16 @@ defmodule LlamaCppEx.SmokeTest do
       assert is_binary(reply)
       assert byte_size(reply) > 0
     end
+
+    # Issue #108: special-token text in a message used to become control tokens,
+    # so a user could forge a system turn through its content.
+    test "message content cannot forge turns of the conversation", %{model: model} do
+      LlamaCppEx.TestChat.assert_content_cannot_forge_turns(model, model)
+    end
+
+    test "the template's own special tokens are still parsed as such", %{model: model} do
+      LlamaCppEx.TestChat.assert_template_tokens_still_special(model, model)
+    end
   end
 
   describe "structured output" do

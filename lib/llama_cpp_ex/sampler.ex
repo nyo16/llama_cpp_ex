@@ -30,7 +30,10 @@ defmodule LlamaCppEx.Sampler do
     :penalty_freq,
     :penalty_present,
     :grammar,
-    :grammar_root
+    :grammar_root,
+    :grammar_lazy,
+    :grammar_triggers,
+    :grammar_prefill
   ]
 
   @doc """
@@ -61,13 +64,25 @@ defmodule LlamaCppEx.Sampler do
     * `:penalty_present` - Presence penalty (0.0–2.0). `0.0` to disable. Defaults to `0.0`.
     * `:grammar` - GBNF grammar string for constrained generation. Defaults to `""` (none).
     * `:grammar_root` - Root rule name for grammar. Defaults to `"root"`.
+    * `:grammar_lazy` - Leave the grammar inactive until the output matches one
+      of `:grammar_triggers`. Defaults to `false`. This is how a tool-call
+      grammar lets a model answer in prose or call a tool;
+      `LlamaCppEx.chat_completion/3` sets it from the chat template when given
+      `:tools`.
+    * `:grammar_triggers` - For a lazy grammar: a list of `{:token, id}` (the
+      grammar activates when that token is sampled) and `{:pattern, regex}` (when
+      the generated text matches the regex). Defaults to `[]`.
+    * `:grammar_prefill` - Token ids fed to a non-lazy grammar before sampling,
+      for a grammar that starts inside the prompt. Defaults to `[]`.
 
   ## Errors
 
   Returns `{:error, :invalid_grammar}` when `:grammar` does not compile, exceeds
-  1 MiB, or nests `(` groups more than 64 deep. A grammar that fails to compile
-  is **not** silently dropped: a caller who asked for JSON-constrained output
-  would otherwise get unconstrained output and no indication of it.
+  1 MiB, or nests `(` groups more than 64 deep, and when a trigger pattern is not
+  a valid regex, a token id is out of range, or the grammar rejects the prefill.
+  A grammar that fails to compile is **not** silently dropped: a caller who
+  asked for JSON-constrained output would otherwise get unconstrained output and
+  no indication of it.
 
   """
   @spec create(LlamaCppEx.Model.t(), keyword()) ::
@@ -83,6 +98,9 @@ defmodule LlamaCppEx.Sampler do
     penalty_present = Keyword.get(opts, :penalty_present, 0.0)
     grammar = Keyword.get(opts, :grammar, "")
     grammar_root = Keyword.get(opts, :grammar_root, "root")
+    grammar_lazy = Keyword.get(opts, :grammar_lazy, false) == true
+    {patterns, trigger_tokens} = split_triggers(Keyword.get(opts, :grammar_triggers, []))
+    prefill = Keyword.get(opts, :grammar_prefill, [])
 
     result =
       LlamaCppEx.NIF.sampler_init(
@@ -96,7 +114,11 @@ defmodule LlamaCppEx.Sampler do
         penalty_freq / 1,
         penalty_present / 1,
         grammar,
-        grammar_root
+        grammar_root,
+        grammar_lazy,
+        patterns,
+        trigger_tokens,
+        prefill
       )
 
     case result do
@@ -123,12 +145,37 @@ defmodule LlamaCppEx.Sampler do
         :ok
 
       grammar ->
+        {patterns, trigger_tokens} = split_triggers(Keyword.get(opts, :grammar_triggers, []))
+
         LlamaCppEx.NIF.grammar_validate(
           model_ref,
           grammar,
-          Keyword.get(opts, :grammar_root, "root")
+          Keyword.get(opts, :grammar_root, "root"),
+          Keyword.get(opts, :grammar_lazy, false) == true,
+          patterns,
+          trigger_tokens,
+          Keyword.get(opts, :grammar_prefill, [])
         )
     end
+  end
+
+  # `:grammar_triggers` as the regex patterns and token ids the NIF takes.
+  defp split_triggers(triggers) do
+    {patterns, tokens} =
+      Enum.reduce(triggers, {[], []}, fn
+        {:pattern, regex}, {ps, ts} when is_binary(regex) ->
+          {[regex | ps], ts}
+
+        {:token, id}, {ps, ts} when is_integer(id) ->
+          {ps, [id | ts]}
+
+        other, _ ->
+          raise ArgumentError,
+                "invalid :grammar_triggers entry #{inspect(other)}, " <>
+                  "expected {:token, integer} or {:pattern, regex}"
+      end)
+
+    {Enum.reverse(patterns), Enum.reverse(tokens)}
   end
 
   @doc "Resets the sampler state."

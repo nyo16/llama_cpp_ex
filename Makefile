@@ -359,8 +359,11 @@ NPROC := $(shell nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 4)
 
 # Sources. decision.cpp is the port of upstream's server-decision code, kept in
 # its own translation unit so it can be diffed against upstream on a bump.
-NIF_SRCS = c_src/llama_cpp_ex/llama_nif.cpp c_src/llama_cpp_ex/decision.cpp
-NIF_HDRS = c_src/llama_cpp_ex/llama_nif.h c_src/llama_cpp_ex/decision.h
+# input_tokenize.cpp is shared by the chat and decision paths.
+NIF_SRCS = c_src/llama_cpp_ex/llama_nif.cpp c_src/llama_cpp_ex/decision.cpp \
+	c_src/llama_cpp_ex/input_tokenize.cpp
+NIF_HDRS = c_src/llama_cpp_ex/llama_nif.h c_src/llama_cpp_ex/decision.h \
+	c_src/llama_cpp_ex/input_tokenize.h
 NIF_OBJ = $(patsubst c_src/llama_cpp_ex/%.cpp,$(BUILD)/%.o,$(NIF_SRCS))
 
 # Everything downstream depends on the build *configuration*, not only on file

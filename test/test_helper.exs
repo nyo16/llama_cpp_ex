@@ -2,6 +2,12 @@
 # behind a set of opt-in tags. Each tag names the model it needs:
 #
 #   :smoke      — generation/chat/grammar/server paths; needs LLAMA_SMOKE_GEN_MODEL
+#   :tools      — tool calling through chat_completion/3; needs
+#                 LLAMA_SMOKE_TOOLS_MODEL, a model whose chat template supports
+#                 tools (Qwen3.5-0.8B, Llama-3.2-1B-Instruct). Its own tag
+#                 because CI's smoke model (SmolLM2-135M) has a template without
+#                 tool support. Pick a different template from the :smoke model
+#                 and the chat special-token tests cover two templates.
 #   :embeddings — embedding paths;                      needs LLAMA_SMOKE_EMB_MODEL
 #   :mtp        — MTP speculative decoding;             needs LLAMA_SMOKE_MTP_MODEL
 #   :mtp_sidecar — MTP with the head in a *separate* sidecar GGUF. Qwen 3.8
@@ -96,6 +102,10 @@
 #   LLAMA_SMOKE_DECISION_CLEF_MODEL=/path/to/Cloudflare_clef-flash-Q8_0.gguf \
 #     mix test --include decision_clef
 #
+#   GGML_METAL_NO_RESIDENCY=1 \
+#   LLAMA_SMOKE_TOOLS_MODEL=/path/to/Qwen3.5-0.8B-UD-Q4_K_XL.gguf \
+#     mix test --include tools
+#
 # `GGML_METAL_NO_RESIDENCY=1` is only needed on Metal, and only to keep the VM
 # from aborting *after* the suite has passed:
 #
@@ -116,6 +126,7 @@
 # — production keeps the upstream default.
 Code.require_file("support/test_models.exs", __DIR__)
 Code.require_file("support/test_slots.exs", __DIR__)
+Code.require_file("support/test_chat.exs", __DIR__)
 
 # `:rpc_live` needs a reachable worker, so it is excluded here to keep the
 # default run quiet, and rpc_test.exs additionally carries a compile-time `skip:`
@@ -124,6 +135,7 @@ Code.require_file("support/test_slots.exs", __DIR__)
 ExUnit.start(
   exclude: [
     :smoke,
+    :tools,
     :embeddings,
     :slow,
     :mtp,

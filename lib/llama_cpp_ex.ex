@@ -51,14 +51,18 @@ defmodule LlamaCppEx do
   # lists here; three copies had already drifted apart.
 
   # Chat-templating options split off before the rest flows to generation. Owned
-  # by LlamaCppEx.Chat (apply_template/3 reads all three).
+  # by LlamaCppEx.Chat.
   #
   # `:template` used to be here and documented on chat/3 and chat_completion/3 as
-  # "Custom chat template string", but nothing ever read it: apply_template/3
-  # goes through chat_apply_template_jinja, which takes the model and uses its
-  # embedded template. An accepted-and-ignored option is worse than no option, so
-  # it is gone and a caller passing it now gets an unknown-option error.
-  @chat_opt_keys [:add_assistant, :enable_thinking, :chat_template_kwargs]
+  # "Custom chat template string", but nothing ever read it: the chat functions
+  # take the model and use its embedded template. An accepted-and-ignored option
+  # is worse than no option, so it is gone and a caller passing it now gets an
+  # unknown-option error.
+  @chat_opt_keys Chat.template_option_keys()
+
+  # Tool calling, accepted by chat_completion/3 and stream_chat_completion/3
+  # only: chat/3 returns text, which has nowhere to put a tool call.
+  @tool_opt_keys Chat.tool_option_keys()
 
   # Options this module reads itself, as opposed to forwarding.
   @own_opt_keys [:max_tokens, :n_ctx, :timeout, :grammar, :json_schema]
@@ -73,6 +77,8 @@ defmodule LlamaCppEx do
                     Context.tuning_option_keys()
                 )
 
+  @completion_opt_keys @gen_opt_keys ++ @tool_opt_keys
+
   # Server-routed calls accept what the *server* accepts, plus this module's own
   # chat-templating and schema options. Assembling from @gen_opt_keys instead
   # dragged in `:n_ctx` and all 20 `Context.tuning_option_keys()`: 21 keys that
@@ -86,8 +92,11 @@ defmodule LlamaCppEx do
   # anything is forwarded, so the server never sees the key.
   @server_opt_keys Enum.uniq(
                      [:max_tokens, :timeout, :json_schema] ++
-                       @chat_opt_keys ++ Server.request_option_keys()
+                       @chat_opt_keys ++ @tool_opt_keys ++ Server.request_option_keys()
                    )
+
+  # Sampler options a tool-call grammar sets; a caller's own would conflict.
+  @grammar_opt_keys [:grammar, :json_schema, :grammar_lazy, :grammar_triggers, :grammar_prefill]
 
   @doc """
   Initializes the llama.cpp backend. Call once at application start.
@@ -193,18 +202,27 @@ defmodule LlamaCppEx do
       to a GBNF grammar. Cannot be used together with `:grammar`. Tip: set
       `"additionalProperties" => false` for tighter grammars.
 
+  ## Errors
+
+  Returns `{:error, {:invalid_json_schema, message}}` when llama.cpp cannot
+  convert `:json_schema` to a grammar (an unresolvable `$ref`, say), with the
+  converter's message. Passing both `:grammar` and `:json_schema` raises
+  `ArgumentError`.
+
   """
   @spec generate(Model.t(), String.t(), keyword()) ::
           {:ok, String.t()} | {:error, term()}
   def generate(%Model{} = model, prompt, opts \\ []) when is_binary(prompt) do
-    cfg =
-      opts
-      |> Options.validate!(@gen_opt_keys, "LlamaCppEx.generate/3")
-      |> resolve_grammar_opts()
-      |> gen_config(:blocking)
+    opts = Options.validate!(opts, @gen_opt_keys, "LlamaCppEx.generate/3")
 
-    with {:ok, tokens} <- Tokenizer.encode(model, prompt),
-         {:ok, ctx, sampler} <- create_gen_resources(model, tokens, cfg) do
+    with {:ok, opts} <- resolve_grammar_opts(opts),
+         {:ok, tokens} <- Tokenizer.encode(model, prompt) do
+      generate_from_tokens(model, tokens, gen_config(opts, :blocking))
+    end
+  end
+
+  defp generate_from_tokens(model, tokens, cfg) do
+    with {:ok, ctx, sampler} <- create_gen_resources(model, tokens, cfg) do
       Context.generate(ctx, sampler, tokens, max_tokens: cfg.max_tokens)
     end
   end
@@ -226,6 +244,10 @@ defmodule LlamaCppEx do
   Elements are otherwise always strings, so `Enum.join/1` on a stream that may
   fail is unsafe — match on the element shape if you care.
 
+  A `:json_schema` that cannot be converted is reported the same way, before
+  anything is generated: the stream's only element is
+  `{:error, {:invalid_json_schema, message}}`.
+
   ## Examples
 
       model
@@ -235,12 +257,20 @@ defmodule LlamaCppEx do
   """
   @spec stream(Model.t(), String.t(), keyword()) :: Enumerable.t()
   def stream(%Model{} = model, prompt, opts \\ []) when is_binary(prompt) do
-    cfg =
-      opts
-      |> Options.validate!(@gen_opt_keys, "LlamaCppEx.stream/3")
-      |> resolve_grammar_opts()
-      |> gen_config(:stream)
+    opts = Options.validate!(opts, @gen_opt_keys, "LlamaCppEx.stream/3")
 
+    case resolve_grammar_opts(opts) do
+      {:ok, opts} ->
+        token_stream(model, fn -> Tokenizer.encode(model, prompt) end, gen_config(opts, :stream))
+
+      {:error, reason} ->
+        [{:error, reason}]
+    end
+  end
+
+  # The text stream behind stream/3 and stream_chat/3. `fetch_tokens` runs in
+  # the start function, so tokenizing a long prompt waits for the first pull.
+  defp token_stream(model, fetch_tokens, cfg) do
     Stream.resource(
       fn ->
         # Start: tokenize, create context+sampler, spawn generator. Failures
@@ -248,7 +278,7 @@ defmodule LlamaCppEx do
         # inside the first Enum.take — Stream.resource start functions run
         # lazily, so a hard match would blow up in the consumer's face at a
         # point unrelated to the call that configured it.
-        with {:ok, tokens} <- Tokenizer.encode(model, prompt),
+        with {:ok, tokens} <- fetch_tokens.(),
              {:ok, ctx, sampler} <- create_gen_resources(model, tokens, cfg) do
           {ref, gen_pid, cancel} = spawn_generator(ctx, sampler, tokens, cfg.max_tokens)
           {ref, gen_pid, cancel, cfg.timeout, _utf8_pending = ""}
@@ -312,7 +342,19 @@ defmodule LlamaCppEx do
     }
   end
 
-  defp split_chat_opts(opts), do: Keyword.split(opts, @chat_opt_keys)
+  defp split_chat_opts(opts), do: Keyword.split(opts, @chat_opt_keys ++ @tool_opt_keys)
+
+  # A tool-call grammar comes from the chat template; a caller's own grammar
+  # would replace it, so the two together are a programmer error, as in
+  # llama-server ("Cannot use custom grammar constraints with tools").
+  defp check_tool_grammar!(chat_opts, gen_opts) do
+    if Chat.tool_grammar?(chat_opts) and
+         Enum.any?(@grammar_opt_keys, &Keyword.has_key?(gen_opts, &1)) do
+      raise ArgumentError,
+            "cannot use :grammar or :json_schema together with :tools; the chat template " <>
+              "supplies the tool-call grammar (pass tool_choice: :none to use your own)"
+    end
+  end
 
   # Creates a context sized to fit prompt + generation, plus its sampler.
   defp create_gen_resources(model, tokens, cfg) do
@@ -366,6 +408,10 @@ defmodule LlamaCppEx do
   `LlamaCppEx.Chat.apply_template/3` (`:add_assistant`, `:enable_thinking`,
   `:chat_template_kwargs`).
 
+  Special-token text in message content (`<|im_start|>`, `[INST]`, ...) is
+  tokenized as text, so a message cannot forge a turn of the conversation; see
+  `LlamaCppEx.Chat`.
+
   ## Examples
 
       {:ok, reply} = LlamaCppEx.chat(model, [
@@ -379,11 +425,11 @@ defmodule LlamaCppEx do
     {chat_opts, gen_opts} =
       opts
       |> Options.validate!(@gen_opt_keys, "LlamaCppEx.chat/3")
-      |> resolve_grammar_opts()
       |> split_chat_opts()
 
-    with {:ok, prompt} <- Chat.apply_template(model, messages, chat_opts) do
-      generate(model, prompt, gen_opts)
+    with {:ok, gen_opts} <- resolve_grammar_opts(gen_opts),
+         {:ok, %{tokens: tokens}} <- Chat.prepare(model, messages, chat_opts) do
+      generate_from_tokens(model, tokens, gen_config(gen_opts, :blocking))
     end
   end
 
@@ -400,11 +446,12 @@ defmodule LlamaCppEx do
     {chat_opts, gen_opts} =
       opts
       |> Options.validate!(@gen_opt_keys, "LlamaCppEx.stream_chat/3")
-      |> resolve_grammar_opts()
       |> split_chat_opts()
 
-    case Chat.apply_template(model, messages, chat_opts) do
-      {:ok, prompt} -> stream(model, prompt, gen_opts)
+    with {:ok, gen_opts} <- resolve_grammar_opts(gen_opts),
+         {:ok, %{tokens: tokens}} <- Chat.prepare(model, messages, chat_opts) do
+      token_stream(model, fn -> {:ok, tokens} end, gen_config(gen_opts, :stream))
+    else
       {:error, reason} -> [{:error, reason}]
     end
   end
@@ -419,7 +466,29 @@ defmodule LlamaCppEx do
 
   Accepts all options from `generate/3` plus the chat-templating options from
   `LlamaCppEx.Chat.apply_template/3` (`:add_assistant`, `:enable_thinking`,
-  `:chat_template_kwargs`).
+  `:chat_template_kwargs`), and:
+
+    * `:tools` - Tools the model may call, in the OpenAI shape:
+      `[%{type: "function", function: %{name: "get_weather", description: "...",
+      parameters: json_schema}}]`. The model's chat template renders them and
+      supplies the grammar and parser for its tool-call format; a template
+      without tool support returns `{:error, reason}` saying so.
+    * `:tool_choice` - `:auto` (default: the model decides), `:none` (the
+      tools are left out of the prompt, so the reply is text), `:required` (the
+      grammar does not let the reply end without a call; the model may write
+      text before it), or `%{type: "function", function: %{name: name}}` to
+      offer only that tool and require a call to it.
+    * `:parallel_tool_calls` - Allow several calls in one reply. Defaults to
+      `false`.
+
+  With tools, a reply that calls one has `finish_reason: "tool_calls"` and its
+  message carries `tool_calls: [%{id: "call_…", type: "function", function:
+  %{name: name, arguments: json_text}}]`, with `content: nil` when the model
+  wrote nothing else. Answer each call with a message `%{role: "tool",
+  tool_call_id: id, content: result}`, after the assistant message that made
+  it, and call again. `reasoning_content` is split out by the template's own
+  parser, whatever `:enable_thinking` says. `:grammar` and `:json_schema`
+  cannot be combined with tools (`ArgumentError`) unless `tool_choice: :none`.
 
   ## Examples
 
@@ -432,7 +501,10 @@ defmodule LlamaCppEx do
   ## Errors
 
   Returns `{:error, reason}` when templating, tokenization, or generation fails,
-  and `{:error, :timeout}` when generation does not complete within `:timeout`.
+  `{:error, :timeout}` when generation does not complete within `:timeout`,
+  `{:error, {:invalid_json_schema, message}}` when `:json_schema` cannot be
+  converted to a grammar, and `{:error, {:chat_parse_failed, message}}` when a
+  reply does not parse in the template's tool-call format.
 
   > #### Breaking change in 0.8.40 {: .warning}
   >
@@ -456,31 +528,32 @@ defmodule LlamaCppEx do
   def chat_completion(%Model{} = model, messages, opts) when is_list(messages) do
     {chat_opts, gen_opts} =
       opts
-      |> Options.validate!(@gen_opt_keys, "LlamaCppEx.chat_completion/3")
-      |> resolve_grammar_opts()
+      |> Options.validate!(@completion_opt_keys, "LlamaCppEx.chat_completion/3")
       |> split_chat_opts()
 
-    cfg = gen_config(gen_opts, :blocking)
+    check_tool_grammar!(chat_opts, gen_opts)
 
-    with {:ok, prompt} <- Chat.apply_template(model, messages, chat_opts),
-         {:ok, prompt_tokens} <- Tokenizer.encode(model, prompt),
-         {:ok, ctx, sampler} <- create_gen_resources(model, prompt_tokens, cfg) do
-      {ref, gen_pid, cancel} = spawn_generator(ctx, sampler, prompt_tokens, cfg.max_tokens)
-      outcome = collect_completion_tokens(ref, cfg.timeout)
+    with {:ok, gen_opts} <- resolve_grammar_opts(gen_opts),
+         {:ok, prep} <- Chat.prepare(model, messages, chat_opts),
+         cfg = gen_config(gen_opts ++ prep.sampler_opts, :blocking),
+         {:ok, ctx, sampler} <- create_gen_resources(model, prep.tokens, cfg) do
+      {ref, gen_pid, cancel} = spawn_generator(ctx, sampler, prep.tokens, cfg.max_tokens)
+      outcome = collect_completion_tokens(ref, cfg.timeout, prep.session)
 
       # Always tear the generator down: on timeout it is still running, and its
-      # stragglers would otherwise pollute the caller's mailbox.
+      # stragglers would otherwise pollute the caller's mailbox. It is also how a
+      # reply that reached a stop string ends early.
       stop_generator(ref, gen_pid, cancel)
 
-      with {:ok, texts, finish_reason, completion_tokens} <- outcome do
+      with {:ok, reply} <- outcome,
+           {:ok, message, finish} <- completion_message(reply, prep.session, chat_opts) do
         {:ok,
          build_chat_completion(
            Model.desc(model),
-           length(prompt_tokens),
-           Enum.join(texts),
-           finish_reason,
-           completion_tokens,
-           chat_opts
+           length(prep.tokens),
+           message,
+           finish,
+           reply.count
          )}
       end
     end
@@ -490,59 +563,93 @@ defmodule LlamaCppEx do
     {chat_opts, gen_opts} =
       opts
       |> Options.validate!(@server_opt_keys, "LlamaCppEx.chat_completion/3")
-      |> resolve_grammar_opts()
       |> split_chat_opts()
 
-    with {:ok, model} <- Server.fetch_model(server),
-         {:ok, prompt} <- Chat.apply_template(model, messages, chat_opts),
-         {:ok, prompt_tokens} <- Tokenizer.encode(model, prompt),
-         {:ok, result} <- Server.complete_tokens(server, prompt_tokens, gen_opts) do
+    check_tool_grammar!(chat_opts, gen_opts)
+
+    with {:ok, gen_opts} <- resolve_grammar_opts(gen_opts),
+         {:ok, model} <- Server.fetch_model(server),
+         {:ok, prep} <- Chat.prepare(model, messages, chat_opts),
+         {:ok, result} <-
+           Server.complete_tokens(server, prep.tokens, gen_opts ++ prep.sampler_opts),
+         reply = %{
+           texts: [result.text],
+           finish: finish_reason(result.finish_reason),
+           count: result.completion_tokens
+         },
+         reply = feed_session(prep.session, result.token_ids, reply),
+         {:ok, message, finish} <- completion_message(reply, prep.session, chat_opts) do
       {:ok,
-       build_chat_completion(
-         Model.desc(model),
-         length(prompt_tokens),
-         result.text,
-         finish_reason(result.finish_reason),
-         result.completion_tokens,
-         chat_opts
-       )}
+       build_chat_completion(Model.desc(model), length(prep.tokens), message, finish, reply.count)}
     end
   end
 
-  defp build_chat_completion(
-         model_desc,
-         prompt_tokens,
-         raw_text,
-         finish_reason,
-         completion_tokens,
-         chat_opts
-       ) do
-    enable_thinking = Keyword.get(chat_opts, :enable_thinking, false)
+  # The server generates without knowing the template's stop strings; the
+  # session finds them in the finished reply and cuts it there.
+  defp feed_session(nil, _token_ids, reply), do: reply
+
+  defp feed_session(session, token_ids, reply) do
+    case Chat.append(session, token_ids) do
+      :ok -> reply
+      :stop -> %{reply | finish: "stop"}
+    end
+  end
+
+  # The assistant message of a finished reply. Without tools it is the raw text,
+  # with `<think>` split out when `:enable_thinking` is set; with tools, the
+  # template's parser splits content, reasoning and tool calls.
+  defp completion_message(reply, nil, chat_opts) do
+    raw_text = Enum.join(reply.texts)
 
     {reasoning_content, content} =
-      if enable_thinking do
+      if Keyword.get(chat_opts, :enable_thinking, false) do
         {rc, c} = Thinking.parse(raw_text)
         {if(rc == "", do: nil, else: rc), c}
       else
         {nil, raw_text}
       end
 
+    {:ok, %{role: "assistant", content: content, reasoning_content: reasoning_content},
+     reply.finish}
+  end
+
+  defp completion_message(reply, session, _chat_opts) do
+    with {:ok, _diffs, parsed} <- Chat.parse(session, true) do
+      {:ok, tool_message(parsed), tool_finish_reason(reply.finish, parsed)}
+    end
+  end
+
+  defp tool_message(%{tool_calls: []} = parsed) do
+    %{
+      role: "assistant",
+      content: parsed.content,
+      reasoning_content: nil_if_empty(parsed.reasoning_content)
+    }
+  end
+
+  defp tool_message(parsed) do
+    %{
+      role: "assistant",
+      content: nil_if_empty(parsed.content),
+      reasoning_content: nil_if_empty(parsed.reasoning_content),
+      tool_calls: parsed.tool_calls
+    }
+  end
+
+  # OpenAI: a reply that ended by calling tools finishes with "tool_calls".
+  defp tool_finish_reason("stop", %{tool_calls: [_ | _]}), do: "tool_calls"
+  defp tool_finish_reason(finish, _parsed), do: finish
+
+  defp nil_if_empty(""), do: nil
+  defp nil_if_empty(text), do: text
+
+  defp build_chat_completion(model_desc, prompt_tokens, message, finish_reason, completion_tokens) do
     %ChatCompletion{
       id: "chatcmpl-" <> random_hex(12),
       object: "chat.completion",
       created: System.os_time(:second),
       model: model_desc,
-      choices: [
-        %{
-          index: 0,
-          message: %{
-            role: "assistant",
-            content: content,
-            reasoning_content: reasoning_content
-          },
-          finish_reason: finish_reason
-        }
-      ],
+      choices: [%{index: 0, message: message, finish_reason: finish_reason}],
       usage: %{
         prompt_tokens: prompt_tokens,
         completion_tokens: completion_tokens,
@@ -560,6 +667,14 @@ defmodule LlamaCppEx do
 
   All chunks share the same `id` and `created` timestamp.
 
+  With `:tools`, deltas come from the template's parser instead: `%{content: _}`,
+  `%{reasoning_content: _}`, and `%{tool_calls: [%{index: i, id: id, type:
+  "function", function: %{name: name, arguments: ""}}]}` when a call starts,
+  then `%{tool_calls: [%{index: i, function: %{arguments: fragment}}]}` as its
+  arguments arrive, as OpenAI streams them. A reply that called a tool ends with
+  `finish_reason: "tool_calls"`. Concatenating a call's argument fragments gives
+  the `arguments` `chat_completion/3` returns.
+
   ## Options
 
   Accepts same options as `chat_completion/3`. `:timeout` bounds the wait for the
@@ -572,7 +687,8 @@ defmodule LlamaCppEx do
 
   A failure is emitted as a final `{:error, reason}` element, and a chunk timeout
   as `{:error, :timeout}`, rather than truncating the stream silently. Every other
-  element is a `%ChatCompletionChunk{}`.
+  element is a `%ChatCompletionChunk{}`. A `:json_schema` that cannot be
+  converted makes `{:error, {:invalid_json_schema, message}}` the only element.
 
   ## Examples
 
@@ -594,20 +710,42 @@ defmodule LlamaCppEx do
   def stream_chat_completion(%Model{} = model, messages, opts) when is_list(messages) do
     {chat_opts, gen_opts} =
       opts
-      |> Options.validate!(@gen_opt_keys, "LlamaCppEx.stream_chat_completion/3")
-      |> resolve_grammar_opts()
+      |> Options.validate!(@completion_opt_keys, "LlamaCppEx.stream_chat_completion/3")
       |> split_chat_opts()
 
-    cfg = gen_config(gen_opts, :stream)
+    check_tool_grammar!(chat_opts, gen_opts)
 
+    case resolve_grammar_opts(gen_opts) do
+      {:ok, gen_opts} -> model_chat_chunk_stream(model, messages, chat_opts, gen_opts)
+      {:error, reason} -> [{:error, reason}]
+    end
+  end
+
+  # Server-routed streaming: templating/tokenization in the caller, tokens
+  # served by the batching server with prefix caching.
+  def stream_chat_completion(server, messages, opts) when is_list(messages) do
+    {chat_opts, gen_opts} =
+      opts
+      |> Options.validate!(@server_opt_keys, "LlamaCppEx.stream_chat_completion/3")
+      |> split_chat_opts()
+
+    check_tool_grammar!(chat_opts, gen_opts)
+
+    case resolve_grammar_opts(gen_opts) do
+      {:ok, gen_opts} -> server_chat_chunk_stream(server, messages, chat_opts, gen_opts)
+      {:error, reason} -> [{:error, reason}]
+    end
+  end
+
+  defp model_chat_chunk_stream(model, messages, chat_opts, gen_opts) do
     Stream.resource(
       fn ->
-        with {:ok, prompt} <- Chat.apply_template(model, messages, chat_opts),
-             {:ok, tokens} <- Tokenizer.encode(model, prompt),
-             {:ok, ctx, sampler} <- create_gen_resources(model, tokens, cfg) do
-          {ref, gen_pid, cancel} = spawn_generator(ctx, sampler, tokens, cfg.max_tokens)
+        with {:ok, prep} <- Chat.prepare(model, messages, chat_opts),
+             cfg = gen_config(gen_opts ++ prep.sampler_opts, :stream),
+             {:ok, ctx, sampler} <- create_gen_resources(model, prep.tokens, cfg) do
+          {ref, gen_pid, cancel} = spawn_generator(ctx, sampler, prep.tokens, cfg.max_tokens)
 
-          chat_chunk_state(ref, cfg.timeout, Model.desc(model), chat_opts)
+          chat_chunk_state(ref, cfg.timeout, Model.desc(model), chat_opts, prep.session)
           |> Map.put(:gen_pid, gen_pid)
           |> Map.put(:cancel, cancel)
         else
@@ -623,6 +761,9 @@ defmodule LlamaCppEx do
 
         %{phase: :streaming, ref: ref, timeout: timeout} = state ->
           receive do
+            {^ref, {:token, id, _text}} when state.session != nil ->
+              session_token_chunks(state, id)
+
             {^ref, {:token, _id, text}} ->
               # Whole codepoints only — the thinking parser and consumers
               # must never see a split multibyte sequence.
@@ -631,8 +772,7 @@ defmodule LlamaCppEx do
               if out == "", do: {[], state}, else: token_chunks(state, out)
 
             {^ref, outcome} when outcome in [:eog, :done] ->
-              {tail, state} = flush_pending_chunks(state)
-              {tail ++ [chunk(state, %{}, finish_reason(outcome))], %{state | phase: :done}}
+              finish_chunks(state, finish_reason(outcome))
 
             {^ref, {:error, reason}} ->
               halt_with_error(state, reason)
@@ -657,29 +797,11 @@ defmodule LlamaCppEx do
     )
   end
 
-  # Server-routed streaming: templating/tokenization in the caller, tokens
-  # served by the batching server with prefix caching.
-  def stream_chat_completion(server, messages, opts) when is_list(messages) do
-    {chat_opts, gen_opts} =
-      opts
-      |> Options.validate!(@server_opt_keys, "LlamaCppEx.stream_chat_completion/3")
-      |> resolve_grammar_opts()
-      |> split_chat_opts()
-
+  defp server_chat_chunk_stream(server, messages, chat_opts, gen_opts) do
     timeout = Options.timeout(gen_opts, :stream)
 
     Stream.resource(
-      fn ->
-        with {:ok, model} <- Server.fetch_model(server),
-             {:ok, prompt} <- Chat.apply_template(model, messages, chat_opts),
-             {:ok, tokens} <- Tokenizer.encode(model, prompt),
-             ref = make_ref(),
-             :ok <- Server.subscribe_stream_tokens(server, tokens, ref, gen_opts) do
-          chat_chunk_state(ref, timeout, Model.desc(model), chat_opts)
-        else
-          {:error, reason} -> %{phase: :setup_failed, reason: reason}
-        end
-      end,
+      fn -> start_server_chat_stream(server, messages, chat_opts, gen_opts, timeout) end,
       fn
         %{phase: :setup_failed, reason: reason} = state ->
           {[{:error, reason}], %{state | phase: :done}}
@@ -689,11 +811,14 @@ defmodule LlamaCppEx do
 
         %{phase: :streaming, ref: ref, timeout: timeout} = state ->
           receive do
+            {^ref, {:token_id, id}} ->
+              session_token_chunks(state, id)
+
             {^ref, {:token, text}} ->
               token_chunks(state, text)
 
             {^ref, {:done, reason}} ->
-              {[chunk(state, %{}, finish_reason(reason))], %{state | phase: :done}}
+              finish_chunks(state, finish_reason(reason))
 
             {^ref, {:error, reason}} ->
               halt_with_error(state, reason)
@@ -721,6 +846,73 @@ defmodule LlamaCppEx do
     )
   end
 
+  defp start_server_chat_stream(server, messages, chat_opts, gen_opts, timeout) do
+    with {:ok, model} <- Server.fetch_model(server),
+         {:ok, prep} <- Chat.prepare(model, messages, chat_opts),
+         ref = make_ref(),
+         # A tool-call reply is rendered and parsed here, from token ids.
+         ids = if(prep.session, do: [token_ids: true], else: []),
+         :ok <-
+           Server.subscribe_stream_tokens(
+             server,
+             prep.tokens,
+             ref,
+             gen_opts ++ prep.sampler_opts ++ ids
+           ) do
+      chat_chunk_state(ref, timeout, Model.desc(model), chat_opts, prep.session)
+    else
+      {:error, reason} -> %{phase: :setup_failed, reason: reason}
+    end
+  end
+
+  # One generated token of a tool-calling reply: feed it to the session, emit
+  # what the partial parse adds. Reaching a stop string ends the reply; the
+  # generation behind it is still running, hence `aborted?`.
+  defp session_token_chunks(state, id) do
+    case Chat.append(state.session, [id]) do
+      :ok ->
+        case Chat.parse(state.session, false) do
+          {:ok, diffs, nil} -> {Enum.map(diffs, &diff_chunk(state, &1)), state}
+          {:error, reason} -> halt_with_error(state, reason)
+        end
+
+      :stop ->
+        finish_chunks(%{state | aborted?: true}, "stop")
+    end
+  end
+
+  # The end of a reply: the last of the text, then the finish chunk.
+  defp finish_chunks(%{session: nil} = state, finish) do
+    {tail, state} = flush_pending_chunks(state)
+    {tail ++ [chunk(state, %{}, finish)], %{state | phase: :done}}
+  end
+
+  defp finish_chunks(state, finish) do
+    case Chat.parse(state.session, true) do
+      {:ok, diffs, parsed} ->
+        chunks = Enum.map(diffs, &diff_chunk(state, &1))
+
+        {chunks ++ [chunk(state, %{}, tool_finish_reason(finish, parsed))],
+         %{state | phase: :done}}
+
+      {:error, reason} ->
+        halt_with_error(state, reason)
+    end
+  end
+
+  defp diff_chunk(state, {:content, text}), do: chunk(state, %{content: text}, nil)
+
+  defp diff_chunk(state, {:reasoning_content, text}),
+    do: chunk(state, %{reasoning_content: text}, nil)
+
+  # OpenAI sends a call's id, type and name once, in its first delta.
+  defp diff_chunk(state, {:tool_call, tc}) do
+    function = if tc.name == "", do: %{}, else: %{name: tc.name}
+    call = %{index: tc.index, function: Map.put(function, :arguments, tc.arguments)}
+    call = if tc.id == "", do: call, else: Map.merge(call, %{id: tc.id, type: "function"})
+    chunk(state, %{tool_calls: [call]}, nil)
+  end
+
   # Emits any held-back text, then the error, then halts. Shared by both
   # streaming clauses so the two cannot drift apart again.
   #
@@ -739,8 +931,8 @@ defmodule LlamaCppEx do
   end
 
   # Shared per-stream state for the chat-completion chunk builders.
-  defp chat_chunk_state(ref, timeout, model_desc, chat_opts) do
-    enable_thinking = Keyword.get(chat_opts, :enable_thinking, false)
+  defp chat_chunk_state(ref, timeout, model_desc, chat_opts, session) do
+    enable_thinking = session == nil and Keyword.get(chat_opts, :enable_thinking, false)
 
     %{
       ref: ref,
@@ -751,6 +943,7 @@ defmodule LlamaCppEx do
       phase: :first,
       aborted?: false,
       utf8_pending: "",
+      session: session,
       enable_thinking: enable_thinking,
       thinking_parser: if(enable_thinking, do: Thinking.stream_parser(thinking: true), else: nil)
     }
@@ -789,19 +982,29 @@ defmodule LlamaCppEx do
   # as finish_reason "stop"/"length" inside {:ok, %ChatCompletion{}} meant a
   # caller matching only {:ok, _} silently consumed truncated or empty output,
   # and made this function's error branch unreachable.
-  @spec collect_completion_tokens(reference(), timeout()) ::
-          {:ok, [String.t()], String.t(), non_neg_integer()} | {:error, term()}
-  defp collect_completion_tokens(ref, timeout) do
-    collect_completion_tokens(ref, timeout, [], 0)
+  #
+  # With a chat session, each token also goes to it, and the reply ends early
+  # at one of the template's stop strings.
+  @spec collect_completion_tokens(reference(), timeout(), reference() | nil) ::
+          {:ok, %{texts: [String.t()], finish: String.t(), count: non_neg_integer()}}
+          | {:error, term()}
+  defp collect_completion_tokens(ref, timeout, session) do
+    collect_completion_tokens(ref, timeout, session, [], 0)
   end
 
-  defp collect_completion_tokens(ref, timeout, texts, count) do
+  defp collect_completion_tokens(ref, timeout, session, texts, count) do
     receive do
-      {^ref, {:token, _id, text}} ->
-        collect_completion_tokens(ref, timeout, [text | texts], count + 1)
+      {^ref, {:token, id, text}} ->
+        texts = [text | texts]
+
+        if session != nil and Chat.append(session, [id]) == :stop do
+          {:ok, %{texts: Enum.reverse(texts), finish: "stop", count: count + 1}}
+        else
+          collect_completion_tokens(ref, timeout, session, texts, count + 1)
+        end
 
       {^ref, outcome} when outcome in [:eog, :done] ->
-        {:ok, Enum.reverse(texts), finish_reason(outcome), count}
+        {:ok, %{texts: Enum.reverse(texts), finish: finish_reason(outcome), count: count}}
 
       {^ref, {:error, reason}} ->
         {:error, reason}
@@ -814,6 +1017,9 @@ defmodule LlamaCppEx do
     :crypto.strong_rand_bytes(n) |> Base.encode16(case: :lower)
   end
 
+  # Turns `:json_schema` into `:grammar`. A schema is data, often from user
+  # config, so one llama.cpp cannot convert is an error tuple rather than a
+  # raise; passing both options is a programmer error and still raises.
   defp resolve_grammar_opts(opts) do
     grammar = Keyword.get(opts, :grammar)
     json_schema = Keyword.get(opts, :json_schema)
@@ -823,11 +1029,16 @@ defmodule LlamaCppEx do
         raise ArgumentError, "cannot use both :grammar and :json_schema options"
 
       json_schema ->
-        gbnf = Grammar.from_json_schema!(json_schema)
-        opts |> Keyword.delete(:json_schema) |> Keyword.put(:grammar, gbnf)
+        case Grammar.from_json_schema(json_schema) do
+          {:ok, gbnf} ->
+            {:ok, opts |> Keyword.delete(:json_schema) |> Keyword.put(:grammar, gbnf)}
+
+          {:error, message} ->
+            {:error, {:invalid_json_schema, message}}
+        end
 
       true ->
-        opts
+        {:ok, opts}
     end
   end
 

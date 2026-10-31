@@ -119,12 +119,24 @@ defmodule LlamaCppEx.NIF do
         _penalty_freq,
         _penalty_present,
         _grammar_str,
-        _grammar_root
+        _grammar_root,
+        _grammar_lazy,
+        _trigger_patterns,
+        _trigger_tokens,
+        _grammar_prefill
       ),
       do: :erlang.nif_error(:not_loaded)
 
-  def grammar_validate(_model, _grammar_str, _grammar_root),
-    do: :erlang.nif_error(:not_loaded)
+  def grammar_validate(
+        _model,
+        _grammar_str,
+        _grammar_root,
+        _grammar_lazy,
+        _trigger_patterns,
+        _trigger_tokens,
+        _grammar_prefill
+      ),
+      do: :erlang.nif_error(:not_loaded)
 
   def sampler_accept(_sampler, _token), do: :erlang.nif_error(:not_loaded)
   def sampler_reset(_sampler), do: :erlang.nif_error(:not_loaded)
@@ -146,19 +158,12 @@ defmodule LlamaCppEx.NIF do
   def state_seq_get_data(_ctx, _seq_id), do: :erlang.nif_error(:not_loaded)
   def state_seq_set_data(_ctx, _state_bin, _dest_seq_id), do: :erlang.nif_error(:not_loaded)
 
-  # Chat template
-  def chat_apply_template(_template, _messages, _add_assistant),
-    do: :erlang.nif_error(:not_loaded)
-
-  # Jinja chat template (via common library)
-  def chat_apply_template_jinja(
-        _model,
-        _messages,
-        _add_assistant,
-        _enable_thinking,
-        _extra_kwargs
-      ),
-      do: :erlang.nif_error(:not_loaded)
+  # Chat templates (jinja, via llama.cpp's common library). The request is JSON;
+  # see chat_request_inputs in llama_nif.cpp.
+  def chat_render(_model, _request_json), do: :erlang.nif_error(:not_loaded)
+  def chat_session_new(_model, _request_json), do: :erlang.nif_error(:not_loaded)
+  def chat_session_append(_session, _tokens), do: :erlang.nif_error(:not_loaded)
+  def chat_session_parse(_session, _final), do: :erlang.nif_error(:not_loaded)
 
   # Cancellation (cooperative flag polled by the stateless generation loops)
   def cancel_flag_new, do: :erlang.nif_error(:not_loaded)

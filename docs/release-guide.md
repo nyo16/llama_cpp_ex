@@ -82,14 +82,40 @@ The NIF uses these key APIs (grep `llama_nif.cpp` for the full list):
 - `llama_sampler_*` — sampling chain
 - `llama_memory_*` — KV cache / memory management
 - `llama_get_embeddings_*`, `llama_pooling_type` — embeddings
-- `llama_chat_apply_template` — legacy chat templates
-- `common_chat_templates_init`, `common_chat_templates_apply` — Jinja chat templates
+- `llama_chat_apply_template` — legacy chat templates (called by
+  `common_chat_templates_apply` for templates without jinja; the NIF no longer
+  calls it directly)
+- `common_chat_templates_init`, `common_chat_templates_apply` — Jinja chat
+  templates; the NIF reads `common_chat_params` (prompt *parts* with their
+  `is_input` flag, grammar, triggers, preserved tokens, stops, parser)
+- `common_chat_parse`, `common_chat_msg_diff::compute_diffs`,
+  `common_chat_msgs_parse_oaicompat`, `common_chat_tools_parse_oaicompat`,
+  `common_chat_tool_choice_parse_oaicompat`, `common_chat_templates_get_caps`,
+  `common_sampling_add_preserved_tokens` / `_add_grammar_triggers` — tool
+  calling (`chat_session_*` in `llama_nif.cpp`)
+- `llama_sampler_init_grammar_lazy_patterns` — the lazy tool-call grammar
+- `llama_vocab_get_attr`, `llama_vocab_get_text` — `input_tokenize.cpp`
+  rebuilds the special-token partition `llama_tokenize` does internally
 - `json_schema_to_grammar` — grammar generation
 - `common_speculative_*` — speculative decoding and MTP draft models
 - `ggml_backend_dev_*`, `ggml_backend_reg_*` — device enumeration for `:devices`
 - `ggml_backend_rpc_add_server`, `ggml_backend_rpc_start_server` — RPC backend
 
 If any signatures changed, update `c_src/llama_cpp_ex/llama_nif.cpp` and/or `llama_nif.h`.
+
+### Caller text and the tokenizer
+
+`c_src/llama_cpp_ex/input_tokenize.cpp` (ours) tokenizes a rendered prompt so
+that only template text can produce special tokens. Its slow path re-implements
+`llama_vocab::impl::tokenizer_st_partition` (`src/llama-vocab.cpp`) with one
+change, and its fast path relies on "no guarded token text overlaps caller text
+⇒ `llama_tokenize(joined, parse_special = true)` is safe". On a bump, diff
+`tokenizer_st_partition` and `cache_special_tokens` (which attributes are cached,
+how `LSTRIP`/`RSTRIP` strip, the length order) and the BOS/EOS/SEP rules of
+`llama_vocab::impl::tokenize`, and port any change. `caller_text_guard` relies
+on jinja's `tojson`, `trim`, `upper` and `lower` leaving ASCII digits, `@` and
+`_` alone. The `:smoke` and `:tools` chat tests and the `:decision` tests pin
+the behaviour.
 
 ### Decision engine port
 
@@ -113,11 +139,20 @@ git -C vendor/llama.cpp log --oneline <old-commit>..<new-commit> -- \
 
 Ported functions carry their upstream name in a trailing comment
 (`// server_decision_context::format_answer`), so a hunk maps to one function.
-Port every change except image input (libmtmd is not linked), update the
-"Ported at" commit at the top of `decision.cpp`, then check the result against
-upstream's own server with `scripts/decision_compare.exs` (its header has the
-build and serve commands) on tinylaya, tinyopenjev and any decision model on
-disk. A new decision *type* is a new branch in `init`, in `@types` in
+Code marked `ours` is not a port and has no upstream counterpart: the caller
+text guard (`rendered_prompt`, `protect_request`, `run_template`,
+`tokenize_prompt`, `tokenize_caller`), which keeps special-token text in the
+caller's input from becoming special tokens (#109). Upstream tokenizes a
+rendered prompt with `common_tokenize(vocab, prompt, false, true)`; where a
+hunk touches such a call, port it through `tokenize_prompt` instead, and where
+upstream adds a field to the template input, decide in `protect_request`
+whether it is the caller's text. Port every change except image input (libmtmd
+is not linked), update the "Ported at" commit at the top of `decision.cpp`,
+then check the result against upstream's own server with
+`scripts/decision_compare.exs` (its header has the build and serve commands)
+on tinylaya, tinyopenjev and any decision model on disk. Its "special text"
+request differs from upstream by design and is printed, not checked. A new
+decision *type* is a new branch in `init`, in `@types` in
 `lib/llama_cpp_ex/decision.ex`, and in the two type lists beside it — and if
 it both shares a prompt and reads embeddings, in the script's list of those
 (it builds the non-sharing context itself, see below).

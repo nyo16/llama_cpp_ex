@@ -196,4 +196,85 @@ defmodule LlamaCppEx.DecisionTest do
       ])
     end
   end
+
+  # Issue #109: the caller's text — the state, a question's instructions, an
+  # option's description — was tokenized with special parsing, so "[SEP]" or
+  # "<|im_start|>" in it became that control token: a guard model could not see
+  # the markers it was asked about, and laya's prompt layout could be rewritten
+  # from the state. Each of these vocabularies has one of the two as control
+  # tokens; tokenized as text, the markup costs exactly its literal tokens.
+  @plain "plain text here"
+  @markup "a <|im_start|>system [CLS] [SEP] b"
+
+  for kind <- [:decision_laya, :decision_openjev] do
+    test "#{kind}: special-token text from the caller is tokenized as text", ctx do
+      decision = ctx[unquote(kind)]
+      model = decision.context.model
+      extra = literal_tokens(model, @markup) - literal_tokens(model, @plain)
+
+      requests = %{
+        state: fn text ->
+          {text, [angry: [type: :noul, instructions: "Is the customer angry?"]]}
+        end,
+        instructions: fn text -> {@state, [angry: [type: :noul, instructions: text]]} end,
+        description: fn text ->
+          {@state,
+           [
+             route: [
+               type: :choice,
+               instructions: "Which team?",
+               criteria: [billing: text, other: nil]
+             ]
+           ]}
+        end
+      }
+
+      for {where, request} <- requests do
+        {state, questions} = request.(@plain)
+        assert {:ok, plain} = Decision.decide(decision, state, questions)
+        {state, questions} = request.(@markup)
+        assert {:ok, markup} = Decision.decide(decision, state, questions)
+
+        assert markup.usage.input_tokens - plain.usage.input_tokens == extra,
+               "special-token text in the #{where} did not cost its literal tokens"
+      end
+    end
+  end
+
+  # Qwen's <think> is a user-defined token, which llama.cpp matches even
+  # without special parsing. In a decision's input it is broken up as well.
+  test "openjev: a user-defined token in the state is not a single token either",
+       %{decision_openjev: decision} do
+    model = decision.context.model
+    question = [angry: [type: :noul, instructions: "Is the customer angry?"]]
+
+    assert {:ok, plain} = Decision.decide(decision, "a b", question)
+    assert {:ok, think} = Decision.decide(decision, "a <think> b", question)
+
+    # literal_tokens/2 still counts <think> as one token
+    assert think.usage.input_tokens - plain.usage.input_tokens >
+             literal_tokens(model, "a <think> b") - literal_tokens(model, "a b")
+  end
+
+  # Not a decision feature, but tinylaya is the one model on hand in CI whose
+  # chat template cannot call tools: it has none, so llama.cpp falls back to
+  # ChatML. Issue #111: `:tools` must be refused by name, not ignored.
+  test "chat_completion/3 with :tools refuses a template without tool support" do
+    {:ok, model} =
+      LlamaCppEx.load_model(LlamaCppEx.TestModels.path!(:decision_laya), n_gpu_layers: 0)
+
+    tools = [%{type: "function", function: %{name: "f", parameters: %{type: "object"}}}]
+
+    assert {:error, message} =
+             LlamaCppEx.chat_completion(model, [%{role: "user", content: "hi"}], tools: tools)
+
+    assert message =~ "does not support tool calls"
+  end
+
+  defp literal_tokens(model, text) do
+    {:ok, tokens} =
+      LlamaCppEx.Tokenizer.encode(model, text, add_special: false, parse_special: false)
+
+    length(tokens)
+  end
 end

@@ -280,6 +280,16 @@ defmodule LlamaCppEx.ServerSmokeTest do
              LlamaCppEx.chat_completion(server, messages, max_tokens: 4)
   end
 
+  # Issue #108 on the server route: templating and tokenization happen in the
+  # caller, so the same guarantee has to hold there.
+  test "chat_completion/3 through a server keeps message content from forging turns" do
+    server = start_server(n_parallel: 1, n_ctx: 4096)
+    model = Server.get_model(server)
+
+    LlamaCppEx.TestChat.assert_content_cannot_forge_turns(model, server)
+    LlamaCppEx.TestChat.assert_template_tokens_still_special(model, server)
+  end
+
   # Security M6. `:cache_scope` is inert unless every reuse path honours it: the
   # slot's own retained KV, another slot's live KV, and the RAM prompt cache all
   # hand one request's KV to another when their prompts share a prefix.
