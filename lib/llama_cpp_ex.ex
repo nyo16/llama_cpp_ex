@@ -106,6 +106,46 @@ defmodule LlamaCppEx do
     LlamaCppEx.NIF.backend_init()
   end
 
+  # ggml_log_level values (ggml.h): DEBUG 1, INFO 2, WARN 3, ERROR 4; CONT (5),
+  # above every level, prints nothing. And common_log's verbosity threshold
+  # (common/log.h): DEBUG 5, INFO 3, WARN 2, ERROR 1; 0 keeps only tool output,
+  # which the library never writes, so -1 silences it.
+  @log_levels %{
+    debug: {1, 5},
+    info: {2, 3},
+    warning: {3, 2},
+    error: {4, 1},
+    none: {5, -1}
+  }
+
+  @doc """
+  Sets the lowest level of llama.cpp's own log output that is printed to stderr.
+
+  `level` is `:debug`, `:info` (the default), `:warning`, `:error` or `:none`.
+  It covers llama.cpp, ggml (backends, Metal/CUDA setup) and the chat-template
+  code, for the whole VM. `:info` prints what llama.cpp prints by default
+  except its DEBUG lines, which include one per generated token while a lazy
+  tool-call grammar waits for its trigger.
+
+  To set it at startup, configure it and the application applies it when it
+  starts:
+
+      config :llama_cpp_ex, log_level: :warning
+
+  """
+  @spec set_log_level(:debug | :info | :warning | :error | :none) :: :ok
+  def set_log_level(level) do
+    case Map.fetch(@log_levels, level) do
+      {:ok, {min_level, common_threshold}} ->
+        LlamaCppEx.NIF.log_set_level(min_level, common_threshold)
+
+      :error ->
+        raise ArgumentError,
+              "invalid log level #{inspect(level)}, expected one of " <>
+                inspect([:debug, :info, :warning, :error, :none])
+    end
+  end
+
   @doc """
   Lists the available ggml backend devices (GPUs, integrated GPUs, accelerators,
   and the CPU).

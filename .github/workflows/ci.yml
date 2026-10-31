@@ -41,6 +41,13 @@ env:
   DECISION_OPENJEV_REPO: ggml-org/tinyopenjev-for-testing-gguf
   DECISION_OPENJEV_REV: 953e44649ca8a71e5a8eee4676edebff2a45b2a2
   DECISION_OPENJEV_FILE: tinyopenjev-for-testing-Q8_0.gguf
+  # A model whose chat template supports tool calling, for the :tools tag (559
+  # MB). SmolLM2's template has no tools. Qwen3.5-0.8B is what the tool tests
+  # and the README were written against, and a second chat template for the
+  # special-token tests.
+  TOOLS_MODEL_REPO: unsloth/Qwen3.5-0.8B-GGUF
+  TOOLS_MODEL_REV: 6ab461498e2023f6e3c1baea90a8f0fe38ab64d0
+  TOOLS_MODEL_FILE: Qwen3.5-0.8B-UD-Q4_K_XL.gguf
 
 jobs:
   setup:
@@ -391,13 +398,13 @@ jobs:
           fail-on-cache-miss: true
 
       # Every URL is revision-pinned so a repo re-upload cannot silently change
-      # what CI runs. Total ~318 MB, cached on the pins.
+      # what CI runs. Total ~877 MB, cached on the pins.
       - name: Cache GGUF models
         id: models
         uses: actions/cache@v5
         with:
           path: models
-          key: gguf-${{ env.GEN_MODEL_REV }}-${{ env.EMB_MODEL_REV }}-${{ env.DECISION_LAYA_REV }}-${{ env.DECISION_OPENJEV_REV }}
+          key: gguf-${{ env.GEN_MODEL_REV }}-${{ env.EMB_MODEL_REV }}-${{ env.DECISION_LAYA_REV }}-${{ env.DECISION_OPENJEV_REV }}-${{ env.TOOLS_MODEL_REV }}
 
       - name: Download GGUF models
         if: steps.models.outputs.cache-hit != 'true'
@@ -411,6 +418,8 @@ jobs:
             "https://huggingface.co/${DECISION_LAYA_REPO}/resolve/${DECISION_LAYA_REV}/${DECISION_LAYA_FILE}"
           curl -fsSL --retry 3 -o "models/${DECISION_OPENJEV_FILE}" \
             "https://huggingface.co/${DECISION_OPENJEV_REPO}/resolve/${DECISION_OPENJEV_REV}/${DECISION_OPENJEV_FILE}"
+          curl -fsSL --retry 3 -o "models/${TOOLS_MODEL_FILE}" \
+            "https://huggingface.co/${TOOLS_MODEL_REPO}/resolve/${TOOLS_MODEL_REV}/${TOOLS_MODEL_FILE}"
 
       # This is the job the audit says the repo was missing: CI compiled the
       # 2100-line NIF but never ran a single forward pass, while 61 of 223
@@ -421,14 +430,17 @@ jobs:
       # tag was excluded by default and included by nothing, even though the
       # generation model it needs is already cached above. :decision covers
       # LlamaCppEx.Decision, the port of upstream's server-decision code.
+      # :tools covers tool calling and the special-token tests on a second
+      # chat template.
       - name: Run inference tests
-        run: mix test --include smoke --include embeddings --include slow --include decision
+        run: mix test --include smoke --include embeddings --include slow --include decision --include tools
         env:
           LLAMA_BACKEND: cpu
           LLAMA_SMOKE_GEN_MODEL: models/SmolLM2-135M-Instruct-Q8_0.gguf
           LLAMA_SMOKE_EMB_MODEL: models/bge-small-en-v1.5-q8_0.gguf
           LLAMA_SMOKE_DECISION_LAYA_MODEL: models/tinylaya-for-testing-Q8_0.gguf
           LLAMA_SMOKE_DECISION_OPENJEV_MODEL: models/tinyopenjev-for-testing-Q8_0.gguf
+          LLAMA_SMOKE_TOOLS_MODEL: models/Qwen3.5-0.8B-UD-Q4_K_XL.gguf
 
       # The taxonomy's invariant, checked rather than trusted: each gate tag must
       # stand alone, because `--include` beats `--exclude` and a test carrying two
@@ -455,3 +467,9 @@ jobs:
           LLAMA_BACKEND: cpu
           LLAMA_SMOKE_DECISION_LAYA_MODEL: models/tinylaya-for-testing-Q8_0.gguf
           LLAMA_SMOKE_DECISION_OPENJEV_MODEL: models/tinyopenjev-for-testing-Q8_0.gguf
+
+      - name: Tools tag runs alone
+        run: mix test --include tools
+        env:
+          LLAMA_BACKEND: cpu
+          LLAMA_SMOKE_TOOLS_MODEL: models/Qwen3.5-0.8B-UD-Q4_K_XL.gguf

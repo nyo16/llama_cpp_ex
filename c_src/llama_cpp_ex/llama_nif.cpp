@@ -3,6 +3,7 @@
 #include <llama.h>
 #include <ggml-backend.h>
 #include "json-schema-to-grammar.h"
+#include "log.h"
 #include "sampling.h"
 #include "speculative.h"
 #include <cctype>
@@ -54,6 +55,56 @@ inline auto unreachable     = fine::Atom("unreachable");
 inline auto no_devices      = fine::Atom("no_devices");
 inline auto bind_timeout    = fine::Atom("bind_timeout");
 } // namespace atoms
+
+// --- Logging ---
+//
+// llama.cpp's default log callback writes every message to stderr, DEBUG
+// included: a lazy tool-call grammar alone logged "Grammar still awaiting
+// trigger" once per generated token. This callback drops what is below the
+// level LlamaCppEx.set_log_level/1 sets, INFO by default, so the default
+// output is what it was minus DEBUG. Installed for llama and ggml (one call
+// sets both) when the library is loaded, before any model is.
+namespace {
+
+// Lowest ggml_log_level that is printed. GGML_LOG_LEVEL_CONT (above ERROR)
+// prints nothing.
+std::atomic<int> g_log_min{GGML_LOG_LEVEL_INFO};
+
+// A CONT message continues the previous one on its thread, so it takes that
+// message's level.
+thread_local int t_log_last = GGML_LOG_LEVEL_INFO;
+
+void log_callback(ggml_log_level level, const char* text, void* /*user_data*/) {
+    int effective = level;
+    if (level == GGML_LOG_LEVEL_CONT) {
+        effective = t_log_last;
+    } else {
+        // LLAMA_LOG(...) (model summaries) logs at NONE; treat it as INFO.
+        if (level == GGML_LOG_LEVEL_NONE) {
+            effective = GGML_LOG_LEVEL_INFO;
+        }
+        t_log_last = effective;
+    }
+    if (effective >= g_log_min.load(std::memory_order_relaxed)) {
+        fputs(text, stderr);
+    }
+}
+
+[[maybe_unused]] const bool log_callback_installed = (llama_log_set(log_callback, nullptr), true);
+
+} // namespace
+
+// min_level: the lowest ggml_log_level printed (GGML_LOG_LEVEL_CONT for none).
+// common_threshold: common_log's verbosity threshold, for the chat-template
+// code's own logger, which compares each message's verbosity against it.
+fine::Ok<> log_set_level(ErlNifEnv* env, int64_t min_level, int64_t common_threshold) {
+    g_log_min.store(static_cast<int>(min_level), std::memory_order_relaxed);
+    // An int store; common documents the setter as not thread-safe because a
+    // concurrent reader may see the old value for one message.
+    common_log_set_verbosity_thold(static_cast<int>(common_threshold));
+    return fine::Ok();
+}
+FINE_NIF(log_set_level, 0);
 
 // --- Input validation at the NIF boundary ---
 //

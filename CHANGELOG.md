@@ -2,12 +2,35 @@
 
 ## Unreleased
 
+### Added
+
+- `LlamaCppEx.set_log_level/1` and `config :llama_cpp_ex, log_level: level`
+  (`:debug | :info | :warning | :error | :none`). The NIF now installs its own
+  llama.cpp/ggml log callback instead of llama.cpp's default, which wrote every
+  level to stderr, and also sets the chat-template code's log threshold.
+
 ### Changed
 
+- llama.cpp's DEBUG log lines are no longer printed by default (`:info`).
+  With `:tools`, a lazy grammar logged "Grammar still awaiting trigger" once
+  per generated token: a 100-token Qwen3.5 tool call printed 1,663 stderr
+  lines, now 199. Everything at INFO and above is printed as before.
+- CI runs the `:tools` tag on CPU against a pinned Qwen3.5-0.8B-UD-Q4_K_XL, so
+  tool calling and the chat special-token tests on a second template run on
+  every push.
+- `elixir_make` requirement raised to `~> 0.10.1`. OTP 29.0.6, 28.5.0.6 and
+  27.3.4.17 limit `httpc` response headers to 10,240 bytes, and GitHub's
+  release redirects can exceed it; 0.10.1 raises the limit, so an older
+  elixir_make could fail to download the precompiled NIF there. On earlier OTP
+  patch releases `httpc` logs `Invalid option {max_header_size,65536}
+  ignored`, which is harmless (README, "Logging").
 - `:req` (optional, for `LlamaCppEx.Hub`) now also accepts `~> 0.7`, and the
   lock moves to elixir_make 0.10.1, req 0.7.5, finch 0.24.0 and mint 1.11.0.
   Their older releases set `xref: [exclude: ...]`, which Elixir 1.20 reports
   as deprecated on every build (three CI annotations per run).
+- Lock: decimal 2.4.1 → 3.2.0 and ecto 3.13.5 → 3.14.2, clearing
+  EEF-CVE-2026-32686 and EEF-CVE-2026-97853 from `mix deps.get`. Both are
+  optional dependencies, so this changes nothing a user resolves.
 
 ## v0.8.63
 
