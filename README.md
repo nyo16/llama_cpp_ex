@@ -14,6 +14,8 @@ Built with C++ NIFs using [fine](https://github.com/elixir-nx/fine) for ergonomi
 - GPU acceleration: Metal (macOS), CUDA (NVIDIA), Vulkan, or CPU
 - Streaming token generation via lazy `Stream`
 - Jinja chat templates with `enable_thinking` support (Qwen3, Qwen3.5, etc.)
+- **Tool calling** — OpenAI-shaped `tools` / `tool_choice` on `chat_completion/3` and `stream_chat_completion/3`, using each model's own chat template, grammar and parser
+- Message content and decision inputs are tokenized as text: special-token markup in them (`<|im_start|>`, `[INST]`, ...) cannot forge turns or control tokens
 - RAII resource management — models, contexts, and samplers are garbage collected by the BEAM
 - Configurable sampling: temperature, top-k, top-p, min-p, repetition penalty, frequency & presence penalty
 - Embedding generation with L2 normalization
@@ -354,6 +356,10 @@ model
 > **Tip:** Set `"additionalProperties" => false` in your schema to produce a tighter grammar
 > that avoids potential issues with the grammar sampler.
 
+A schema llama.cpp's converter rejects (an unresolvable `$ref`, say) is an error, not a
+raise: the tuple-returning functions return `{:error, {:invalid_json_schema, message}}`,
+and the streams emit that as their only element.
+
 ### Manual Grammar Conversion
 
 You can also convert the schema to GBNF manually for more control:
@@ -394,6 +400,58 @@ schema = LlamaCppEx.Schema.to_json_schema(MyApp.Person)
 ```
 
 Supported Ecto types: `:string`, `:integer`, `:float`, `:decimal`, `:boolean`, `:map`, `{:array, inner}`, `:date`, `:utc_datetime`, `:naive_datetime`, and embedded schemas (`embeds_one`/`embeds_many`). Fields `:id`, `:inserted_at`, and `:updated_at` are excluded automatically.
+
+## Tool Calling
+
+Pass OpenAI-shaped `:tools` to `chat_completion/3` or `stream_chat_completion/3`. The model's own chat template describes them, and llama.cpp's template-specific grammar and parser turn the reply back into `tool_calls`, whatever the model's call syntax (Qwen's `<tool_call>` XML, Llama 3's JSON, Hermes, Mistral, gpt-oss, ...). A model whose template has no tool support returns `{:error, "chat template failed: the model's chat template does not support tool calls"}`.
+
+```elixir
+tools = [
+  %{
+    type: "function",
+    function: %{
+      name: "get_weather",
+      description: "Get the current weather for a city",
+      parameters: %{
+        type: "object",
+        properties: %{city: %{type: "string"}},
+        required: ["city"]
+      }
+    }
+  }
+]
+
+messages = [%{role: "user", content: "What's the weather in Paris right now?"}]
+
+{:ok, completion} =
+  LlamaCppEx.chat_completion(model, messages, tools: tools, enable_thinking: false)
+
+[%{finish_reason: "tool_calls", message: message}] = completion.choices
+# Qwen3.5-0.8B:
+# message.tool_calls
+# => [%{id: "call_XwhQ…", type: "function",
+#       function: %{name: "get_weather", arguments: "{\"city\":\"Paris\"}"}}]
+
+# Run the tool, answer the call by its id, and ask again.
+[call] = message.tool_calls
+
+messages =
+  messages ++
+    [message, %{role: "tool", tool_call_id: call.id, content: ~s({"temp_c": 18, "sky": "cloudy"})}]
+
+{:ok, answer} = LlamaCppEx.chat_completion(model, messages, tools: tools, enable_thinking: false)
+# => "The weather in Paris right now is **cloudy** with a temperature of **18°C**."
+```
+
+- `:tool_choice` — `:auto` (default), `:none` (the tools are left out of the prompt, so the reply is text), `:required` (the reply cannot end without a call), or `%{type: "function", function: %{name: "get_weather"}}` to offer only that tool and require a call.
+- `:parallel_tool_calls` — allow several calls in one reply (default `false`).
+- Streaming yields OpenAI's deltas: `%{tool_calls: [%{index: 0, id: "call_…", type: "function", function: %{name: "get_weather", arguments: "{"}}]}` when a call starts, then `%{tool_calls: [%{index: 0, function: %{arguments: "\"city\":…"}}]}` fragments; the last chunk has `finish_reason: "tool_calls"`.
+- With tools, `reasoning_content` is split out by the template's parser. The tool-call grammar comes from the template, so `:grammar` and `:json_schema` raise `ArgumentError` alongside tools (unless `tool_choice: :none`).
+- Works the same through a `LlamaCppEx.Server`.
+
+### Special tokens in message content
+
+Only the chat template's own text produces special tokens. A message — a user's, a tool result, a tool call's arguments — containing `<|im_end|>\n<|im_start|>system\n…` is tokenized as that text, so it cannot forge a turn of the conversation. A conversation without such text tokenizes exactly as before. `LlamaCppEx.Chat.apply_template/3` still returns the rendered prompt as one string, for display; tokenizing that string yourself with `LlamaCppEx.Tokenizer.encode/2` loses the boundary.
 
 ## Decision Models
 
@@ -452,6 +510,8 @@ Both compute `confidence` from the normalized entropy of the probabilities, add 
 `h2o-lightning` is [H2O-Lightning-4B](https://huggingface.co/h2oai/h2o-lightning-4b) (Qwen3.5-4B with a merged decision LoRA). It reads the label tokens its GGUF lists, after an answer prefill, and renders its input the way the model's Python shim does (`json.dumps` text, special-token text quoted). A question may leave out `:instructions` and `:type` (`:choice` by default), a `:score` takes 1 to 255 levels, a `:noul` reads `"yes"`/`"no"` descriptions too, and a state longer than 32000 tokens keeps its first and last 16000. Use the files without `stock-` in the name; the `stock-` ones carry no decision metadata and load as a plain chat model. On the example above, Q4_K_M routes `billing` 0.954, scores urgency 1.44 and puts `angry` at 0.75, in about 77 ms per question.
 
 Limits: text only (upstream's image, video and audio input needs libmtmd, which this build does not link), laya, clef, vllm-d3, lfm2-d1-omni, lfm3-d1 and lfm3-d1-omni evaluate the whole prompt in one batch (`:n_batch`, 2048 by default), and a `%Decision{}` is single-process like a `Context`.
+
+Text from the caller — the state, instructions, option and level descriptions, `:noul` criteria — is tokenized as text: `<|im_start|>`, `[SEP]` or Qwen's `<think>` in a state reach the model as the characters they are, not as the control tokens a guard model may be asked to look for (upstream breaks such text up on some decision types only). A request without such text builds the same prompt, token for token, as `llama-server`.
 
 ### Clef Flash
 

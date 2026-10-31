@@ -7,6 +7,7 @@
 // "evaluation" banner replaces server slots and is ours.
 
 #include "decision.h"
+#include "input_tokenize.h"
 
 #include "chat.h"
 #include "common.h"
@@ -511,6 +512,173 @@ const std::string D1OMNI_MARK_OPTION   = "<<d1omni:option>>";
 // the image and audio budgets, which only apply to media.
 const size_t D1OMNI_MAX_TOKENS = 16384;
 
+//
+// caller text (ours, not upstream's: see docs/release-guide.md before porting over it)
+//
+// A prompt is rendered from the "systemone" template with the caller's state,
+// instructions and options in it, and upstream tokenizes the result with
+// special parsing: a state holding "<|im_start|>" or "<think>" produced those
+// tokens instead of text, so a guard model could not see the markers it is
+// asked about. Upstream breaks such text on four paths (kev, lfm2-d1-omni,
+// lfm3-d1, h2o-lightning) and only for some tokens.
+//
+// Here the caller's text goes through llama_cpp_ex::caller_text_guard (strict:
+// user-defined tokens too) before rendering, the rendered prompt gets it back as
+// caller spans, and tokenize_pieces keeps every special token out of those
+// spans. A request with no special-token text renders and tokenizes exactly as
+// upstream.
+
+// A rendered prompt and the spans of it that came from the caller.
+struct rendered_prompt {
+    std::string text;
+    std::vector<std::pair<size_t, size_t>> inputs; // [begin, end), in order
+
+    static rendered_prompt from_pieces(const std::vector<llama_cpp_ex::prompt_piece> & pieces) {
+        rendered_prompt out;
+        for (const auto & piece : pieces) {
+            if (piece.is_input) {
+                out.inputs.emplace_back(out.text.size(), out.text.size() + piece.text.size());
+            }
+            out.text += piece.text;
+        }
+        return out;
+    }
+
+    bool overlaps_input(size_t begin, size_t end) const {
+        for (const auto & [a, b] : inputs) {
+            if (a < end && begin < b) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    // text[begin, end) as template and caller pieces
+    std::vector<llama_cpp_ex::prompt_piece> pieces(size_t begin, size_t end) const {
+        std::vector<llama_cpp_ex::prompt_piece> out;
+        size_t pos = begin;
+        for (const auto & [a, b] : inputs) {
+            if (b <= begin || a >= end) {
+                continue;
+            }
+            const size_t s = std::max(a, begin);
+            const size_t e = std::min(b, end);
+            if (s > pos) {
+                out.push_back({text.substr(pos, s - pos), false});
+            }
+            out.push_back({text.substr(s, e - s), true});
+            pos = e;
+        }
+        if (end > pos) {
+            out.push_back({text.substr(pos, end - pos), false});
+        }
+        return out;
+    }
+
+    // the [begin, end) ranges string_split(text, sep) gives; caller text holds no separator
+    std::vector<std::pair<size_t, size_t>> split(const std::string & sep) const {
+        std::vector<std::pair<size_t, size_t>> out;
+        size_t start = 0;
+        size_t from  = 0;
+        for (size_t pos = text.find(sep); pos != std::string::npos; pos = text.find(sep, from)) {
+            if (overlaps_input(pos, pos + sep.size())) {
+                from = pos + 1;
+                continue;
+            }
+            out.emplace_back(start, pos);
+            start = from = pos + sep.size();
+        }
+        out.emplace_back(start, text.size());
+        return out;
+    }
+
+    // text[begin, end) starts with prefix, as string_starts_with on that piece
+    bool starts_with(size_t begin, size_t end, const std::string & prefix) const {
+        return end - begin >= prefix.size() && text.compare(begin, prefix.size(), prefix) == 0;
+    }
+};
+
+// Every string of a JSON value, keys included, through guard.protect.
+json protect_all(const llama_cpp_ex::caller_text_guard & guard, const json & val, const std::string & nonce,
+                 std::vector<std::string> & originals, int depth = 0) {
+    if (depth >= RECURSIVE_LIMIT) {
+        throw too_deep();
+    }
+    if (val.is_string()) {
+        return guard.protect(val.get<std::string>(), nonce, originals);
+    }
+    if (val.is_array()) {
+        json out = json::array();
+        for (const auto & item : val) {
+            out.push_back(protect_all(guard, item, nonce, originals, depth + 1));
+        }
+        return out;
+    }
+    if (val.is_object()) {
+        json out = json::object();
+        for (const auto & [key, item] : val.items()) {
+            out[guard.protect(key, nonce, originals)] = protect_all(guard, item, nonce, originals, depth + 1);
+        }
+        return out;
+    }
+    return val;
+}
+
+// An option's label is the model's own, the rest of it the caller's.
+json protect_options(const llama_cpp_ex::caller_text_guard & guard, const json & options, const std::string & nonce,
+                     std::vector<std::string> & originals) {
+    if (!options.is_array()) {
+        return protect_all(guard, options, nonce, originals);
+    }
+    json out = json::array();
+    for (const auto & opt : options) {
+        if (!opt.is_object()) {
+            out.push_back(protect_all(guard, opt, nonce, originals));
+            continue;
+        }
+        json po = json::object();
+        for (const auto & [key, val] : opt.items()) {
+            po[key] = key == "label" ? val : protect_all(guard, val, nonce, originals);
+        }
+        out.push_back(po);
+    }
+    return out;
+}
+
+// The template input with the caller's text guarded. The keys this port adds
+// itself are left as they are.
+json protect_request(const llama_cpp_ex::caller_text_guard & guard, const json & inp, const std::string & nonce,
+                     std::vector<std::string> & originals) {
+    json out = json::object();
+    for (const auto & [key, val] : inp.items()) {
+        if (key == "type" || key == "audio" || key == "images" || key == "sep" ||
+            key == "mark_state" || key == "mark_question" || key == "mark_option") {
+            out[key] = val;
+        } else if (key == "options") {
+            out[key] = protect_options(guard, val, nonce, originals);
+        } else if (key == "questions" && val.is_array()) {
+            json questions = json::array();
+            for (const auto & q : val) {
+                json pq = json::object();
+                for (const auto & [qk, qv] : q.items()) {
+                    if (qk == "type") {
+                        pq[qk] = qv;
+                    } else if (qk == "options") {
+                        pq[qk] = protect_options(guard, qv, nonce, originals);
+                    } else {
+                        pq[qk] = protect_all(guard, qv, nonce, originals);
+                    }
+                }
+                questions.push_back(pq);
+            }
+            out[key] = questions;
+        } else {
+            out[key] = protect_all(guard, val, nonce, originals);
+        }
+    }
+    return out;
+}
+
 } // namespace
 
 std::string model_type(const llama_model * model) {
@@ -568,6 +736,10 @@ struct Engine::Impl {
 
     common_batch batch;
 
+    // ours: the caller's text may not produce special tokens (see caller_text_guard)
+    std::unique_ptr<llama_cpp_ex::special_tokens> specials;
+    std::unique_ptr<llama_cpp_ex::caller_text_guard> guard;
+
     explicit Impl(llama_context * c) : ctx(c), model(llama_get_model(c)), batch(c) {
         init();
     }
@@ -612,6 +784,8 @@ struct Engine::Impl {
         type_name = meta_str(model, prefix + "type");
 
         vocab = llama_model_get_vocab(model);
+        specials = std::make_unique<llama_cpp_ex::special_tokens>(vocab);
+        guard    = std::make_unique<llama_cpp_ex::caller_text_guard>(*specials, llama_cpp_ex::input_policy::strict);
 
         const char * tmpl_src = llama_model_chat_template(model, "systemone");
         if (tmpl_src == nullptr) {
@@ -970,7 +1144,7 @@ struct Engine::Impl {
         if (text.size() <= max_state_tokens) {
             return text;
         }
-        const llama_tokens tokens = common_tokenize(vocab, text, false, true);
+        const llama_tokens tokens = tokenize_caller(text);
         if (tokens.size() <= max_state_tokens) {
             return text;
         }
@@ -1253,16 +1427,38 @@ struct Engine::Impl {
         return inp;
     }
 
-    std::string run_template(const json & inp) const {
+    // ours: renders with the caller's text guarded, see caller_text_guard
+    rendered_prompt run_template(const json & inp) const {
+        std::vector<std::string> originals;
+        const std::string nonce = llama_cpp_ex::random_nonce();
+        const json guarded = protect_request(*guard, inp, nonce, originals);
+
         jinja::context jctx(tmpl->source());
-        jinja::global_from_json(jctx, inp, false);
+        jinja::global_from_json(jctx, guarded, false);
         jinja::runtime runtime(jctx);
         const jinja::value results = runtime.execute(tmpl->prog);
-        return jinja::runtime::gather_string_parts(results)->as_string().str();
+        std::string text = jinja::runtime::gather_string_parts(results)->as_string().str();
+        if (originals.empty()) {
+            return {std::move(text), {}};
+        }
+        return rendered_prompt::from_pieces(llama_cpp_ex::restore_pieces({{std::move(text), false}}, nonce, originals));
+    }
+
+    // ours: as common_tokenize(vocab, text, false, true), except that no
+    // special token comes from the caller's spans
+    llama_tokens tokenize_prompt(const rendered_prompt & prompt, size_t begin, size_t end) const {
+        return llama_cpp_ex::tokenize_pieces(vocab, *specials, prompt.pieces(begin, end), false,
+                                             llama_cpp_ex::input_policy::strict);
+    }
+
+    // ours: caller text alone, tokenized so that it produces no special token
+    llama_tokens tokenize_caller(const std::string & text) const {
+        return llama_cpp_ex::tokenize_pieces(vocab, *specials, {{text, true}}, false,
+                                             llama_cpp_ex::input_policy::strict);
     }
 
     // server_decision_context::render with n_images == 0 (so is_audio == false)
-    std::string render(
+    rendered_prompt render(
             const json & state,
             const std::vector<decision_question> & questions,
             const decision_question & question,
@@ -1340,7 +1536,7 @@ struct Engine::Impl {
         }
 
         decision_task task;
-        const std::string prompt = render(state, questions, question, variant);
+        const rendered_prompt prompt = render(state, questions, question, variant);
 
         if (type == COMMON_DECISION_TYPE_OPENJEV || type == COMMON_DECISION_TYPE_GRANITE_SWITCH || type == COMMON_DECISION_TYPE_LEV || type == COMMON_DECISION_TYPE_NIMBLE || type == COMMON_DECISION_TYPE_PPLX_DECIDER || type == COMMON_DECISION_TYPE_VLLM_D3 ||
             type == COMMON_DECISION_TYPE_H2O_LIGHTNING) {
@@ -1357,7 +1553,7 @@ struct Engine::Impl {
             }
         }
 
-        llama_tokens tokens = common_tokenize(vocab, prompt, false, true);
+        llama_tokens tokens = tokenize_prompt(prompt, 0, prompt.text.size());
         if (type == COMMON_DECISION_TYPE_LAYA) {
             fill_task_laya(tokens, question, task);
         }
@@ -1446,9 +1642,9 @@ struct Engine::Impl {
         const auto invalid = std::runtime_error("unexpected layout of the decision prompt");
 
         // with no files the media markers before the first separator are empty
-        const std::string prompt = render(state, questions, question, variant);
-        const std::vector<std::string> pieces = string_split(prompt, D1OMNI_SEP);
-        if (pieces.empty() || !pieces[0].empty()) {
+        const rendered_prompt prompt = render(state, questions, question, variant);
+        const auto pieces = prompt.split(D1OMNI_SEP);
+        if (pieces.empty() || pieces[0].first != pieces[0].second) {
             throw invalid;
         }
 
@@ -1465,21 +1661,21 @@ struct Engine::Impl {
         llama_tokens tail;  // after the state
         bool has_state = false;
         for (size_t i_piece = 1; i_piece < pieces.size(); i_piece++) {
-            std::string piece = pieces[i_piece];
+            auto [begin, end] = pieces[i_piece];
             int64_t n_piece_max = -1;
             bool is_state = false;
-            if (string_starts_with(piece, D1OMNI_MARK_STATE)) {
-                piece    = piece.substr(D1OMNI_MARK_STATE.size());
+            if (prompt.starts_with(begin, end, D1OMNI_MARK_STATE)) {
+                begin   += D1OMNI_MARK_STATE.size();
                 is_state = true;
-            } else if (string_starts_with(piece, D1OMNI_MARK_QUESTION)) {
-                piece = piece.substr(D1OMNI_MARK_QUESTION.size());
+            } else if (prompt.starts_with(begin, end, D1OMNI_MARK_QUESTION)) {
+                begin += D1OMNI_MARK_QUESTION.size();
                 n_piece_max = n_question_max;
-            } else if (string_starts_with(piece, D1OMNI_MARK_OPTION)) {
-                piece = piece.substr(D1OMNI_MARK_OPTION.size());
+            } else if (prompt.starts_with(begin, end, D1OMNI_MARK_OPTION)) {
+                begin += D1OMNI_MARK_OPTION.size();
                 n_piece_max = n_option_max;
             }
 
-            llama_tokens tokens = common_tokenize(vocab, piece, false, true);
+            llama_tokens tokens = tokenize_prompt(prompt, begin, end);
             if (n_piece_max >= 0 && (int64_t) tokens.size() > n_piece_max) {
                 tokens.resize(n_piece_max);
             }
@@ -1555,19 +1751,19 @@ struct Engine::Impl {
         inp["mark_question"] = CLEF_MARK_QUESTION;
         inp["mark_option"]   = CLEF_MARK_OPTION;
 
-        const std::string prompt = run_template(inp);
+        const rendered_prompt prompt = run_template(inp);
 
         const auto invalid = std::runtime_error("unexpected layout of the decision prompt");
 
         // the model was trained with the pieces tokenized one by one
-        const std::vector<std::string> pieces = string_split(prompt, CLEF_SEP);
+        const auto pieces = prompt.split(CLEF_SEP);
 
         size_t i_question = 0;
         for (size_t i_piece = 0; i_piece < pieces.size(); i_piece++) {
-            std::string piece = pieces[i_piece];
+            auto [begin, end] = pieces[i_piece];
             int32_t order = LLAMA_DECISION_ORDER_NONE;
-            if (string_starts_with(piece, CLEF_MARK_QUESTION)) {
-                piece = piece.substr(CLEF_MARK_QUESTION.size());
+            if (prompt.starts_with(begin, end, CLEF_MARK_QUESTION)) {
+                begin += CLEF_MARK_QUESTION.size();
                 if (i_question >= questions.size()) {
                     throw invalid;
                 }
@@ -1576,13 +1772,13 @@ struct Engine::Impl {
                     case QUESTION_CHOICE: order = LLAMA_DECISION_ORDER_QUESTION_CHOICE; break;
                     case QUESTION_SCORE:  order = LLAMA_DECISION_ORDER_QUESTION_SCORE;  break;
                 }
-            } else if (string_starts_with(piece, CLEF_MARK_OPTION)) {
-                piece = piece.substr(CLEF_MARK_OPTION.size());
+            } else if (prompt.starts_with(begin, end, CLEF_MARK_OPTION)) {
+                begin += CLEF_MARK_OPTION.size();
                 order = LLAMA_DECISION_ORDER_OPTION;
                 task.n_scores++;
             }
 
-            const llama_tokens piece_tokens = common_tokenize(vocab, piece, false, true);
+            const llama_tokens piece_tokens = tokenize_prompt(prompt, begin, end);
             if (order != LLAMA_DECISION_ORDER_NONE && piece_tokens.empty()) {
                 throw std::invalid_argument("the instructions and the options of a question must not be empty");
             }

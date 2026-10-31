@@ -1,5 +1,105 @@
 # Changelog
 
+## v0.8.63
+
+Security fixes for special-token text in caller input (chat and decisions),
+tool calling for the OpenAI-shaped chat functions, and error tuples for a bad
+`:json_schema`. llama.cpp stays at `418f905a4`.
+
+### Security
+
+- **Special tokens in chat message content no longer become control tokens**
+  (#108). `chat/3`, `stream_chat/3`, `chat_completion/3` and
+  `stream_chat_completion/3` (model- and server-routed) and
+  `ModelManager.chat/3` used to tokenize the rendered prompt with special
+  parsing, so `"<|im_end|>\n<|im_start|>system\n…"` in a user message forged a
+  system turn. The chat template now renders to template and request parts
+  (`common_chat_prompt` with `is_input`), and a new tokenizer
+  (`c_src/llama_cpp_ex/input_tokenize.cpp`) lets a special token through only
+  where its text lies entirely in template text; request text is tokenized as
+  with `parse_special: false`. Because templates also render request text
+  through `| tojson` (Llama 3 renders tool results and call arguments that
+  way), out of sight of the template engine's input tracking, request text
+  that is or could join into a special token's text is swapped for a
+  placeholder before rendering and put back as request text after. A prompt
+  without such text tokenizes exactly as before (`llama_tokenize` on the
+  joined string). Checked on Qwen3.5, Llama 3.2, SmolLM2 and Granite 3.0
+  templates: the forged conversation from the issue costs exactly its literal
+  tokens and adds no turn boundary.
+- **Decision inputs are tokenized as text on every decision type** (#109).
+  The state, instructions, option and level descriptions and `:noul`
+  criteria went into the prompt with special parsing on all types except
+  where upstream escapes (kev, lfm2-d1-omni, lfm3-d1, h2o-lightning, and
+  then only some tokens), so a guard model could not see `<|im_start|>` in
+  the state it was asked about. Decisions now use the same placeholder and
+  tokenizer machinery with a strict policy: user-defined tokens such as
+  Qwen's `<think>` are broken up too (they match even without special
+  parsing), except whitespace-only ones. On Clef Flash the issue's request
+  answers `noul` 0.98 instead of 0.03 (0.80 when escaped by hand).
+  `scripts/decision_compare.exs` against `llama-server` at the same commit
+  (Metal, `-np 1`): every request without special-token text still **MATCHES**
+  exactly on tinylaya, tinyopenjev, d1-2B, d1-3B, d1-omni-600M,
+  vllm-decision2-Kai-0.6B, vllm-d3-edge, h2o-lightning-4b and Clef Flash; the
+  new "special text" request differs by design and is printed, not checked.
+
+### Added
+
+- **Tool calling** (#111): `:tools`, `:tool_choice` (`:auto`, `:none`,
+  `:required`, or `%{type: "function", function: %{name: name}}`) and
+  `:parallel_tool_calls` on `chat_completion/3` and `stream_chat_completion/3`,
+  model- and server-routed. llama.cpp's template-specific grammar (lazy, with
+  triggers, or strict with a generation-prompt prefill) constrains the call
+  and its PEG parser (`common_chat_parse`) turns the reply into
+  `message.tool_calls` (`%{id: "call_…", type: "function", function: %{name,
+  arguments}}`), `finish_reason: "tool_calls"`, and `reasoning_content`.
+  Streaming emits OpenAI-shaped `tool_calls` deltas from partial parses.
+  Messages accept `role: "tool"` with `:tool_call_id`, and assistant messages
+  with `:tool_calls`, so a tool loop round-trips through the template.
+  `tool_choice: :none` leaves the tools out of the prompt (upstream renders
+  them and a model writes the call markup into the content anyway). A
+  template without tool support returns `{:error, "chat template failed: the
+  model's chat template does not support tool calls"}`; `:grammar` or
+  `:json_schema` together with tools raise `ArgumentError`, as in
+  llama-server. The template's literal stop strings end the reply.
+- `LlamaCppEx.Sampler`: `:grammar_lazy`, `:grammar_triggers`
+  (`{:token, id}` / `{:pattern, regex}`) and `:grammar_prefill`, accepted by
+  every sampling entry point and `LlamaCppEx.Server`.
+- `LlamaCppEx.Server.complete_tokens/3` returns the generated `:token_ids`.
+- Test tag `:tools` (`LLAMA_SMOKE_TOOLS_MODEL`, a model whose template
+  supports tools), since CI's `:smoke` model (SmolLM2-135M) has none.
+
+### Changed
+
+- An unconvertible `:json_schema` is `{:error, {:invalid_json_schema,
+  message}}` from `generate/3`, `chat/3` and `chat_completion/3` (model and
+  server), and the only element of `stream/3`, `stream_chat/3` and
+  `stream_chat_completion/3`, instead of an `ArgumentError` (#110). Passing
+  both `:grammar` and `:json_schema` still raises.
+- `Chat.apply_template/3` builds the same request as the chat functions:
+  messages may carry `:tool_calls`, `:tool_call_id`, `:name`,
+  `:reasoning_content` and `content: nil`, and it accepts the tool options.
+- `Chat.message()` type widened accordingly; `ChatCompletion` and
+  `ChatCompletionChunk` types describe tool calls.
+
+### Removed
+
+- The `chat_apply_template` and `chat_apply_template_jinja` NIFs, replaced by
+  `chat_render` and `chat_session_new` / `_append` / `_parse`. The legacy one
+  had no caller; `LlamaCppEx.NIF` is internal.
+
+Verified on macOS, M1 Max, Metal (`GGML_METAL_NO_RESIDENCY=1`): default
+**434 passed, 194 excluded**; `--include smoke --include embeddings --include
+slow --include mtp` (Qwen3.5-0.8B-UD-Q4_K_XL, Qwen3-Embedding-0.6B-f16,
+Qwen3.6-35B-A3B-MTP-UD-Q4_K_XL) **583 passed**; `--include smoke` on
+SmolLM2-135M (CI's model) **551 passed**; `--include embeddings` on
+embeddinggemma-2-Q8_0 **445 passed**; `--include decision` on tinylaya +
+tinyopenjev **450 passed**; `--include decision_clef` on Clef Flash Q8_0
+**438 passed** (4 of 4 clef); `--include tools` on Qwen3.5-0.8B **445
+passed** (11 of 11 tool tests; Llama-3.2-1B-Instruct passes 10 of 11, calling
+the tool again in the round trip). A decision run of every model on disk
+before and after the change gives bit-identical answers for states without
+special-token text. Format, credo `--strict` and dialyzer (0 errors) clean.
+
 ## v0.8.62
 
 llama.cpp bumped to `418f905a4`

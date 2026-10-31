@@ -557,12 +557,20 @@ defmodule LlamaCppEx.Server do
   @doc """
   Like `generate_tokens/3`, but returns completion metadata alongside the text.
 
-  Returns `{:ok, %{text: text, completion_tokens: n, finish_reason: reason}}`
-  where `reason` is `:eog` or `:max_tokens`. Used by the OpenAI-shaped
-  `LlamaCppEx.chat_completion/3` when routed through a server.
+  Returns `{:ok, %{text: text, token_ids: ids, completion_tokens: n,
+  finish_reason: reason}}` where `ids` are the generated tokens (the
+  end-of-generation token excluded) and `reason` is `:eog` or `:max_tokens`.
+  Used by the OpenAI-shaped `LlamaCppEx.chat_completion/3` when routed through a
+  server.
   """
   @spec complete_tokens(GenServer.server(), [integer()], keyword()) ::
-          {:ok, %{text: String.t(), completion_tokens: non_neg_integer(), finish_reason: atom()}}
+          {:ok,
+           %{
+             text: String.t(),
+             token_ids: [integer()],
+             completion_tokens: non_neg_integer(),
+             finish_reason: atom()
+           }}
           | {:error, term()}
   def complete_tokens(server, token_ids, opts \\ []) when is_list(token_ids) do
     opts = Options.validate!(opts, @call_opt_keys, "LlamaCppEx.Server.complete_tokens/3")
@@ -581,6 +589,9 @@ defmodule LlamaCppEx.Server do
   # or {ref, {:error, reason}}. Internal — used by the chat-completion
   # streaming path; library users should call stream/3 or stream_tokens/3.
   #
+  # `token_ids: true` sends {ref, {:token_id, id}} per token instead of the
+  # pieces, for a caller that renders and parses the reply itself (tool calls).
+  #
   # The `@spec` used to say `:ok`. The body returns `GenServer.call/2` verbatim
   # and its only caller depends on the `{:error, :queue_full}` the spec denied;
   # Dialyzer could not see the lie because `GenServer.call/2` is typed `term()`.
@@ -591,9 +602,10 @@ defmodule LlamaCppEx.Server do
   @spec subscribe_stream_tokens(GenServer.server(), [integer()], reference(), keyword()) ::
           :ok | {:error, term()}
   def subscribe_stream_tokens(server, token_ids, ref, opts \\ []) when is_list(token_ids) do
+    {ids?, opts} = Keyword.pop(opts, :token_ids, false)
     opts = Options.validate!(opts, @call_opt_keys, "LlamaCppEx.Server.subscribe_stream_tokens/4")
     max_tokens = Keyword.get(opts, :max_tokens, 256)
-    req_opts = Keyword.take(opts, @request_opt_keys)
+    req_opts = Keyword.take(opts, @request_opt_keys) ++ [stream_token_ids: ids?]
 
     # Bounded by the caller's `:timeout` for the same reason as
     # `start_token_stream/5`: the only caller runs this inside a
@@ -1167,6 +1179,7 @@ defmodule LlamaCppEx.Server do
         monitor_ref: monitor_ref,
         sampler: sampler,
         reply_mode: Keyword.get(req_opts, :reply, :text),
+        stream_token_ids: Keyword.get(req_opts, :stream_token_ids, false),
         cache_prompt: cache_prompt?,
         prompt_tokens: tokens,
         prompt_tokens_tuple: List.to_tuple(tokens),
@@ -1191,6 +1204,7 @@ defmodule LlamaCppEx.Server do
         tokens_generated: 0,
         max_tokens: max_tokens,
         accumulated_pieces: [],
+        token_ids: [],
         t_start: System.monotonic_time(),
         t_first_token: nil,
         n_prompt_tokens: n_tokens,
@@ -1713,7 +1727,7 @@ defmodule LlamaCppEx.Server do
         end
 
       slot = %{slot | pending_token: token, pending_eog: is_eog}
-      slot = if is_eog, do: slot, else: emit_piece(slot, piece, now)
+      slot = if is_eog, do: slot, else: emit_piece(slot, token, piece, now)
 
       put_in(state.slots[seq_id], slot)
     end)
@@ -1723,23 +1737,35 @@ defmodule LlamaCppEx.Server do
   # into the slot's accumulated output/counters. Streamed bytes pass through
   # a per-slot UTF-8 buffer so a codepoint split across tokens is never sent
   # partially; the accumulated text keeps raw pieces (whole result is valid).
-  defp emit_piece(slot, piece, now) do
+  #
+  # A subscriber that asked for token ids (the chat-completion path parsing
+  # tool calls) gets {:token_id, id} instead: the parser renders the pieces
+  # itself, with the template's marker tokens as text, which these pieces
+  # leave out.
+  defp emit_piece(slot, token, piece, now) do
     utf8_pending =
-      if slot.stream_pid && slot.stream_ref do
-        {out, pending} = UTF8Stream.push(slot.utf8_pending, piece)
+      cond do
+        slot.stream_pid && slot.stream_ref && slot.stream_token_ids ->
+          send(slot.stream_pid, {slot.stream_ref, {:token_id, token}})
+          slot.utf8_pending
 
-        if out != "" do
-          send(slot.stream_pid, {slot.stream_ref, {:token, out}})
-        end
+        slot.stream_pid && slot.stream_ref ->
+          {out, pending} = UTF8Stream.push(slot.utf8_pending, piece)
 
-        pending
-      else
-        slot.utf8_pending
+          if out != "" do
+            send(slot.stream_pid, {slot.stream_ref, {:token, out}})
+          end
+
+          pending
+
+        true ->
+          slot.utf8_pending
       end
 
     %{
       slot
       | accumulated_pieces: [piece | slot.accumulated_pieces],
+        token_ids: [token | slot.token_ids],
         utf8_pending: utf8_pending,
         tokens_generated: slot.tokens_generated + 1,
         t_first_token: slot.t_first_token || now
@@ -2004,6 +2030,7 @@ defmodule LlamaCppEx.Server do
       stream_ref: nil,
       monitor_ref: nil,
       reply_mode: :text,
+      stream_token_ids: false,
       cache_prompt: false,
       prompt_tokens: [],
       prompt_tokens_tuple: {},
@@ -2015,6 +2042,7 @@ defmodule LlamaCppEx.Server do
       tokens_generated: 0,
       max_tokens: 0,
       accumulated_pieces: [],
+      token_ids: [],
       utf8_pending: "",
       t_start: nil,
       t_first_token: nil,
@@ -2037,6 +2065,7 @@ defmodule LlamaCppEx.Server do
   defp completion_reply(%{reply_mode: :full} = slot, stop_reason) do
     %{
       text: accumulated_text(slot),
+      token_ids: Enum.reverse(slot.token_ids),
       completion_tokens: slot.tokens_generated,
       finish_reason: stop_reason
     }

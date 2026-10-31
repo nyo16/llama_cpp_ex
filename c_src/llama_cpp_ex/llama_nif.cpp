@@ -3,7 +3,10 @@
 #include <llama.h>
 #include <ggml-backend.h>
 #include "json-schema-to-grammar.h"
+#include "sampling.h"
 #include "speculative.h"
+#include <cctype>
+#include <random>
 #include <string>
 #include <vector>
 #include <algorithm>
@@ -35,6 +38,7 @@ FINE_RESOURCE(LlamaSampler);
 FINE_RESOURCE(LlamaSpeculative);
 FINE_RESOURCE(CancelFlag);
 FINE_RESOURCE(LlamaDecision);
+FINE_RESOURCE(LlamaChatSession);
 
 // --- Error atoms ---
 //
@@ -969,6 +973,56 @@ FINE_NIF(context_n_rs_seq, 0);
 
 // --- Sampler ---
 
+// Builds the grammar stage, or returns nullptr when it does not compile.
+//
+// Lazy: inactive until the output matches a trigger (a token id, or a regex
+// over the generated text), the shape of a tool-call grammar that lets a model
+// answer in prose or call a tool. `prefill` is fed to a strict grammar before
+// sampling, for a grammar that starts inside the generation prompt.
+static llama_sampler* make_grammar_sampler(
+    const llama_vocab* vocab,
+    const std::string& grammar_str,
+    const std::string& grammar_root,
+    bool lazy,
+    const std::vector<std::string>& trigger_patterns,
+    const std::vector<int64_t>& trigger_tokens,
+    const std::vector<int64_t>& prefill)
+{
+    const int32_t n_vocab = llama_vocab_n_tokens(vocab);
+    const auto in_vocab = [n_vocab](int64_t t) { return t >= 0 && t < n_vocab; };
+    if (!std::all_of(trigger_tokens.begin(), trigger_tokens.end(), in_vocab) ||
+        !std::all_of(prefill.begin(), prefill.end(), in_vocab)) {
+        return nullptr;
+    }
+
+    llama_sampler* grammar = nullptr;
+    try {
+        if (lazy) {
+            std::vector<const char*> patterns;
+            patterns.reserve(trigger_patterns.size());
+            for (const auto& p : trigger_patterns) {
+                patterns.push_back(p.c_str());
+            }
+            const std::vector<llama_token> tokens(trigger_tokens.begin(), trigger_tokens.end());
+            grammar = llama_sampler_init_grammar_lazy_patterns(
+                vocab, grammar_str.c_str(), grammar_root.c_str(),
+                patterns.data(), patterns.size(), tokens.data(), tokens.size());
+        } else {
+            grammar = llama_sampler_init_grammar(vocab, grammar_str.c_str(), grammar_root.c_str());
+        }
+        if (grammar) {
+            for (const auto t : prefill) {
+                llama_sampler_accept(grammar, static_cast<llama_token>(t));
+            }
+        }
+    } catch (const std::exception&) {
+        // a trigger pattern that is not a regex, or a prefill the grammar rejects
+        if (grammar) llama_sampler_free(grammar);
+        return nullptr;
+    }
+    return grammar;
+}
+
 std::variant<fine::Ok<fine::ResourcePtr<LlamaSampler>>, fine::Error<fine::Atom>>
 sampler_init(
     ErlNifEnv* env,
@@ -982,7 +1036,11 @@ sampler_init(
     double penalty_freq,
     double penalty_present,
     std::string grammar_str,
-    std::string grammar_root)
+    std::string grammar_root,
+    bool grammar_lazy,
+    std::vector<std::string> trigger_patterns,
+    std::vector<int64_t> trigger_tokens,
+    std::vector<int64_t> grammar_prefill)
 {
     // Validate the grammar BEFORE allocating the chain, so a rejection cannot
     // leak it.
@@ -1002,9 +1060,8 @@ sampler_init(
     // stage turns "give me JSON" into unconstrained generation, which is a
     // validation bypass rather than a cosmetic degradation.
     if (!grammar_str.empty()) {
-        const auto* vocab = model->vocab();
-        auto* grammar = llama_sampler_init_grammar(
-            vocab, grammar_str.c_str(), grammar_root.c_str());
+        auto* grammar = make_grammar_sampler(model->vocab(), grammar_str, grammar_root, grammar_lazy,
+                                             trigger_patterns, trigger_tokens, grammar_prefill);
         if (!grammar) {
             llama_sampler_free(chain);
             return fine::Error(atoms::invalid_grammar);
@@ -1067,7 +1124,11 @@ grammar_validate(
     ErlNifEnv* env,
     fine::ResourcePtr<LlamaModel> model,
     std::string grammar_str,
-    std::string grammar_root)
+    std::string grammar_root,
+    bool grammar_lazy,
+    std::vector<std::string> trigger_patterns,
+    std::vector<int64_t> trigger_tokens,
+    std::vector<int64_t> grammar_prefill)
 {
     if (grammar_str.empty()) {
         return fine::Ok();
@@ -1078,8 +1139,8 @@ grammar_validate(
         return fine::Error(atoms::invalid_grammar);
     }
 
-    auto* grammar = llama_sampler_init_grammar(
-        model->vocab(), grammar_str.c_str(), grammar_root.c_str());
+    auto* grammar = make_grammar_sampler(model->vocab(), grammar_str, grammar_root, grammar_lazy,
+                                         trigger_patterns, trigger_tokens, grammar_prefill);
     if (!grammar) {
         return fine::Error(atoms::invalid_grammar);
     }
@@ -1959,78 +2020,411 @@ static ERL_NIF_TERM make_binary_term(ErlNifEnv* env, const char* data, size_t le
     return bin;
 }
 
-std::string chat_apply_template(
-    ErlNifEnv* env,
-    std::string tmpl,
-    std::vector<std::tuple<std::string, std::string>> messages,
-    bool add_assistant)
-{
-    // Build llama_chat_message array - keep strings alive
-    std::vector<llama_chat_message> chat_messages;
-    chat_messages.reserve(messages.size());
-    for (const auto& msg : messages) {
-        chat_messages.push_back({std::get<0>(msg).c_str(), std::get<1>(msg).c_str()});
+// Request text that templates may render out of jinja's sight (`| tojson`),
+// swapped for placeholders before rendering; see caller_text_guard.
+struct guarded_text {
+    std::string nonce = random_nonce();
+    std::vector<std::string> originals;
+};
+
+// Every string in v, object keys included, through the guard.
+static common_json guard_all(const caller_text_guard& guard, const common_json& v, guarded_text& g, int depth = 0) {
+    if (depth > 128) {
+        throw std::invalid_argument("chat request is nested too deeply");
     }
-
-    // First call to get required buffer size
-    int n = llama_chat_apply_template(
-        tmpl.c_str(), chat_messages.data(), chat_messages.size(),
-        add_assistant, nullptr, 0);
-
-    if (n < 0) {
-        throw std::runtime_error("failed to apply chat template");
+    if (v.is_string()) {
+        return common_json(guard.protect(v.get<std::string>(), g.nonce, g.originals));
     }
-
-    std::vector<char> buf(n + 1);
-    n = llama_chat_apply_template(
-        tmpl.c_str(), chat_messages.data(), chat_messages.size(),
-        add_assistant, buf.data(), buf.size());
-
-    if (n < 0) {
-        throw std::runtime_error("failed to apply chat template");
+    if (v.is_array()) {
+        common_json out = common_json::array();
+        for (const auto& item : v) {
+            out.push_back(guard_all(guard, item, g, depth + 1));
+        }
+        return out;
     }
-
-    return std::string(buf.data(), n);
+    if (v.is_object()) {
+        common_json out = common_json::object();
+        for (const auto& [key, item] : v.items()) {
+            out[guard.protect(key, g.nonce, g.originals)] = guard_all(guard, item, g, depth + 1);
+        }
+        return out;
+    }
+    return v;
 }
-FINE_NIF(chat_apply_template, 0);
 
-// --- Jinja chat template (via common library) ---
+// The strings under `key` anywhere in v: "description" in a tool's JSON schema,
+// whose property names and enums shape the tool-call grammar and stay as given,
+// or "text" in a message's content parts.
+static common_json guard_key(const caller_text_guard& guard, const common_json& v, const std::string& key,
+                             guarded_text& g, int depth = 0) {
+    if (depth > 128) {
+        throw std::invalid_argument("chat request is nested too deeply");
+    }
+    if (v.is_array()) {
+        common_json out = common_json::array();
+        for (const auto& item : v) {
+            out.push_back(guard_key(guard, item, key, g, depth + 1));
+        }
+        return out;
+    }
+    if (v.is_object()) {
+        common_json out = common_json::object();
+        for (const auto& [k, item] : v.items()) {
+            out[k] = k == key && item.is_string()
+                ? common_json(guard.protect(item.get<std::string>(), g.nonce, g.originals))
+                : guard_key(guard, item, key, g, depth + 1);
+        }
+        return out;
+    }
+    return v;
+}
 
-std::string chat_apply_template_jinja(
-    ErlNifEnv* env,
-    fine::ResourcePtr<LlamaModel> model,
-    std::vector<std::tuple<std::string, std::string>> messages,
-    bool add_assistant,
-    bool enable_thinking,
-    std::vector<std::tuple<std::string, std::string>> extra_kwargs)
-{
+// The text of the messages (content, reasoning, tool call arguments, names and
+// ids) and the tools' descriptions guarded. Roles, tool names and parameter
+// schemas are what the template and the parser match on, and stay as given.
+static common_json guard_chat_request(const caller_text_guard& guard, const common_json& req, guarded_text& g) {
+    common_json out = common_json::object();
+    for (const auto& [key, val] : req.items()) {
+        if (key == "messages" && val.is_array()) {
+            common_json messages = common_json::array();
+            for (const auto& msg : val) {
+                if (!msg.is_object()) {
+                    messages.push_back(msg);
+                    continue;
+                }
+                common_json m = common_json::object();
+                for (const auto& [mk, mv] : msg.items()) {
+                    if (mk == "content" || mk == "reasoning_content" || mk == "name" || mk == "tool_call_id") {
+                        m[mk] = mk == "content" && mv.is_array() ? guard_key(guard, mv, "text", g) : guard_all(guard, mv, g);
+                    } else if (mk == "tool_calls" && mv.is_array()) {
+                        common_json calls = common_json::array();
+                        for (const auto& call : mv) {
+                            common_json c = call;
+                            if (call.is_object() && call.contains("function") && call.at("function").is_object() &&
+                                call.at("function").contains("arguments")) {
+                                c["function"]["arguments"] = guard_all(guard, call.at("function").at("arguments"), g);
+                            }
+                            calls.push_back(c);
+                        }
+                        m[mk] = calls;
+                    } else {
+                        m[mk] = mv;
+                    }
+                }
+                messages.push_back(m);
+            }
+            out[key] = messages;
+        } else if (key == "tools") {
+            out[key] = guard_key(guard, val, "description", g);
+        } else {
+            out[key] = val;
+        }
+    }
+    return out;
+}
+
+// The request LlamaCppEx.Chat encodes as JSON:
+//
+//   {"messages": [OpenAI-shaped messages], "add_generation_prompt": bool,
+//    "enable_thinking": bool, "chat_template_kwargs": {"name": "<JSON text>"},
+//    "tools": [OpenAI-shaped tools], "tool_choice": "auto" | "none" | "required",
+//    "parallel_tool_calls": bool}
+//
+// Only "messages" is required. Messages go through upstream's own OpenAI
+// parser, so a role "tool" message with tool_call_id and an assistant message
+// with tool_calls reach the template the way llama-server passes them.
+static common_chat_templates_inputs chat_request_inputs(LlamaModel& model, const common_json& raw, guarded_text& g) {
+    const common_json req = guard_chat_request(model.chat_guard(), raw, g);
+
     common_chat_templates_inputs inputs;
-    inputs.add_generation_prompt = add_assistant;
     inputs.use_jinja = true;
-    inputs.enable_thinking = enable_thinking;
-
-    // Build messages
-    for (const auto& msg : messages) {
-        common_chat_msg m;
-        m.role = std::get<0>(msg);
-        m.content = std::get<1>(msg);
-        inputs.messages.push_back(std::move(m));
+    inputs.messages = common_chat_msgs_parse_oaicompat(req.at("messages"));
+    inputs.add_generation_prompt = req.value("add_generation_prompt", true);
+    inputs.enable_thinking = req.value("enable_thinking", true);
+    if (req.contains("chat_template_kwargs")) {
+        for (const auto& [key, value] : req.at("chat_template_kwargs").items()) {
+            inputs.chat_template_kwargs[key] = value.get<std::string>();
+        }
     }
+    if (req.contains("tools")) {
+        inputs.tools = common_chat_tools_parse_oaicompat(req.at("tools"));
+        inputs.tool_choice = common_chat_tool_choice_parse_oaicompat(req.value("tool_choice", std::string("auto")));
+        inputs.parallel_tool_calls = req.value("parallel_tool_calls", false);
+        // The reply is parsed with the template's own parser; have it split
+        // reasoning out, as llama-server's default ("auto") does.
+        inputs.reasoning_format = COMMON_REASONING_FORMAT_DEEPSEEK;
 
-    // Extra kwargs
-    for (const auto& kv : extra_kwargs) {
-        inputs.chat_template_kwargs[std::get<0>(kv)] = std::get<1>(kv);
+        if (inputs.tool_choice == COMMON_CHAT_TOOL_CHOICE_NONE) {
+            // Upstream still describes the tools to the model and parses the
+            // reply as plain content, so a model trained to call them writes
+            // the call markup into the content anyway. Not offering them is
+            // what "no tool call" means to a caller (vLLM's
+            // --exclude-tools-when-tool-choice-none).
+            inputs.tools.clear();
+        } else if (!inputs.tools.empty()) {
+            const auto caps = common_chat_templates_get_caps(model.chat_templates.get());
+            if (!caps.value("supports_tool_calls", false)) {
+                throw std::invalid_argument("the model's chat template does not support tool calls");
+            }
+        }
     }
-
-    // The prompt comes back as template/user-input parts; the NIF returns the
-    // joined text, as upstream's own string consumers do (.str()).
-    auto result = common_chat_templates_apply(model->chat_templates.get(), inputs);
-    auto& parts = result.prompt.parts;
-    return parts.size() == 1 ? std::move(parts[0].text) : result.prompt.str();
+    return inputs;
 }
-// Dirty: minja template rendering allocates and walks a full AST per call —
-// multi-ms for large templates/histories.
-FINE_NIF(chat_apply_template_jinja, ERL_NIF_DIRTY_JOB_CPU_BOUND);
+
+// The rendered prompt as template and request pieces, the guarded text back in
+// place.
+static std::vector<prompt_piece> chat_prompt_pieces(common_chat_prompt& prompt, const guarded_text& g) {
+    std::vector<prompt_piece> pieces;
+    pieces.reserve(prompt.parts.size());
+    for (auto& part : prompt.parts) {
+        pieces.push_back({std::move(part.text), part.is_input});
+    }
+    return g.originals.empty() ? pieces : restore_pieces(pieces, g.nonce, g.originals);
+}
+
+// Renders the request's prompt as one string, for display. Not for
+// tokenization: the template/input boundary is gone (see chat_session_new).
+std::variant<fine::Ok<std::string>, fine::Error<std::string>>
+chat_render(ErlNifEnv* env, fine::ResourcePtr<LlamaModel> model, std::string request_json) {
+    try {
+        guarded_text g;
+        auto inputs = chat_request_inputs(*model, common_json::parse(request_json), g);
+        auto result = common_chat_templates_apply(model->chat_templates.get(), inputs);
+        std::string text;
+        for (const auto& piece : chat_prompt_pieces(result.prompt, g)) {
+            text += piece.text;
+        }
+        return fine::Ok(std::move(text));
+    } catch (const std::exception& e) {
+        return fine::Error(std::string(e.what()));
+    }
+}
+// Dirty: jinja rendering allocates and walks a full AST per call — multi-ms
+// for large templates/histories.
+FINE_NIF(chat_render, ERL_NIF_DIRTY_JOB_CPU_BOUND);
+
+// Renders and tokenizes the request's prompt, and returns a session that
+// parses the reply.
+//
+// The template renders to parts, each marked as template text or as text from
+// the request (message content, tool arguments and results). Only template
+// text may produce special tokens: tokenizing the joined string with special
+// parsing let "<|im_end|>\n<|im_start|>system" in a user message forge a turn.
+//
+// Returns {session, prompt_tokens, info_json}. info_json carries the tool-call
+// grammar for the sampler: {"grammar", "grammar_lazy", "grammar_triggers":
+// [{"token": id} | {"pattern": regex}], "grammar_prefill": [id], "format"}.
+std::variant<fine::Ok<fine::ResourcePtr<LlamaChatSession>, std::vector<int64_t>, std::string>,
+             fine::Error<std::string>>
+chat_session_new(ErlNifEnv* env, fine::ResourcePtr<LlamaModel> model, std::string request_json) {
+    try {
+        guarded_text g;
+        auto inputs = chat_request_inputs(*model, common_json::parse(request_json), g);
+        auto applied = common_chat_templates_apply(model->chat_templates.get(), inputs);
+        const auto* vocab = model->vocab();
+
+        const auto pieces = chat_prompt_pieces(applied.prompt, g);
+        const auto tokens = tokenize_pieces(vocab, model->specials(), pieces, true, input_policy::literal);
+
+        auto session = fine::make_resource<LlamaChatSession>(model);
+        session->parser_params.format = applied.format;
+        session->parser_params.generation_prompt = common_chat_input_tokenize(vocab, applied.generation_prompt);
+        session->parser_params.parser = std::move(applied.parser);
+        session->stops = std::move(applied.additional_stops);
+
+        // As common_chat_session: a trigger word that is one token becomes a
+        // token trigger, and the markers the parser reads are preserved.
+        common_params_sampling resolved;
+        resolved.grammar_lazy = applied.grammar_lazy;
+        common_sampling_add_preserved_tokens(resolved, vocab, applied.preserved_tokens);
+        common_sampling_add_grammar_triggers(resolved, vocab, std::move(applied.grammar_triggers));
+        session->preserved_tokens = resolved.preserved_tokens;
+
+        // Triggers in the form llama_sampler_init_grammar_lazy_patterns takes,
+        // converted as common_sampler_init does.
+        common_json triggers = common_json::array();
+        for (const auto& trigger : resolved.grammar_triggers) {
+            switch (trigger.type) {
+                case COMMON_GRAMMAR_TRIGGER_TYPE_TOKEN:
+                    triggers.push_back({{"token", trigger.token}});
+                    break;
+                case COMMON_GRAMMAR_TRIGGER_TYPE_WORD:
+                    triggers.push_back({{"pattern", regex_escape(trigger.value)}});
+                    break;
+                case COMMON_GRAMMAR_TRIGGER_TYPE_PATTERN:
+                    triggers.push_back({{"pattern", trigger.value}});
+                    break;
+                case COMMON_GRAMMAR_TRIGGER_TYPE_PATTERN_FULL: {
+                    const auto& p = trigger.value;
+                    std::string anchored = "^$";
+                    if (!p.empty()) {
+                        anchored = (p.front() != '^' ? "^" : "") + p + (p.back() != '$' ? "$" : "");
+                    }
+                    triggers.push_back({{"pattern", anchored}});
+                    break;
+                }
+            }
+        }
+
+        // A strict (non-lazy) tool-call grammar starts where the generation
+        // prompt leaves off, so it is fed those tokens first. The tokens the
+        // prompt itself already holds; see common_sampler_init.
+        common_json prefill = common_json::array();
+        if (!applied.grammar.empty() && !applied.grammar_lazy && !applied.generation_prompt.empty()) {
+            const auto gp = common_tokenize(vocab, applied.generation_prompt, false, true);
+            for (size_t i = 0; i < gp.size(); i++) {
+                const std::string piece = common_token_to_piece(vocab, gp[i], true);
+                if (i == 0 && !piece.empty() && std::isspace((unsigned char) piece[0]) &&
+                    !std::isspace((unsigned char) applied.generation_prompt[0])) {
+                    continue;
+                }
+                prefill.push_back(gp[i]);
+            }
+        }
+
+        const common_json info = {
+            {"grammar", applied.grammar},
+            {"grammar_lazy", applied.grammar_lazy},
+            {"grammar_triggers", triggers},
+            {"grammar_prefill", prefill},
+            {"format", common_chat_format_name(applied.format)},
+        };
+
+        return fine::Ok<fine::ResourcePtr<LlamaChatSession>, std::vector<int64_t>, std::string>(
+            session, std::vector<int64_t>(tokens.begin(), tokens.end()),
+            info.dump_safe());
+    } catch (const std::exception& e) {
+        return fine::Error(std::string(e.what()));
+    }
+}
+FINE_NIF(chat_session_new, ERL_NIF_DIRTY_JOB_CPU_BOUND);
+
+// Appends generated tokens to the reply. Returns true once the reply reaches
+// one of the template's literal stop strings; the reply is cut before it and
+// later tokens are ignored.
+bool chat_session_append(ErlNifEnv* env, fine::ResourcePtr<LlamaChatSession> session,
+                         std::vector<int64_t> tokens) {
+    auto& s = *session;
+    if (s.stopped) {
+        return true;
+    }
+    const auto* vocab = s.model->vocab();
+    const size_t before = s.input.size();
+    for (const auto tok : tokens) {
+        const auto id = static_cast<llama_token>(tok);
+        if (id < 0 || id >= llama_vocab_n_tokens(vocab)) {
+            throw std::invalid_argument("token id out of range");
+        }
+        s.input.append(common_token_to_piece(vocab, id, s.preserved_tokens.count(id) > 0), id);
+    }
+    for (const auto& stop : s.stops) {
+        if (stop.empty()) {
+            continue;
+        }
+        // A stop can only end in the new text.
+        const size_t from = before >= stop.size() - 1 ? before - (stop.size() - 1) : 0;
+        const size_t pos = s.input.text.find(stop, from);
+        if (pos != std::string::npos) {
+            s.input.truncate(pos);
+            s.stopped = true;
+        }
+    }
+    return s.stopped;
+}
+FINE_NIF(chat_session_append, 0);
+
+// Byte length of the longest prefix of text that does not end inside a UTF-8
+// sequence. A partial parse must not hand out half a code point.
+static size_t utf8_complete_prefix(const std::string& text) {
+    const size_t n = text.size();
+    for (size_t back = 1; back <= 4 && back <= n; back++) {
+        const unsigned char c = text[n - back];
+        if ((c & 0xC0) == 0x80) {
+            continue; // continuation byte
+        }
+        const size_t need = c < 0x80 ? 1 : (c >> 5) == 0x6 ? 2 : (c >> 4) == 0xE ? 3 : (c >> 3) == 0x1E ? 4 : 1;
+        return need > back ? n - back : n;
+    }
+    return n;
+}
+
+// The random part of a tool call id ("call_" + 24 alphanumerics), as
+// llama-server's gen_tool_call_id.
+static std::string random_tool_call_suffix() {
+    static const char alphabet[] = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
+    thread_local std::mt19937 gen{std::random_device{}()};
+    std::uniform_int_distribution<size_t> dist(0, sizeof(alphabet) - 2);
+    std::string out(24, '0');
+    for (auto& c : out) {
+        c = alphabet[dist(gen)];
+    }
+    return out;
+}
+
+static common_json chat_msg_json(const common_chat_msg& msg) {
+    common_json tool_calls = common_json::array();
+    for (const auto& tc : msg.tool_calls) {
+        tool_calls.push_back({{"id", tc.id}, {"name", tc.name}, {"arguments", tc.arguments}});
+    }
+    return {
+        {"content", msg.content},
+        {"reasoning_content", msg.reasoning_content},
+        {"tool_calls", tool_calls},
+    };
+}
+
+// Parses the reply so far. `final` parses it as complete. Returns JSON:
+// {"diffs": [{"content": s} | {"reasoning_content": s} |
+//            {"tool_call": {"index": i, "id": s, "name": s, "arguments": s}}],
+//  "message": {...}}, "message" only when final. A partial parse that has
+// nothing new returns no diffs.
+std::variant<fine::Ok<std::string>, fine::Error<std::string>>
+chat_session_parse(ErlNifEnv* env, fine::ResourcePtr<LlamaChatSession> session, bool final) {
+    auto& s = *session;
+    try {
+        common_chat_msg parsed;
+        if (final) {
+            parsed = common_chat_parse(s.input, false, s.parser_params);
+        } else {
+            const size_t complete = utf8_complete_prefix(s.input.text);
+            parsed = complete == s.input.size()
+                ? common_chat_parse(s.input, true, s.parser_params)
+                : common_chat_parse(s.input.substr(0, complete), true, s.parser_params);
+        }
+
+        common_json diffs = common_json::array();
+        if (!parsed.empty()) {
+            parsed.set_tool_call_ids(s.tool_call_ids, [] { return "call_" + random_tool_call_suffix(); });
+            for (const auto& d : common_chat_msg_diff::compute_diffs(s.msg, parsed)) {
+                if (!d.reasoning_content_delta.empty()) {
+                    diffs.push_back({{"reasoning_content", d.reasoning_content_delta}});
+                }
+                if (!d.content_delta.empty()) {
+                    diffs.push_back({{"content", d.content_delta}});
+                }
+                if (d.tool_call_index != std::string::npos) {
+                    diffs.push_back({{"tool_call", {
+                        {"index", d.tool_call_index},
+                        {"id", d.tool_call_delta.id},
+                        {"name", d.tool_call_delta.name},
+                        {"arguments", d.tool_call_delta.arguments},
+                    }}});
+                }
+            }
+            s.msg = std::move(parsed);
+        }
+
+        common_json out = {{"diffs", diffs}};
+        if (final) {
+            out["message"] = chat_msg_json(s.msg);
+        }
+        return fine::Ok(out.dump_safe());
+    } catch (const std::exception& e) {
+        return fine::Error(std::string(e.what()));
+    }
+}
+// Dirty: re-parses the whole reply, so its cost grows with the reply.
+FINE_NIF(chat_session_parse, ERL_NIF_DIRTY_JOB_CPU_BOUND);
 
 // --- Speculative decoding (MTP) ---
 

@@ -9,6 +9,10 @@ defmodule LlamaCppEx.TestModels do
 
   @vars %{
     gen: {"LLAMA_SMOKE_GEN_MODEL", "a chat/instruct"},
+    # A chat model whose template supports tool calling (Qwen3.5-0.8B,
+    # Llama-3.2-1B-Instruct). Its own var because CI's :gen model, SmolLM2-135M,
+    # has a template without tools.
+    tools: {"LLAMA_SMOKE_TOOLS_MODEL", "a tool-calling chat"},
     emb: {"LLAMA_SMOKE_EMB_MODEL", "an embedding"},
     mtp: {"LLAMA_SMOKE_MTP_MODEL", "an MTP-enabled"},
     # The head-only sidecar half of a target/draft pair, e.g. Qwen 3.8's
@@ -42,6 +46,7 @@ defmodule LlamaCppEx.TestModels do
 
   @type kind ::
           :gen
+          | :tools
           | :emb
           | :mtp
           | :mtp_draft

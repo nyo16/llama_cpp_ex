@@ -9,6 +9,11 @@ defmodule LlamaCppEx.Decision do
   [TypeSafe-compatible System One API](https://github.com/ggml-org/llama.cpp/blob/master/tools/server/README.md#post-v1systemone-typesafe-compatible-system-one-api),
   ported into the NIF: same request shape, same prompts, same answers.
 
+  One deliberate difference: special-token text in the caller's input (the
+  state, instructions, descriptions, criteria) is tokenized as text, where
+  llama-server parses it as the special tokens themselves on most decision
+  types. A request without such text tokenizes exactly as llama-server's.
+
   ## Models
 
   The model file says what kind of decision model it is
