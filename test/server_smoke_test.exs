@@ -30,15 +30,23 @@ defmodule LlamaCppEx.ServerSmokeTest do
     server
   end
 
-  defp attach_collector(event) do
+  # Telemetry handlers are global, so filter on the server under test: the
+  # previous test's server can still be emitting `:done` after its caller got
+  # the reply (finish_slot replies first), and ExUnit does not wait for that
+  # linked server to stop before starting the next test.
+  defp attach_collector(server, event) do
     parent = self()
     handler_id = {__MODULE__, self(), event}
 
     :telemetry.attach(
       handler_id,
       event,
-      fn _event, measurements, metadata, _ ->
-        send(parent, {:telemetry, measurements, metadata})
+      fn
+        _event, measurements, %{server: ^server} = metadata, _ ->
+          send(parent, {:telemetry, measurements, metadata})
+
+        _event, _measurements, _metadata, _ ->
+          :ok
       end,
       nil
     )
@@ -83,7 +91,7 @@ defmodule LlamaCppEx.ServerSmokeTest do
 
   test "per-request cache_prompt overrides: hit, no-reuse, no-retention" do
     server = start_server(n_parallel: 1)
-    attach_collector([:llama_cpp_ex, :server, :request, :start])
+    attach_collector(server, [:llama_cpp_ex, :server, :request, :start])
 
     prompt = "User: Name three colors.\nAssistant:"
     {:ok, reply} = Server.generate(server, prompt, max_tokens: 12)
@@ -106,7 +114,7 @@ defmodule LlamaCppEx.ServerSmokeTest do
 
   test "session affinity keeps interleaved conversations on their slots" do
     server = start_server([])
-    attach_collector([:llama_cpp_ex, :server, :request, :start])
+    attach_collector(server, [:llama_cpp_ex, :server, :request, :start])
 
     # The two prompts must share no leading tokens. pick_cached_slot/2 reuses a
     # slot when longest-common-prefix / prompt_len > 0.1, so a shared opener
@@ -195,7 +203,7 @@ defmodule LlamaCppEx.ServerSmokeTest do
 
   test "halting a stream early cancels generation and frees the slot" do
     server = start_server(n_parallel: 1)
-    attach_collector([:llama_cpp_ex, :server, :request, :done])
+    attach_collector(server, [:llama_cpp_ex, :server, :request, :done])
 
     _ = Server.stream(server, "Write an endless story:", max_tokens: 400) |> Enum.take(3)
 
@@ -295,7 +303,7 @@ defmodule LlamaCppEx.ServerSmokeTest do
   # hand one request's KV to another when their prompts share a prefix.
   test "a cached prefix is never reused across cache scopes" do
     server = start_server(n_parallel: 1, prompt_cache_ram_mb: 64)
-    attach_collector([:llama_cpp_ex, :server, :request, :start])
+    attach_collector(server, [:llama_cpp_ex, :server, :request, :start])
 
     prompt =
       "Internal memo, confidential. " <>

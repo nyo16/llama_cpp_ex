@@ -819,29 +819,53 @@ defmodule LlamaCppExTest do
       ref = make_ref()
       test_pid = self()
 
+      start_id = "test-request-start-#{inspect(ref)}"
+      done_id = "test-request-done-#{inspect(ref)}"
+      tick_id = "test-tick-#{inspect(ref)}"
+
+      on_exit(fn ->
+        :telemetry.detach(start_id)
+        :telemetry.detach(done_id)
+        :telemetry.detach(tick_id)
+      end)
+
+      # Handlers are global: pin the server so a lingering server from an
+      # earlier test cannot satisfy these assertions.
       :telemetry.attach(
-        "test-request-start-#{inspect(ref)}",
+        start_id,
         [:llama_cpp_ex, :server, :request, :start],
-        fn _event, measurements, metadata, _config ->
-          send(test_pid, {:start_telemetry, measurements, metadata})
+        fn
+          _event, measurements, %{server: ^server} = metadata, _config ->
+            send(test_pid, {:start_telemetry, measurements, metadata})
+
+          _event, _measurements, _metadata, _config ->
+            :ok
         end,
         nil
       )
 
       :telemetry.attach(
-        "test-request-done-#{inspect(ref)}",
+        done_id,
         [:llama_cpp_ex, :server, :request, :done],
-        fn _event, measurements, metadata, _config ->
-          send(test_pid, {:telemetry, measurements, metadata})
+        fn
+          _event, measurements, %{server: ^server} = metadata, _config ->
+            send(test_pid, {:telemetry, measurements, metadata})
+
+          _event, _measurements, _metadata, _config ->
+            :ok
         end,
         nil
       )
 
       :telemetry.attach(
-        "test-tick-#{inspect(ref)}",
+        tick_id,
         [:llama_cpp_ex, :server, :tick],
-        fn _event, measurements, _metadata, _config ->
-          send(test_pid, {:tick_telemetry, measurements})
+        fn
+          _event, measurements, %{server: ^server}, _config ->
+            send(test_pid, {:tick_telemetry, measurements})
+
+          _event, _measurements, _metadata, _config ->
+            :ok
         end,
         nil
       )
@@ -873,7 +897,7 @@ defmodule LlamaCppExTest do
       # be strictly less than duration.
       assert measurements.ttft_ms < measurements.duration_ms
 
-      assert is_pid(metadata.server)
+      assert metadata.server == server
       assert is_integer(metadata.seq_id)
       assert metadata.mode == :generate
       assert metadata.stop_reason in [:eog, :max_tokens]
@@ -883,10 +907,6 @@ defmodule LlamaCppExTest do
       assert is_number(tick_measurements.batch_size)
       assert tick_measurements.batch_size > 0
       assert is_number(tick_measurements.eval_ms)
-
-      :telemetry.detach("test-request-start-#{inspect(ref)}")
-      :telemetry.detach("test-request-done-#{inspect(ref)}")
-      :telemetry.detach("test-tick-#{inspect(ref)}")
     end
 
     test "cache_prompt sequential requests don't crash on hybrid models", %{
