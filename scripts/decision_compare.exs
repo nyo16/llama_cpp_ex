@@ -32,7 +32,7 @@
 #
 # Then:
 #
-#   GGML_METAL_NO_RESIDENCY=1 mix run scripts/decision_compare.exs MODEL 18081
+#   mix run scripts/decision_compare.exs MODEL 18081
 alias LlamaCppEx.{Context, Decision}
 [path, port] = System.argv()
 :ok = LlamaCppEx.init()

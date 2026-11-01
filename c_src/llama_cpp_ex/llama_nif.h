@@ -15,6 +15,27 @@
 
 namespace llama_cpp_ex {
 
+class LlamaModel;
+class LlamaContext;
+class LlamaSpeculative;
+
+// Every live model, context and speculative session, so that
+// free_live_resources_at_exit (llama_nif.cpp) can free what the BEAM never
+// destroys at halt. Each constructor adds itself and each destructor removes
+// itself and frees its llama object while holding the lock, so a destructor
+// running on a GC'ing scheduler cannot race the exit hook. Recursive because a
+// destructor can drop the last reference to another tracked resource
+// (LlamaContext's ctx_other) while it still holds the lock.
+namespace live {
+std::recursive_mutex& mutex();
+void add(LlamaModel* m);
+void remove(LlamaModel* m);
+void add(LlamaContext* c);
+void remove(LlamaContext* c);
+void add(LlamaSpeculative* s);
+void remove(LlamaSpeculative* s);
+} // namespace live
+
 // RAII wrapper for llama_model*
 class LlamaModel {
 public:
@@ -24,11 +45,22 @@ public:
     explicit LlamaModel(llama_model* m)
         : model(m)
         , chat_templates(common_chat_templates_init(m, ""))
-    {}
+    {
+        live::add(this);
+    }
     ~LlamaModel() {
+        std::lock_guard<std::recursive_mutex> lock(live::mutex());
+        live::remove(this);
+        release();
+    }
+
+    // Frees the llama model, leaving this object empty. Called by the
+    // destructor, or by the exit hook for a model the BEAM still references.
+    void release() {
         // Release chat_templates before freeing the model
         chat_templates.reset();
         if (model) llama_model_free(model);
+        model = nullptr;
     }
 
     LlamaModel(const LlamaModel&) = delete;
@@ -79,6 +111,9 @@ public:
     // Fine keep for the raw llama_context* passed as params.ctx_other.
     // gemma4-assistant stores that pointer in cparams; Qwen does not.
     fine::ResourcePtr<LlamaContext> ctx_other;
+    // Whether ctx_other is set (ResourcePtr has no null test). The exit hook
+    // frees such a context before the one it points at.
+    bool has_ctx_other = false;
 
     // Reusable explicit batch for the decode-side NIFs (batch_eval,
     // batch_eval_sample, decode_token, prefill), allocated once on first use
@@ -156,11 +191,15 @@ public:
     }
 
     LlamaContext(llama_context* c, fine::ResourcePtr<LlamaModel> m)
-        : ctx(c), model(std::move(m)) {}
+        : ctx(c), model(std::move(m)) {
+        live::add(this);
+    }
 
     LlamaContext(llama_context* c, fine::ResourcePtr<LlamaModel> m,
                  fine::ResourcePtr<LlamaContext> other)
-        : ctx(c), model(std::move(m)), ctx_other(std::move(other)) {}
+        : ctx(c), model(std::move(m)), ctx_other(std::move(other)), has_ctx_other(true) {
+        live::add(this);
+    }
 
     // Returns the reusable batch with capacity for at least n tokens
     // (per-token seq-id capacity 1 — all decode builders use single-seq
@@ -175,12 +214,20 @@ public:
     }
 
     ~LlamaContext() {
+        std::lock_guard<std::recursive_mutex> lock(live::mutex());
+        live::remove(this);
         if (batch_capacity > 0) llama_batch_free(batch);
-        if (ctx) llama_free(ctx);
-        ctx = nullptr;
+        release();
         // llama_free the draft first: gemma4-assistant still holds
         // cparams.ctx_other until that returns. Then drop the Fine keep.
         ctx_other = {};
+    }
+
+    // Frees the llama context, leaving this object empty. Called by the
+    // destructor, or by the exit hook for a context the BEAM still references.
+    void release() {
+        if (ctx) llama_free(ctx);
+        ctx = nullptr;
     }
 
     LlamaContext(const LlamaContext&) = delete;
@@ -297,9 +344,21 @@ public:
         , ctx_dft(std::move(dft))
         , n_draft(n)
         , needs_ckpt(ckpt)
-    {}
+    {
+        live::add(this);
+    }
     ~LlamaSpeculative() {
+        std::lock_guard<std::recursive_mutex> lock(live::mutex());
+        live::remove(this);
+        release();
+    }
+
+    // Frees the speculative state, including the draft contexts
+    // common_speculative creates for itself. Called by the destructor, or by
+    // the exit hook, which runs it before freeing any context.
+    void release() {
         if (spec) common_speculative_free(spec);
+        spec = nullptr;
     }
 
     LlamaSpeculative(const LlamaSpeculative&) = delete;

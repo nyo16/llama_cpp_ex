@@ -5,7 +5,6 @@ defmodule LlamaCppEx.DecisionTest do
   embeddings output at marker tokens, tinyopenjev reads label logits and shares
   a prompt prefix across questions.
 
-      GGML_METAL_NO_RESIDENCY=1 \\
       LLAMA_SMOKE_DECISION_LAYA_MODEL=/path/to/tinylaya-for-testing-Q8_0.gguf \\
       LLAMA_SMOKE_DECISION_OPENJEV_MODEL=/path/to/tinyopenjev-for-testing-Q8_0.gguf \\
         mix test test/decision_test.exs --include decision

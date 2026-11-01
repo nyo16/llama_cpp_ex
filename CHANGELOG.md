@@ -1,5 +1,27 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+
+- **The VM no longer aborts at exit on Metal when a model is still
+  referenced** (#116). A model or context referenced by anything alive at halt
+  (`persistent_term`, ETS, a process `System.halt/1` does not stop first, a
+  Server mid-generation) made the VM exit 134 on
+  `GGML_ASSERT([rsets->data count] == 0)` instead of with its own status. The
+  BEAM does not run NIF resource destructors at halt, and llama.cpp's Metal
+  device, a C++ static destroyed during `exit(3)`, asserts that no residency
+  set is left. Precompiled NIFs hit this from v0.8.63 on: their move to
+  `macos-15` runners built them against the macOS 15 SDK, the first with
+  residency sets (v0.8.62's SDK 14.5 build had none). The NIF now frees every
+  live model, context and MTP session in an exit handler that runs before
+  those destructors. Running NIF calls finish first; new ones raise, and
+  generation loops, decode and model loading stop at once. Exit statuses are
+  kept (`System.halt(7)` exits 7). `test/vm_exit_test.exs` halts a child VM
+  with a model, a context and a generating Server alive. The test
+  instructions no longer set `GGML_METAL_NO_RESIDENCY=1`, which was only a
+  workaround for this.
+
 ## v0.8.64
 
 Quieter llama.cpp logging with a configurable level, `:tools` coverage in

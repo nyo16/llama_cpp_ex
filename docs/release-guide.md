@@ -353,12 +353,9 @@ deliberately do not work around.
 LLAMA_BACKEND=cpu mix compile
 
 # Run the suite. The default run needs no model; each opt-in tag names the env
-# var for the model it loads (see test/test_helper.exs). GGML_METAL_NO_RESIDENCY
-# is Metal-only, and only stops a post-suite assert in llama.cpp's Metal device
-# destructor from aborting the VM after a green run.
+# var for the model it loads (see test/test_helper.exs).
 mix test
 
-GGML_METAL_NO_RESIDENCY=1 \
 LLAMA_SMOKE_GEN_MODEL=~/Downloads/Qwen3.5-0.8B-UD-Q4_K_XL.gguf \
 LLAMA_SMOKE_EMB_MODEL=~/Downloads/Qwen3-Embedding-0.6B-f16.gguf \
 LLAMA_SMOKE_MTP_MODEL=~/Downloads/Qwen3.6-35B-A3B-MTP-UD-Q4_K_XL.gguf \
@@ -367,18 +364,15 @@ LLAMA_SMOKE_MTP_MODEL=~/Downloads/Qwen3.6-35B-A3B-MTP-UD-Q4_K_XL.gguf \
 # A second embedding model worth running: embeddinggemma-2 has n_embd_out
 # (768) != n_embd (512) and defaults to mean pooling, which together caught
 # two bugs in v0.8.56 that Qwen3-Embedding (last pooling, equal widths) cannot.
-GGML_METAL_NO_RESIDENCY=1 \
 LLAMA_SMOKE_EMB_MODEL=~/Downloads/embeddinggemma-2-Q8_0.gguf \
   mix test --include embeddings
 
 # The decision tags: the tiny laya/openjev pair that CI uses, and the real
 # Clef Flash (9B) behind its own tag because no tiny clef exists.
-GGML_METAL_NO_RESIDENCY=1 \
 LLAMA_SMOKE_DECISION_LAYA_MODEL=~/Downloads/tinylaya-for-testing-Q8_0.gguf \
 LLAMA_SMOKE_DECISION_OPENJEV_MODEL=~/Downloads/tinyopenjev-for-testing-Q8_0.gguf \
   mix test --include decision
 
-GGML_METAL_NO_RESIDENCY=1 \
 LLAMA_SMOKE_DECISION_CLEF_MODEL=~/Downloads/Cloudflare_clef-flash-Q8_0.gguf \
   mix test --include decision_clef
 
@@ -399,7 +393,6 @@ LLAMA_SMOKE_DECISION_CLEF_MODEL=~/Downloads/Cloudflare_clef-flash-Q8_0.gguf \
 # openbmb-minicpm-ocr-jev is not supported (two images per request), so there
 # is nothing to compare.
 
-GGML_METAL_NO_RESIDENCY=1 \
 LLAMA_SMOKE_MTP_MODEL=~/Downloads/Qwen3.8-27B-Q4_K_M.gguf \
 LLAMA_SMOKE_MTP_DRAFT_MODEL=~/Downloads/mtp-Qwen3.8-27B-Q4_0.gguf \
   mix test --include mtp_sidecar
@@ -407,7 +400,6 @@ LLAMA_SMOKE_MTP_DRAFT_MODEL=~/Downloads/mtp-Qwen3.8-27B-Q4_0.gguf \
 # The Qwen pair is required: MTPSidecarTest has no skip and calls path!/1.
 # Add the E4B pair to also run MTPE4BSidecarTest. Unset E4B vars skip that
 # module, so the Qwen-only command above stays green.
-GGML_METAL_NO_RESIDENCY=1 \
 LLAMA_SMOKE_MTP_MODEL=~/Downloads/Qwen3.8-27B-Q4_K_M.gguf \
 LLAMA_SMOKE_MTP_DRAFT_MODEL=~/Downloads/mtp-Qwen3.8-27B-Q4_0.gguf \
 LLAMA_SMOKE_MTP_E4B_MODEL=~/Downloads/gemma-4-E4B-it-Q4_K_M.gguf \
@@ -420,12 +412,11 @@ LLAMA_SMOKE_MTP_E4B_DRAFT_MODEL=~/Downloads/mtp-gemma-4-E4B-it-Q8_0.gguf \
 # `LLAMA_RPC=1 make rpc-server` and upstream's ggml-rpc-server binary.
 LLAMA_RPC=1 LLAMA_BACKEND=metal MIX_ENV=test mix run --no-halt -e \
   'LlamaCppEx.RPC.Server.start_link(endpoint: "127.0.0.1:50052")' &
-GGML_METAL_NO_RESIDENCY=1 LLAMA_RPC=1 LLAMA_RPC_ENDPOINT=127.0.0.1:50052 \
+LLAMA_RPC=1 LLAMA_RPC_ENDPOINT=127.0.0.1:50052 \
   mix test --include rpc_live
 
 # :mtp_cancel is the one tag that is not expected to pass; run it to confirm
 # how it fails, and update test/mtp_model_test.exs if the failure mode moved.
-GGML_METAL_NO_RESIDENCY=1 \
 LLAMA_SMOKE_MTP_MODEL=~/Downloads/Qwen3.6-35B-A3B-MTP-UD-Q4_K_XL.gguf \
   mix test --only mtp_cancel
 

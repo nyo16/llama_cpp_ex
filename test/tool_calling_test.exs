@@ -3,7 +3,6 @@ defmodule LlamaCppEx.ToolCallingTest do
   Tool calling through `chat_completion/3` and `stream_chat_completion/3`
   (issue #111), against a model whose chat template supports tools:
 
-      GGML_METAL_NO_RESIDENCY=1 \\
       LLAMA_SMOKE_TOOLS_MODEL=/path/to/Qwen3.5-0.8B-UD-Q4_K_XL.gguf \\
         mix test test/tool_calling_test.exs --include tools
 

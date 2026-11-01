@@ -11,7 +11,6 @@ defmodule LlamaCppEx.EmbeddingsTest do
   happens to pass both flags. They also paid for loading the *generation* model in
   `SmokeTest`'s `setup_all`, which they never used.
 
-      GGML_METAL_NO_RESIDENCY=1 \\
       LLAMA_SMOKE_EMB_MODEL=/path/to/embedding-model.gguf \\
         mix test test/embeddings_test.exs --include embeddings
 

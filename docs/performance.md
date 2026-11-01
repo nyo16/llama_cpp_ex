@@ -122,7 +122,7 @@ We tested Q8_0 against F16 with 10 deterministic prompts (temp: 0.0) covering ar
 Run the regression tests yourself:
 
 ```bash
-GGML_METAL_NO_RESIDENCY=1 LLAMA_SMOKE_GEN_MODEL=model.gguf \
+LLAMA_SMOKE_GEN_MODEL=model.gguf \
   mix test test/kv_quantization_test.exs --include slow
 ```
 
