@@ -1,7 +1,8 @@
 # llama_cpp_ex — project rules
 
 Documented solutions live in `.claude/solutions/`; search there before
-investigating a tokenizer, template, logging, or release problem.
+investigating a tokenizer, template, logging, NIF teardown, flaky test or
+release problem.
 
 ## Prompts and tokenization
 
@@ -29,6 +30,20 @@ investigating a tokenizer, template, logging, or release problem.
   load. Set `LlamaCppEx.set_log_level/1` (or `config :llama_cpp_ex,
   log_level:`) *before* `LlamaCppEx.init/0`, or backend-init lines escape.
 
+## NIF and teardown
+
+- Register every NIF with `LLAMA_NIF`, never `FINE_NIF`: the wrapper's
+  in-flight guard is what lets the exit hook free resources safely (#116).
+- A resource that owns backend buffers (`llama_model`, `llama_context`,
+  `common_speculative`, anything allocating on a ggml device) joins the
+  `live::` registry: `live::add` in constructors, a destructor that locks
+  `live::mutex()`, removes itself and calls `release()`, and a release step in
+  `free_live_resources_at_exit` in dependency order. Long loops and callbacks
+  inside NIFs stop on `g_exiting`.
+- Exit-path regressions show only in the VM's exit status. Run
+  `test/vm_exit_test.exs` (`--include smoke`) after touching resource
+  lifetimes, and never paper over an abort with `GGML_METAL_NO_RESIDENCY=1`.
+
 ## Releases and CI
 
 - Any macOS runner image bump in `.github/workflows/precompile.yml` keeps
@@ -42,5 +57,17 @@ investigating a tokenizer, template, logging, or release problem.
   latest release and changelog before working around it.
 - CI runs `--include tools` against pinned Qwen3.5-0.8B-UD-Q4_K_XL; keep the
   `:tools` tests passing on the CPU backend.
+- When the macOS runner image or SDK changes, compare the new NIF with the
+  previous release (`otool -l` for `sdk`/`minos`, `strings` for feature
+  selectors). llama.cpp gates features such as Metal residency sets on SDK
+  macros, and they switch on silently (#116).
 - After a release, smoke-test end to end from a fresh `/tmp` project that
   depends on the published version, using the models in `~/Downloads`.
+  Run it without `GGML_METAL_NO_RESIDENCY` and check the exit status, not
+  only the pass count.
+
+## Tests
+
+- A test-side `:telemetry.attach` filters on an identity the test owns
+  (`%{server: ^server}`, a ref) and detaches in `on_exit`. A linked server can
+  outlive its test and emit after replying.
