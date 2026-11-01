@@ -935,7 +935,10 @@ defmodule LlamaCppExTest do
       :telemetry.attach(
         handler,
         [:llama_cpp_ex, :server, :request, :start],
-        fn _e, m, _meta, _ -> send(parent, {:started, m}) end,
+        fn
+          _e, m, %{server: ^server}, _ -> send(parent, {:started, m})
+          _e, _m, _meta, _ -> :ok
+        end,
         nil
       )
 
