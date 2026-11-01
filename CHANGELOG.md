@@ -1,6 +1,9 @@
 # Changelog
 
-## Unreleased
+## v0.8.65
+
+Fixes the Metal abort at VM exit with a model still referenced (#116).
+llama.cpp stays at `418f905a4`.
 
 ### Fixed
 
@@ -21,6 +24,22 @@
   with a model, a context and a generating Server alive. The test
   instructions no longer set `GGML_METAL_NO_RESIDENCY=1`, which was only a
   workaround for this.
+
+Verified on macOS, M1 Max, Metal, with residency sets on
+(`GGML_METAL_NO_RESIDENCY` unset), every run exiting 0: default **436
+passed, 197 excluded**; `--include smoke --include embeddings --include slow
+--include mtp` (Qwen3.5-0.8B-UD-Q4_K_XL, Qwen3-Embedding-0.6B-f16,
+Qwen3.6-35B-A3B-MTP-UD-Q4_K_XL) **588 passed**; CI's set (SmolLM2-135M,
+bge-small, tinylaya, tinyopenjev, Qwen3.5-0.8B) **604 passed**, eight runs
+across the change; `--include embeddings` on embeddinggemma-2-Q8_0 **447
+passed**; `--include decision_clef` on Clef Flash Q8_0 **440 passed**;
+`--include tools` on Llama-3.2-1B-Instruct 446 of 447 (the round trip calls
+the tool again, as before); `--include mtp_sidecar` on Qwen3.8-27B-Q4_K_M +
+mtp-Qwen3.8-27B-Q4_0 **442 passed, 6 skipped**. CPU backend: `--include
+tools` on Qwen3.5-0.8B **447 passed**, `test/vm_exit_test.exs` **3 passed**.
+Without the fix the three `vm_exit_test` cases fail with exit 134 (SIGBUS
+for the CPU-first case), and the issue's repro aborts on the published
+0.8.64. Format, credo `--strict` and dialyzer (0 errors) clean.
 
 ## v0.8.64
 
