@@ -9,12 +9,8 @@ defmodule LlamaCppEx.SmokeTest do
   is slow. Run it explicitly after bumping the `vendor/llama.cpp` submodule or
   rebuilding the NIF:
 
-      GGML_METAL_NO_RESIDENCY=1 \\
       LLAMA_SMOKE_GEN_MODEL=/path/to/chat-model.gguf \\
         mix test test/smoke_test.exs --include smoke
-
-  On Metal, `GGML_METAL_NO_RESIDENCY=1` keeps a passing run from aborting with
-  exit 134 while the VM tears down; `test/test_helper.exs` explains why.
 
   `LLAMA_SMOKE_GEN_MODEL` is the only model this suite needs — any small instruct
   model works (e.g. a 0.5B–3B Q4 GGUF). Embedding paths live in

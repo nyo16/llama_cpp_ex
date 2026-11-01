@@ -63,27 +63,22 @@
 # exactly the ones whose model you have. The helper `LlamaCppEx.TestModels`
 # raises with the env var name when an included test has no model to load.
 #
-#   GGML_METAL_NO_RESIDENCY=1 \
 #   LLAMA_SMOKE_GEN_MODEL=/path/to/chat-model.gguf \
 #     mix test --include smoke
 #
-#   GGML_METAL_NO_RESIDENCY=1 \
 #   LLAMA_SMOKE_GEN_MODEL=/path/to/chat-model.gguf \
 #   LLAMA_SMOKE_EMB_MODEL=/path/to/embedding-model.gguf \
 #     mix test --include smoke --include embeddings
 #
-#   GGML_METAL_NO_RESIDENCY=1 \
 #   LLAMA_SMOKE_MTP_MODEL=/path/to/mtp-model.gguf \
 #     mix test --include mtp
 #
-#   GGML_METAL_NO_RESIDENCY=1 \
 #   LLAMA_SMOKE_MTP_MODEL=/path/to/Qwen3.8-27B-Q4_K_M.gguf \
 #   LLAMA_SMOKE_MTP_DRAFT_MODEL=/path/to/mtp-Qwen3.8-27B-Q4_0.gguf \
 #     mix test --include mtp_sidecar
 #
 #   The Qwen pair is required (MTPSidecarTest has no skip). Add the E4B pair
 #   to also run MTPE4BSidecarTest; omit those two vars and that module skips.
-#   GGML_METAL_NO_RESIDENCY=1 \
 #   LLAMA_SMOKE_MTP_MODEL=/path/to/Qwen3.8-27B-Q4_K_M.gguf \
 #   LLAMA_SMOKE_MTP_DRAFT_MODEL=/path/to/mtp-Qwen3.8-27B-Q4_0.gguf \
 #   LLAMA_SMOKE_MTP_E4B_MODEL=/path/to/gemma-4-E4B-it-Q4_K_M.gguf \
@@ -93,37 +88,19 @@
 #   LLAMA_RPC=1 mix compile
 #   LLAMA_RPC_ENDPOINT=10.100.64.2:50052 mix test --include rpc_live
 #
-#   GGML_METAL_NO_RESIDENCY=1 \
 #   LLAMA_SMOKE_DECISION_LAYA_MODEL=/path/to/tinylaya-for-testing-Q8_0.gguf \
 #   LLAMA_SMOKE_DECISION_OPENJEV_MODEL=/path/to/tinyopenjev-for-testing-Q8_0.gguf \
 #     mix test --include decision
 #
-#   GGML_METAL_NO_RESIDENCY=1 \
 #   LLAMA_SMOKE_DECISION_CLEF_MODEL=/path/to/Cloudflare_clef-flash-Q8_0.gguf \
 #     mix test --include decision_clef
 #
-#   GGML_METAL_NO_RESIDENCY=1 \
 #   LLAMA_SMOKE_TOOLS_MODEL=/path/to/Qwen3.5-0.8B-UD-Q4_K_XL.gguf \
 #     mix test --include tools
 #
-# `GGML_METAL_NO_RESIDENCY=1` is only needed on Metal, and only to keep the VM
-# from aborting *after* the suite has passed:
-#
-#   ggml-metal-device.m:622: GGML_ASSERT([rsets->data count] == 0) failed
-#
-# llama.cpp's Metal device is owned by a function-local `static std::vector`, so
-# it is destroyed by `__cxa_finalize_ranges` after the BEAM calls `exit(3)`, and
-# its destructor asserts that the global `MTLResidencySet` collection is empty.
-# The BEAM does not promise that NIF resource destructors have run by then, so a
-# model or context still holding Metal buffers trips the assert and the run exits
-# 134 with a green result already printed (measured at 3 of 12 full-suite runs).
-# Setting the variable stops the collection from being allocated at all, which
-# removes the assert instead of racing it; residency sets are only an OS
-# memory-residency hint, so nothing under test changes.
-#
-# It has to come from the shell: `System.put_env/2` does not reach the C
-# `getenv` that ggml reads, and the library deliberately does not set it either
-# — production keeps the upstream default.
+# On Metal the suite runs with llama.cpp's residency sets on, as production
+# does. A model or context still referenced when the VM halts used to abort it
+# at exit (#116); test/vm_exit_test.exs checks that it no longer does.
 Code.require_file("support/test_models.exs", __DIR__)
 Code.require_file("support/test_slots.exs", __DIR__)
 Code.require_file("support/test_chat.exs", __DIR__)

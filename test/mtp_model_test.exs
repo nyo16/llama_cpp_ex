@@ -13,7 +13,7 @@ defmodule LlamaCppEx.MTPModelTest do
   # allocation could no longer be satisfied. Each test passed in isolation; only
   # the accumulation failed.
   #
-  #   GGML_METAL_NO_RESIDENCY=1 LLAMA_BACKEND=auto \
+  #   LLAMA_BACKEND=auto \
   #   LLAMA_SMOKE_MTP_MODEL=/path/to/mtp-model.gguf mix test --include mtp
   #
   # async: false — one GPU, and the session holds the whole model.
@@ -176,7 +176,7 @@ defmodule LlamaCppEx.MTPCancelTest do
   # second gate tag would drag a flaky test back into `--include mtp` runs.
   # Run it on purpose:
   #
-  #   GGML_METAL_NO_RESIDENCY=1 LLAMA_BACKEND=auto \
+  #   LLAMA_BACKEND=auto \
   #   LLAMA_SMOKE_MTP_MODEL=... mix test --include mtp_cancel
   #
   # Cancellation is fire-and-forget: `request_cancel` sets an atomic flag and the
@@ -228,7 +228,7 @@ defmodule LlamaCppEx.MTPSidecarTest do
   # needs two files rather than one, so it gates on its own tag and its own env
   # var — `--include mtp` has only the single-file model:
   #
-  #   GGML_METAL_NO_RESIDENCY=1 LLAMA_BACKEND=auto \
+  #   LLAMA_BACKEND=auto \
   #   LLAMA_SMOKE_MTP_MODEL=/path/to/Qwen3.8-27B-Q4_K_M.gguf \
   #   LLAMA_SMOKE_MTP_DRAFT_MODEL=/path/to/mtp-Qwen3.8-27B-Q4_0.gguf \
   #     mix test --include mtp_sidecar

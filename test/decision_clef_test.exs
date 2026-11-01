@@ -8,7 +8,6 @@ defmodule LlamaCppEx.DecisionClefTest do
   (Cloudflare/clef-flash; bartowski/Cloudflare_clef-flash-GGUF or
   ggml-org/Clef-Flash-GGUF) and asserts what it answers, not just the shape.
 
-      GGML_METAL_NO_RESIDENCY=1 \\
       LLAMA_SMOKE_DECISION_CLEF_MODEL=/path/to/Cloudflare_clef-flash-Q8_0.gguf \\
         mix test test/decision_clef_test.exs --include decision_clef
 

@@ -15,7 +15,10 @@
 #include <cmath>
 #include <cstring>
 #include <cerrno>
+#include <cstdlib>
 #include <optional>
+#include <thread>
+#include <unordered_set>
 
 // The ggml RPC backend is opt-in at build time (LLAMA_RPC=1). GGML_USE_RPC is
 // set by the Makefile, not inherited from cmake: ggml puts it on the `ggml`
@@ -40,6 +43,156 @@ FINE_RESOURCE(LlamaSpeculative);
 FINE_RESOURCE(CancelFlag);
 FINE_RESOURCE(LlamaDecision);
 FINE_RESOURCE(LlamaChatSession);
+
+// --- Teardown at VM exit (#116) ---
+//
+// The BEAM does not run NIF resource destructors when it halts, so a model or
+// context still referenced at that point (persistent_term, ETS, any process
+// alive at halt) still owns its Metal buffers when exit(3) runs C++ static
+// destructors. llama.cpp's Metal device lives in a function-local static
+// (ggml_metal_device_get, ggml-metal-device.cpp), and its destructor asserts
+// that no residency set is left (GGML_ASSERT([rsets->data count] == 0)), so
+// the VM aborted with exit 134 instead of exiting with its own status.
+// Residency sets exist only in builds against the macOS 15 SDK, which the
+// precompiled Metal NIF has used since v0.8.63 (macos-15 runners); local
+// builds always had them.
+//
+// free_live_resources_at_exit frees every tracked resource first. It is an
+// atexit handler registered *after* the first model, context and speculative
+// session exist, i.e. after the ggml statics those allocations construct, so
+// the C++ rule that handlers and static destructors run in reverse order of
+// registration puts it ahead of them.
+//
+// Freeing must not happen under a running NIF call, so every NIF is wrapped in
+// NifCall (LLAMA_NIF below): the hook sets g_exiting, new calls are refused,
+// generation loops, the decode abort callback and model loading stop on the
+// flag, and the hook waits for the running calls to return. If one has not
+// returned by the deadline it frees nothing, which leaves the old behaviour
+// rather than a use-after-free.
+namespace {
+
+std::atomic<bool> g_exiting{false};
+std::atomic<int64_t> g_in_flight{0};
+
+struct LiveResources {
+    std::recursive_mutex mutex;
+    std::unordered_set<LlamaModel*> models;
+    std::unordered_set<LlamaContext*> contexts;
+    std::unordered_set<LlamaSpeculative*> speculatives;
+};
+
+// Heap-allocated and never destroyed: it must outlive every static destructor
+// that could run before the exit hook.
+LiveResources& live_resources() {
+    static LiveResources* resources = new LiveResources();
+    return *resources;
+}
+
+// Sequentially consistent on both sides: either the hook sees the increment and
+// waits for this call, or this call sees g_exiting and backs out.
+struct NifCall {
+    bool entered;
+
+    NifCall() {
+        g_in_flight.fetch_add(1);
+        entered = !g_exiting.load();
+        if (!entered) g_in_flight.fetch_sub(1);
+    }
+    ~NifCall() {
+        if (entered) g_in_flight.fetch_sub(1);
+    }
+
+    NifCall(const NifCall&) = delete;
+    NifCall& operator=(const NifCall&) = delete;
+};
+
+[[maybe_unused]] void free_live_resources_at_exit() {
+    if (g_exiting.exchange(true)) return; // registered more than once
+
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (g_in_flight.load() > 0) {
+        if (std::chrono::steady_clock::now() >= deadline) return;
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+
+    auto& live = live_resources();
+    std::lock_guard<std::recursive_mutex> lock(live.mutex);
+    // Speculative sessions own draft contexts of their own. A context created
+    // with ctx_other (gemma4-assistant) uses the other one until it is freed.
+    for (auto* s : live.speculatives) s->release();
+    for (auto* c : live.contexts) {
+        if (c->has_ctx_other) c->release();
+    }
+    for (auto* c : live.contexts) c->release();
+    for (auto* m : live.models) m->release();
+}
+
+// Registers the hook after an allocation that may have constructed new ggml
+// statics (see above). Each call site passes its own flag, so it is registered
+// at most once per kind of allocation; the hook ignores repeat runs.
+//
+// Once per kind is not enough on its own: the Metal buffer types are
+// function-local statics built the first time a device's buffer type is asked
+// for, and ~llama_context logs their names. A first model loaded on the CPU
+// only (devices: ["CPU"]) never builds them, so a later Metal context would
+// build them after the hook, and exit would destroy them before it. Asking
+// every Metal device for its buffer types first puts them ahead of the hook.
+// RPC devices are skipped because asking them goes over the network.
+//
+// Only on Apple: the assert is in the Metal backend, and other platforms exit
+// cleanly without freeing anything.
+void arm_exit_hook(std::once_flag& once) {
+#ifdef __APPLE__
+    std::call_once(once, [] {
+        for (size_t i = 0; i < ggml_backend_dev_count(); i++) {
+            ggml_backend_dev_t dev = ggml_backend_dev_get(i);
+            if (std::strcmp(ggml_backend_reg_name(ggml_backend_dev_backend_reg(dev)), "MTL") == 0) {
+                ggml_backend_dev_buffer_type(dev);
+                ggml_backend_dev_host_buffer_type(dev);
+            }
+        }
+        std::atexit(free_live_resources_at_exit);
+    });
+#else
+    (void)once;
+#endif
+}
+
+} // namespace
+
+namespace llama_cpp_ex::live {
+std::recursive_mutex& mutex() { return live_resources().mutex; }
+void add(LlamaModel* m) {
+    std::lock_guard<std::recursive_mutex> lock(mutex());
+    live_resources().models.insert(m);
+}
+void remove(LlamaModel* m) { live_resources().models.erase(m); }
+void add(LlamaContext* c) {
+    std::lock_guard<std::recursive_mutex> lock(mutex());
+    live_resources().contexts.insert(c);
+}
+void remove(LlamaContext* c) { live_resources().contexts.erase(c); }
+void add(LlamaSpeculative* s) {
+    std::lock_guard<std::recursive_mutex> lock(mutex());
+    live_resources().speculatives.insert(s);
+}
+void remove(LlamaSpeculative* s) { live_resources().speculatives.erase(s); }
+} // namespace llama_cpp_ex::live
+
+// fine's FINE_NIF with a NifCall around the call. Every NIF in this file uses
+// it, so none can be running when the exit hook frees resources.
+#define LLAMA_NIF(name, flags)                                                 \
+    static ERL_NIF_TERM name##_nif(ErlNifEnv* env, int argc,                   \
+                                   const ERL_NIF_TERM argv[]) {                \
+        NifCall call;                                                          \
+        if (!call.entered) {                                                   \
+            return enif_raise_exception(env, enif_make_atom(env, "vm_exiting")); \
+        }                                                                      \
+        return fine::nif(env, argc, argv, name);                               \
+    }                                                                          \
+    auto __nif_registration_##name = fine::Registration::register_nif(         \
+        {#name, fine::nif_arity(name), name##_nif, flags});                    \
+    static_assert(true, "require a semicolon after the macro")
 
 // --- Error atoms ---
 //
@@ -104,7 +257,7 @@ fine::Ok<> log_set_level(ErlNifEnv* env, int64_t min_level, int64_t common_thres
     common_log_set_verbosity_thold(static_cast<int>(common_threshold));
     return fine::Ok();
 }
-FINE_NIF(log_set_level, 0);
+LLAMA_NIF(log_set_level, 0);
 
 // --- Input validation at the NIF boundary ---
 //
@@ -319,16 +472,17 @@ struct BatchFreeGuard {
 fine::ResourcePtr<CancelFlag> cancel_flag_new(ErlNifEnv* env) {
     return fine::make_resource<CancelFlag>();
 }
-FINE_NIF(cancel_flag_new, 0);
+LLAMA_NIF(cancel_flag_new, 0);
 
 fine::Ok<> request_cancel(ErlNifEnv* env, fine::ResourcePtr<CancelFlag> flag) {
     flag->cancelled.store(true, std::memory_order_relaxed);
     return fine::Ok();
 }
-FINE_NIF(request_cancel, 0);
+LLAMA_NIF(request_cancel, 0);
 
 static bool cancel_abort_cb(void* data) {
-    return static_cast<CancelFlag*>(data)->cancelled.load(std::memory_order_relaxed);
+    return static_cast<CancelFlag*>(data)->cancelled.load(std::memory_order_relaxed) ||
+           g_exiting.load(std::memory_order_relaxed);
 }
 
 // Installs the flag as the context's abort callback for the duration of a
@@ -351,13 +505,13 @@ fine::Ok<> backend_init(ErlNifEnv* env) {
     llama_backend_init();
     return fine::Ok();
 }
-FINE_NIF(backend_init, 0);
+LLAMA_NIF(backend_init, 0);
 
 fine::Ok<> backend_free(ErlNifEnv* env) {
     llama_backend_free();
     return fine::Ok();
 }
-FINE_NIF(backend_free, 0);
+LLAMA_NIF(backend_free, 0);
 
 // --- RPC ---
 //
@@ -472,7 +626,7 @@ bool rpc_supported(ErlNifEnv* env) {
     return false;
 #endif
 }
-FINE_NIF(rpc_supported, 0);
+LLAMA_NIF(rpc_supported, 0);
 
 // Registers a remote endpoint's devices in the global ggml device registry.
 //
@@ -509,7 +663,7 @@ rpc_add_server(ErlNifEnv* env, std::string endpoint) {
 #endif
 }
 // Dirty IO: a blocking TCP connect plus the HELLO round trip.
-FINE_NIF(rpc_add_server, ERL_NIF_DIRTY_JOB_IO_BOUND);
+LLAMA_NIF(rpc_add_server, ERL_NIF_DIRTY_JOB_IO_BOUND);
 
 // Starts the worker-side RPC server. `device_names` empty means every non-CPU
 // device, falling back to the CPU device, matching tools/rpc/rpc-server.cpp.
@@ -595,7 +749,7 @@ rpc_start_server(ErlNifEnv* env, std::string endpoint, std::string cache_dir,
 }
 // Dirty IO: a blocking bind, two blocking getaddrinfo calls, and a poll that can
 // run for 5 s. Bounded, but nowhere near a normal scheduler's budget.
-FINE_NIF(rpc_start_server, ERL_NIF_DIRTY_JOB_IO_BOUND);
+LLAMA_NIF(rpc_start_server, ERL_NIF_DIRTY_JOB_IO_BOUND);
 
 // --- Devices ---
 
@@ -663,7 +817,7 @@ fine::Term device_list(ErlNifEnv* env) {
 
     return fine::Term(enif_make_list_from_array(env, devices.data(), (unsigned)devices.size()));
 }
-FINE_NIF(device_list, ERL_NIF_DIRTY_JOB_IO_BOUND);
+LLAMA_NIF(device_list, ERL_NIF_DIRTY_JOB_IO_BOUND);
 
 // --- Model ---
 
@@ -697,6 +851,21 @@ model_load(ErlNifEnv* env, std::string path, int64_t n_gpu_layers, bool use_mmap
     // the first MTP draft. `LlamaCppEx.MTP.init/2` therefore refuses a model
     // loaded without this flag rather than letting that error escape.
     params.load_mtp = load_mtp;
+    // Returning false aborts the load, so a halt does not wait for it (see
+    // free_live_resources_at_exit). Setting a callback replaces llama.cpp's
+    // default one (src/llama.cpp), so this also prints its progress dots.
+    unsigned load_percentage = 0;
+    params.progress_callback_user_data = &load_percentage;
+    params.progress_callback = [](float progress, void* data) {
+        auto* shown = static_cast<unsigned*>(data);
+        const auto percentage = static_cast<unsigned>(100 * progress);
+        if (percentage > *shown) {
+            *shown = percentage;
+            log_callback(GGML_LOG_LEVEL_CONT, ".", nullptr);
+            if (percentage >= 100) log_callback(GGML_LOG_LEVEL_CONT, "\n", nullptr);
+        }
+        return !g_exiting.load(std::memory_order_relaxed);
+    };
 
     std::vector<float> ts_float;
     if (!tensor_split.empty()) {
@@ -738,19 +907,22 @@ model_load(ErlNifEnv* env, std::string path, int64_t n_gpu_layers, bool use_mmap
         return fine::Error(std::string("failed to load model from: " + path));
     }
 
-    return fine::Ok(fine::make_resource<LlamaModel>(model));
+    auto res = fine::make_resource<LlamaModel>(model);
+    static std::once_flag exit_hook_once;
+    arm_exit_hook(exit_hook_once);
+    return fine::Ok(std::move(res));
 }
-FINE_NIF(model_load, ERL_NIF_DIRTY_JOB_IO_BOUND);
+LLAMA_NIF(model_load, ERL_NIF_DIRTY_JOB_IO_BOUND);
 
 int64_t model_n_ctx_train(ErlNifEnv* env, fine::ResourcePtr<LlamaModel> model) {
     return llama_model_n_ctx_train(model->model);
 }
-FINE_NIF(model_n_ctx_train, 0);
+LLAMA_NIF(model_n_ctx_train, 0);
 
 int64_t model_n_embd(ErlNifEnv* env, fine::ResourcePtr<LlamaModel> model) {
     return llama_model_n_embd(model->model);
 }
-FINE_NIF(model_n_embd, 0);
+LLAMA_NIF(model_n_embd, 0);
 
 // Output-side embedding width: the row width of llama_get_embeddings_* and
 // what an MTP draft head consumes. Equal to `n_embd` for most architectures,
@@ -765,7 +937,7 @@ FINE_NIF(model_n_embd, 0);
 int64_t model_n_embd_out(ErlNifEnv* env, fine::ResourcePtr<LlamaModel> model) {
     return llama_model_n_embd_out(model->model);
 }
-FINE_NIF(model_n_embd_out, 0);
+LLAMA_NIF(model_n_embd_out, 0);
 
 // Number of MTP / "next-N" prediction layers the checkpoint carries. Zero means
 // the GGUF has no MTP head at all, which is a different situation from a model
@@ -776,24 +948,24 @@ FINE_NIF(model_n_embd_out, 0);
 int64_t model_n_layer_nextn(ErlNifEnv* env, fine::ResourcePtr<LlamaModel> model) {
     return llama_model_n_layer_nextn(model->model);
 }
-FINE_NIF(model_n_layer_nextn, 0);
+LLAMA_NIF(model_n_layer_nextn, 0);
 
 std::string model_desc(ErlNifEnv* env, fine::ResourcePtr<LlamaModel> model) {
     char buf[256];
     llama_model_desc(model->model, buf, sizeof(buf));
     return std::string(buf);
 }
-FINE_NIF(model_desc, 0);
+LLAMA_NIF(model_desc, 0);
 
 uint64_t model_size(ErlNifEnv* env, fine::ResourcePtr<LlamaModel> model) {
     return llama_model_size(model->model);
 }
-FINE_NIF(model_size, 0);
+LLAMA_NIF(model_size, 0);
 
 uint64_t model_n_params(ErlNifEnv* env, fine::ResourcePtr<LlamaModel> model) {
     return llama_model_n_params(model->model);
 }
-FINE_NIF(model_n_params, 0);
+LLAMA_NIF(model_n_params, 0);
 
 std::string model_chat_template(ErlNifEnv* env, fine::ResourcePtr<LlamaModel> model) {
     const char* tmpl = llama_model_chat_template(model->model, nullptr);
@@ -802,29 +974,29 @@ std::string model_chat_template(ErlNifEnv* env, fine::ResourcePtr<LlamaModel> mo
     }
     return std::string();
 }
-FINE_NIF(model_chat_template, 0);
+LLAMA_NIF(model_chat_template, 0);
 
 // --- Vocab ---
 
 int64_t vocab_n_tokens(ErlNifEnv* env, fine::ResourcePtr<LlamaModel> model) {
     return llama_vocab_n_tokens(model->vocab());
 }
-FINE_NIF(vocab_n_tokens, 0);
+LLAMA_NIF(vocab_n_tokens, 0);
 
 int64_t vocab_bos(ErlNifEnv* env, fine::ResourcePtr<LlamaModel> model) {
     return llama_vocab_bos(model->vocab());
 }
-FINE_NIF(vocab_bos, 0);
+LLAMA_NIF(vocab_bos, 0);
 
 int64_t vocab_eos(ErlNifEnv* env, fine::ResourcePtr<LlamaModel> model) {
     return llama_vocab_eos(model->vocab());
 }
-FINE_NIF(vocab_eos, 0);
+LLAMA_NIF(vocab_eos, 0);
 
 bool vocab_is_eog(ErlNifEnv* env, fine::ResourcePtr<LlamaModel> model, int64_t token) {
     return llama_vocab_is_eog(model->vocab(), static_cast<llama_token>(token));
 }
-FINE_NIF(vocab_is_eog, 0);
+LLAMA_NIF(vocab_is_eog, 0);
 
 // --- Tokenization ---
 
@@ -857,7 +1029,7 @@ std::vector<int64_t> tokenize(
 // Dirty: measured 862 µs at 1k tokens, 8.56 ms at 10k, 137 ms at 160k — it
 // crosses the 1 ms normal-scheduler budget at ~1160 prompt tokens, and it runs
 // in the *caller's* process (Server.generate/3, LlamaCppEx.generate/3).
-FINE_NIF(tokenize, ERL_NIF_DIRTY_JOB_CPU_BOUND);
+LLAMA_NIF(tokenize, ERL_NIF_DIRTY_JOB_CPU_BOUND);
 
 std::string detokenize(
     ErlNifEnv* env,
@@ -882,7 +1054,7 @@ std::string detokenize(
     return std::string(buf.data(), n);
 }
 // Dirty: same class as tokenize — measured 1.38 ms at 160k tokens.
-FINE_NIF(detokenize, ERL_NIF_DIRTY_JOB_CPU_BOUND);
+LLAMA_NIF(detokenize, ERL_NIF_DIRTY_JOB_CPU_BOUND);
 
 std::string token_to_piece(ErlNifEnv* env, fine::ResourcePtr<LlamaModel> model, int64_t token) {
     const auto* vocab = model->vocab();
@@ -900,7 +1072,7 @@ std::string token_to_piece(ErlNifEnv* env, fine::ResourcePtr<LlamaModel> model, 
 
     return std::string(buf, n);
 }
-FINE_NIF(token_to_piece, 0);
+LLAMA_NIF(token_to_piece, 0);
 
 // --- Context ---
 
@@ -1008,19 +1180,21 @@ context_create(
     }
     res->kv_unified = kv_unified;
     res->pooled_embeddings = embeddings && llama_pooling_type(ctx) != LLAMA_POOLING_TYPE_NONE;
+    static std::once_flag exit_hook_once;
+    arm_exit_hook(exit_hook_once);
     return fine::Ok(std::move(res));
 }
-FINE_NIF(context_create, ERL_NIF_DIRTY_JOB_CPU_BOUND);
+LLAMA_NIF(context_create, ERL_NIF_DIRTY_JOB_CPU_BOUND);
 
 int64_t context_n_ctx(ErlNifEnv* env, fine::ResourcePtr<LlamaContext> ctx) {
     return llama_n_ctx(ctx->ctx);
 }
-FINE_NIF(context_n_ctx, 0);
+LLAMA_NIF(context_n_ctx, 0);
 
 int64_t context_n_rs_seq(ErlNifEnv* env, fine::ResourcePtr<LlamaContext> ctx) {
     return static_cast<int64_t>(llama_n_rs_seq(ctx->ctx));
 }
-FINE_NIF(context_n_rs_seq, 0);
+LLAMA_NIF(context_n_rs_seq, 0);
 
 // --- Sampler ---
 
@@ -1156,7 +1330,7 @@ sampler_init(
 // without a grammar) and linear in rule count, so it crosses the 1 ms
 // normal-scheduler budget at ~1.3k rules — and it runs per request inside
 // Server.handle_call/3.
-FINE_NIF(sampler_init, ERL_NIF_DIRTY_JOB_CPU_BOUND);
+LLAMA_NIF(sampler_init, ERL_NIF_DIRTY_JOB_CPU_BOUND);
 
 // Validate-only grammar entry point.
 //
@@ -1201,13 +1375,13 @@ grammar_validate(
 }
 // Dirty for the same reason as sampler_init: it runs the same GBNF parse, whose
 // cost is linear in rule count (190 µs on a 245-rule schema).
-FINE_NIF(grammar_validate, ERL_NIF_DIRTY_JOB_CPU_BOUND);
+LLAMA_NIF(grammar_validate, ERL_NIF_DIRTY_JOB_CPU_BOUND);
 
 fine::Ok<> sampler_accept(ErlNifEnv* env, fine::ResourcePtr<LlamaSampler> sampler, int64_t token) {
     llama_sampler_accept(sampler->sampler, static_cast<llama_token>(token));
     return fine::Ok();
 }
-FINE_NIF(sampler_accept, 0);
+LLAMA_NIF(sampler_accept, 0);
 
 fine::Ok<> sampler_reset(ErlNifEnv* env, fine::ResourcePtr<LlamaSampler> sampler) {
     llama_sampler_reset(sampler->sampler);
@@ -1216,7 +1390,7 @@ fine::Ok<> sampler_reset(ErlNifEnv* env, fine::ResourcePtr<LlamaSampler> sampler
 // Dirty: llama_sampler_reset re-parses the entire grammar from scratch
 // (llama-sampler.cpp:2472-2490), so a reset costs the same as an init —
 // measured 177 µs. It is called per request on the Server's slot samplers.
-FINE_NIF(sampler_reset, ERL_NIF_DIRTY_JOB_CPU_BOUND);
+LLAMA_NIF(sampler_reset, ERL_NIF_DIRTY_JOB_CPU_BOUND);
 
 // Dirty: the sampler chain runs a softmax over the full vocab (100k+ entries)
 // and grammar samplers can take multiple ms — too slow for a normal scheduler.
@@ -1229,7 +1403,7 @@ int64_t sampler_sample(ErlNifEnv* env, fine::ResourcePtr<LlamaSampler> sampler,
     check_logits_idx(env, *ctx, -1);
     return llama_sampler_sample(sampler->sampler, ctx->ctx, -1);
 }
-FINE_NIF(sampler_sample, ERL_NIF_DIRTY_JOB_CPU_BOUND);
+LLAMA_NIF(sampler_sample, ERL_NIF_DIRTY_JOB_CPU_BOUND);
 
 // --- Decode ---
 
@@ -1273,7 +1447,7 @@ decode(ErlNifEnv* env, fine::ResourcePtr<LlamaContext> ctx, std::vector<int64_t>
 
     return fine::Ok();
 }
-FINE_NIF(decode, ERL_NIF_DIRTY_JOB_CPU_BOUND);
+LLAMA_NIF(decode, ERL_NIF_DIRTY_JOB_CPU_BOUND);
 
 // --- Memory management ---
 
@@ -1282,7 +1456,7 @@ fine::Ok<> memory_clear(ErlNifEnv* env, fine::ResourcePtr<LlamaContext> ctx) {
     ctx->forget_batch();
     return fine::Ok();
 }
-FINE_NIF(memory_clear, 0);
+LLAMA_NIF(memory_clear, 0);
 
 // Returns llama_memory_seq_rm's boolean verbatim, which callers must read
 // according to the range they asked for. This is the convention every call site
@@ -1309,7 +1483,7 @@ bool memory_seq_rm(ErlNifEnv* env, fine::ResourcePtr<LlamaContext> ctx,
         static_cast<llama_pos>(p0),
         static_cast<llama_pos>(p1));
 }
-FINE_NIF(memory_seq_rm, 0);
+LLAMA_NIF(memory_seq_rm, 0);
 
 // Reports what kinds of seq_rm the context supports — `:part` (any position
 // range), `:full` (whole sequence only — hybrid GDN models), `:rs` (partial
@@ -1326,7 +1500,7 @@ fine::Term context_can_seq_rm(ErlNifEnv* env, fine::ResourcePtr<LlamaContext> ct
     }
     return fine::Term(enif_make_atom(env, "unknown"));
 }
-FINE_NIF(context_can_seq_rm, 0);
+LLAMA_NIF(context_can_seq_rm, 0);
 
 // --- Memory seq_cp ---
 
@@ -1366,7 +1540,7 @@ memory_seq_cp(ErlNifEnv* env, fine::ResourcePtr<LlamaContext> ctx,
         static_cast<llama_pos>(p1));
     return fine::Ok();
 }
-FINE_NIF(memory_seq_cp, 0);
+LLAMA_NIF(memory_seq_cp, 0);
 
 // --- Memory seq_keep ---
 
@@ -1377,7 +1551,7 @@ fine::Ok<> memory_seq_keep(ErlNifEnv* env, fine::ResourcePtr<LlamaContext> ctx, 
         static_cast<llama_seq_id>(seq_id));
     return fine::Ok();
 }
-FINE_NIF(memory_seq_keep, 0);
+LLAMA_NIF(memory_seq_keep, 0);
 
 // --- Memory seq_pos_max ---
 
@@ -1387,14 +1561,14 @@ int64_t memory_seq_pos_max(ErlNifEnv* env, fine::ResourcePtr<LlamaContext> ctx, 
         llama_get_memory(ctx->ctx),
         static_cast<llama_seq_id>(seq_id));
 }
-FINE_NIF(memory_seq_pos_max, 0);
+LLAMA_NIF(memory_seq_pos_max, 0);
 
 // --- Context n_seq_max ---
 
 int64_t context_n_seq_max(ErlNifEnv* env, fine::ResourcePtr<LlamaContext> ctx) {
     return llama_n_seq_max(ctx->ctx);
 }
-FINE_NIF(context_n_seq_max, 0);
+LLAMA_NIF(context_n_seq_max, 0);
 
 // --- Embeddings ---
 
@@ -1445,7 +1619,7 @@ embed_decode(
 
     return fine::Ok();
 }
-FINE_NIF(embed_decode, ERL_NIF_DIRTY_JOB_CPU_BOUND);
+LLAMA_NIF(embed_decode, ERL_NIF_DIRTY_JOB_CPU_BOUND);
 
 // Returns the embedding as a raw little-endian f32 binary (native order on
 // all supported targets): one 16 KB refc binary for a 4096-dim vector instead
@@ -1503,7 +1677,7 @@ get_embeddings(
 
     return fine::Ok(fine::Term(bin));
 }
-FINE_NIF(get_embeddings, 0);
+LLAMA_NIF(get_embeddings, 0);
 
 // --- Batched embeddings: decode many sequences in a single batch ---
 //
@@ -1572,7 +1746,7 @@ embed_batch_decode(
 
     return fine::Ok();
 }
-FINE_NIF(embed_batch_decode, ERL_NIF_DIRTY_JOB_CPU_BOUND);
+LLAMA_NIF(embed_batch_decode, ERL_NIF_DIRTY_JOB_CPU_BOUND);
 
 // --- Prefill (batched inference) ---
 
@@ -1615,7 +1789,7 @@ prefill(
 
     return fine::Ok(static_cast<int64_t>(n_tokens));
 }
-FINE_NIF(prefill, ERL_NIF_DIRTY_JOB_CPU_BOUND);
+LLAMA_NIF(prefill, ERL_NIF_DIRTY_JOB_CPU_BOUND);
 
 // --- Decode batch (batched inference) ---
 
@@ -1691,7 +1865,7 @@ decode_batch(
 
     return fine::Ok(results);
 }
-FINE_NIF(decode_batch, ERL_NIF_DIRTY_JOB_CPU_BOUND);
+LLAMA_NIF(decode_batch, ERL_NIF_DIRTY_JOB_CPU_BOUND);
 
 // --- Decode single token with seq_id (for Server) ---
 
@@ -1719,7 +1893,7 @@ decode_token(
 
     return fine::Ok();
 }
-FINE_NIF(decode_token, ERL_NIF_DIRTY_JOB_CPU_BOUND);
+LLAMA_NIF(decode_token, ERL_NIF_DIRTY_JOB_CPU_BOUND);
 
 // --- Batch eval (forward pass only, no sampling) ---
 
@@ -1754,7 +1928,7 @@ batch_eval(
 
     return fine::Ok();
 }
-FINE_NIF(batch_eval, ERL_NIF_DIRTY_JOB_CPU_BOUND);
+LLAMA_NIF(batch_eval, ERL_NIF_DIRTY_JOB_CPU_BOUND);
 
 // --- Fused batch eval + sample (Server hot loop) ---
 //
@@ -1956,7 +2130,7 @@ batch_eval_sample(
     return fine::Ok(std::move(results), std::move(purged), n_splits,
                     std::move(failed));
 }
-FINE_NIF(batch_eval_sample, ERL_NIF_DIRTY_JOB_CPU_BOUND);
+LLAMA_NIF(batch_eval_sample, ERL_NIF_DIRTY_JOB_CPU_BOUND);
 
 // --- Sampler sample at batch index ---
 
@@ -1979,7 +2153,7 @@ int64_t sampler_sample_at(
     check_logits_idx(env, *ctx, idx);
     return llama_sampler_sample(sampler->sampler, ctx->ctx, static_cast<int32_t>(idx));
 }
-FINE_NIF(sampler_sample_at, ERL_NIF_DIRTY_JOB_CPU_BOUND);
+LLAMA_NIF(sampler_sample_at, ERL_NIF_DIRTY_JOB_CPU_BOUND);
 
 // --- Sequence state save/restore (RAM prompt cache) ---
 
@@ -1991,7 +2165,7 @@ int64_t state_seq_get_size(ErlNifEnv* env, fine::ResourcePtr<LlamaContext> ctx,
     return static_cast<int64_t>(
         llama_state_seq_get_size(ctx->ctx, static_cast<llama_seq_id>(seq_id)));
 }
-FINE_NIF(state_seq_get_size, 0);
+LLAMA_NIF(state_seq_get_size, 0);
 
 // Serializes a sequence's KV state into a binary. Dirty: the state is
 // KV-sized (potentially hundreds of MB on long contexts).
@@ -2015,7 +2189,7 @@ state_seq_get_data(ErlNifEnv* env, fine::ResourcePtr<LlamaContext> ctx,
 
     return fine::Ok(fine::Term(bin));
 }
-FINE_NIF(state_seq_get_data, ERL_NIF_DIRTY_JOB_CPU_BOUND);
+LLAMA_NIF(state_seq_get_data, ERL_NIF_DIRTY_JOB_CPU_BOUND);
 
 // Restores a previously serialized sequence state into dest_seq_id (which
 // must be empty). Returns bytes read. Dirty: KV-sized memcpy.
@@ -2060,7 +2234,7 @@ state_seq_set_data(ErlNifEnv* env, fine::ResourcePtr<LlamaContext> ctx,
 
     return fine::Ok(static_cast<int64_t>(read));
 }
-FINE_NIF(state_seq_set_data, ERL_NIF_DIRTY_JOB_CPU_BOUND);
+LLAMA_NIF(state_seq_set_data, ERL_NIF_DIRTY_JOB_CPU_BOUND);
 
 // --- Chat template ---
 
@@ -2252,7 +2426,7 @@ chat_render(ErlNifEnv* env, fine::ResourcePtr<LlamaModel> model, std::string req
 }
 // Dirty: jinja rendering allocates and walks a full AST per call — multi-ms
 // for large templates/histories.
-FINE_NIF(chat_render, ERL_NIF_DIRTY_JOB_CPU_BOUND);
+LLAMA_NIF(chat_render, ERL_NIF_DIRTY_JOB_CPU_BOUND);
 
 // Renders and tokenizes the request's prompt, and returns a session that
 // parses the reply.
@@ -2348,7 +2522,7 @@ chat_session_new(ErlNifEnv* env, fine::ResourcePtr<LlamaModel> model, std::strin
         return fine::Error(std::string(e.what()));
     }
 }
-FINE_NIF(chat_session_new, ERL_NIF_DIRTY_JOB_CPU_BOUND);
+LLAMA_NIF(chat_session_new, ERL_NIF_DIRTY_JOB_CPU_BOUND);
 
 // Appends generated tokens to the reply. Returns true once the reply reaches
 // one of the template's literal stop strings; the reply is cut before it and
@@ -2382,7 +2556,7 @@ bool chat_session_append(ErlNifEnv* env, fine::ResourcePtr<LlamaChatSession> ses
     }
     return s.stopped;
 }
-FINE_NIF(chat_session_append, 0);
+LLAMA_NIF(chat_session_append, 0);
 
 // Byte length of the longest prefix of text that does not end inside a UTF-8
 // sequence. A partial parse must not hand out half a code point.
@@ -2475,7 +2649,7 @@ chat_session_parse(ErlNifEnv* env, fine::ResourcePtr<LlamaChatSession> session, 
     }
 }
 // Dirty: re-parses the whole reply, so its cost grows with the reply.
-FINE_NIF(chat_session_parse, ERL_NIF_DIRTY_JOB_CPU_BOUND);
+LLAMA_NIF(chat_session_parse, ERL_NIF_DIRTY_JOB_CPU_BOUND);
 
 // --- Speculative decoding (MTP) ---
 
@@ -2526,13 +2700,16 @@ speculative_init(
             "and does the draft context have ctx_type=:mtp with n_rs_seq>0?"));
     }
 
-    return fine::Ok(fine::make_resource<LlamaSpeculative>(
+    auto res = fine::make_resource<LlamaSpeculative>(
         spec, std::move(ctx_tgt), std::move(ctx_dft),
-        static_cast<uint32_t>(n_draft), needs_ckpt));
+        static_cast<uint32_t>(n_draft), needs_ckpt);
+    static std::once_flag exit_hook_once;
+    arm_exit_hook(exit_hook_once);
+    return fine::Ok(std::move(res));
 }
 // Dirty: common_speculative_init probes the contexts (KV clear + setup work)
 // and can block well past the normal-scheduler budget.
-FINE_NIF(speculative_init, ERL_NIF_DIRTY_JOB_CPU_BOUND);
+LLAMA_NIF(speculative_init, ERL_NIF_DIRTY_JOB_CPU_BOUND);
 
 // Build the live counter snapshot as a flat map { atom => term }. Used by
 // speculative_stats (queried from Elixir) and by the streaming NIF when it
@@ -2600,13 +2777,13 @@ static ERL_NIF_TERM build_mtp_stats_map(ErlNifEnv* env, const LlamaSpeculative& 
 fine::Term speculative_stats(ErlNifEnv* env, fine::ResourcePtr<LlamaSpeculative> spec) {
     return fine::Term(build_mtp_stats_map(env, *spec));
 }
-FINE_NIF(speculative_stats, 0);
+LLAMA_NIF(speculative_stats, 0);
 
 fine::Ok<> speculative_print_stats(ErlNifEnv* env, fine::ResourcePtr<LlamaSpeculative> spec) {
     common_speculative_print_stats(spec->spec);
     return fine::Ok();
 }
-FINE_NIF(speculative_print_stats, 0);
+LLAMA_NIF(speculative_print_stats, 0);
 
 // Streaming MTP generation. Drives a target/draft speculative loop entirely in C++,
 // streaming {ref, {:token, id, text}} messages to caller_pid and finally one of:
@@ -2822,7 +2999,8 @@ fine::Ok<> generate_mtp_tokens(
 
     // Main speculative loop.
     while (n_emitted < max_tokens) {
-        if (cancel->cancelled.load(std::memory_order_relaxed)) {
+        if (cancel->cancelled.load(std::memory_order_relaxed) ||
+            g_exiting.load(std::memory_order_relaxed)) {
             // Caller abandoned the stream — stop quietly.
             return fine::Ok();
         }
@@ -3095,7 +3273,7 @@ fine::Ok<> generate_mtp_tokens(
     send_done(nullptr);
     return fine::Ok();
 }
-FINE_NIF(generate_mtp_tokens, ERL_NIF_DIRTY_JOB_CPU_BOUND);
+LLAMA_NIF(generate_mtp_tokens, ERL_NIF_DIRTY_JOB_CPU_BOUND);
 
 // --- Streaming generation ---
 
@@ -3176,7 +3354,8 @@ fine::Ok<> generate_tokens(
 
     // Generation loop
     for (int64_t i = 0; i < max_tokens; i++) {
-        if (cancel->cancelled.load(std::memory_order_relaxed)) {
+        if (cancel->cancelled.load(std::memory_order_relaxed) ||
+            g_exiting.load(std::memory_order_relaxed)) {
             // Caller abandoned the stream — stop quietly; the consumer is
             // not reading messages anymore.
             return fine::Ok();
@@ -3249,7 +3428,7 @@ fine::Ok<> generate_tokens(
 
     return fine::Ok();
 }
-FINE_NIF(generate_tokens, ERL_NIF_DIRTY_JOB_CPU_BOUND);
+LLAMA_NIF(generate_tokens, ERL_NIF_DIRTY_JOB_CPU_BOUND);
 
 // --- High-level generation ---
 
@@ -3297,7 +3476,8 @@ generate(
     // Generation loop
     std::string result;
     for (int64_t i = 0; i < max_tokens; i++) {
-        if (cancel->cancelled.load(std::memory_order_relaxed)) {
+        if (cancel->cancelled.load(std::memory_order_relaxed) ||
+            g_exiting.load(std::memory_order_relaxed)) {
             break;
         }
 
@@ -3335,7 +3515,7 @@ generate(
 
     return fine::Ok(result);
 }
-FINE_NIF(generate, ERL_NIF_DIRTY_JOB_CPU_BOUND);
+LLAMA_NIF(generate, ERL_NIF_DIRTY_JOB_CPU_BOUND);
 
 // --- JSON Schema to Grammar ---
 
@@ -3362,7 +3542,7 @@ json_schema_to_grammar_nif(ErlNifEnv* env, std::string json_str) {
 }
 // Dirty: JSON parsing + grammar construction scale with schema size and can
 // run for milliseconds on real-world schemas.
-FINE_NIF(json_schema_to_grammar_nif, ERL_NIF_DIRTY_JOB_CPU_BOUND);
+LLAMA_NIF(json_schema_to_grammar_nif, ERL_NIF_DIRTY_JOB_CPU_BOUND);
 
 // --- Decision models (/v1/systemone) ---
 //
@@ -3374,7 +3554,7 @@ FINE_NIF(json_schema_to_grammar_nif, ERL_NIF_DIRTY_JOB_CPU_BOUND);
 std::string decision_model_type(ErlNifEnv* env, fine::ResourcePtr<LlamaModel> model) {
     return decision::model_type(model->model);
 }
-FINE_NIF(decision_model_type, 0);
+LLAMA_NIF(decision_model_type, 0);
 
 std::variant<fine::Ok<fine::ResourcePtr<LlamaDecision>>, fine::Error<std::string>>
 decision_init(ErlNifEnv* env, fine::ResourcePtr<LlamaContext> ctx) {
@@ -3385,7 +3565,7 @@ decision_init(ErlNifEnv* env, fine::ResourcePtr<LlamaContext> ctx) {
     }
 }
 // Dirty: tokenizes up to 702 label codes (lev, nimble, pplx-decider) and parses the template.
-FINE_NIF(decision_init, ERL_NIF_DIRTY_JOB_CPU_BOUND);
+LLAMA_NIF(decision_init, ERL_NIF_DIRTY_JOB_CPU_BOUND);
 
 // The request is untrusted JSON. nlohmann's parser and the port's own
 // sort/replace/render walks all recurse on its nesting, so depth is C-stack
@@ -3423,7 +3603,7 @@ decision_decide(ErlNifEnv* env, fine::ResourcePtr<LlamaDecision> dec, std::strin
         return fine::Error(std::string(e.what()));
     }
 }
-FINE_NIF(decision_decide, ERL_NIF_DIRTY_JOB_CPU_BOUND);
+LLAMA_NIF(decision_decide, ERL_NIF_DIRTY_JOB_CPU_BOUND);
 
 // --- Init ---
 
