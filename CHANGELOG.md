@@ -1,5 +1,79 @@
 # Changelog
 
+## v0.8.66
+
+llama.cpp bumped to `785322d17`
+([`b12032`](https://github.com/ggml-org/llama.cpp/releases/tag/b12032)+1),
+31 commits from `418f905a4` (b11986+16). No change was needed in
+`llama_nif.cpp`. Of the headers the NIF includes only `common/common.h`
+changed, removing `fs_path_to_utf8` (#31423), which the NIF does not call;
+`llama.h`, `ggml.h`, `ggml-backend.h`, `ggml-rpc.h`, `chat.h`, `sampling.h`,
+`speculative.h` and `src/llama-ext.h` are untouched, as are
+`src/llama-vocab.cpp` (the special-token partition `input_tokenize.cpp`
+mirrors) and `src/llama-context.cpp`. `llama_model_default_params` /
+`llama_context_default_params` are unchanged. RPC protocol stays at 8.0.1
+(`GGML_OP_COUNT` 102). Upstream versions: llama.cpp 0.8.0, ggml 0.28.0.
+
+### Changed
+
+- `decision.cpp` ports #30710 and is now "Ported at" `785322d17`. Upstream caps
+  a shared decision prefix at the first read position of every question
+  (`server_decision_group_tasks`), so each question's outputs stay in its own
+  last batch when questions share option tokens (#30482). The port already
+  capped it there for embedding readouts; label readouts with a read position
+  are now capped too.
+- Upstream, from the 31 commits:
+  - Recurrent memory refuses a partial rollback past the snapshots its last
+    ubatch wrote, instead of restoring a stale state (#31368). A ubatch longer
+    than `n_rs_seq + 1` tokens now only allows a full reset. That is the path
+    `memory_seq_rm` already reports and the Server already handles for hybrid
+    models.
+  - KV rotation constants stay on the GPU (#31073), and layers that reuse
+    another layer's KV cache rotate correctly (#31406).
+  - Gemma 3n / Gemma 4 create `token_embd` before the tied output (#31394).
+  - Reasoning-budget forcing ends on an end tag from the prompt (#31374).
+  - The qwen3-coder chat parser accepts a think block with
+    `reasoning_format: none` (#31380).
+  - LFM3 tensor split and an LFM short-conv reshape (#31431, #30831).
+  - Metal's quantize kernels compile with `fp math_mode(safe)`, which changes
+    rounding when writing a Q4_0/Q5_0/Q8_0 KV cache (#31120).
+  - OpenCL, SYCL, Hexagon and Windows build work.
+- `test/mtp_model_test.exs` records `:mtp_cancel` at this commit: 3 of 4 runs
+  abort (SIGSEGV), the fourth fails with `unknown exception thrown within NIF`.
+  This is the same known race as before.
+
+Upstream defects (`docs/release-guide.md`): #1, #2 and #3 are unchanged by
+source diff. `ggml-cpu/CMakeLists.txt`, `ggml-rpc` and `ggml-cuda.cu` were
+not touched. #2's tp=2 re-measurement on Spark is still owed.
+
+Verified on macOS, M1 Max, at `785322d17`, Metal with residency sets on, every
+run exiting 0 unless noted:
+
+- default **436 passed, 197 excluded**;
+- `--include smoke --include embeddings --include slow --include mtp`
+  (Qwen3.5-0.8B-UD-Q4_K_XL, Qwen3-Embedding-0.6B-f16,
+  Qwen3.6-35B-A3B-MTP-UD-Q4_K_XL) **588 passed**;
+- CI's set (SmolLM2-135M, bge-small, tinylaya, tinyopenjev, Qwen3.5-0.8B)
+  **604 passed**;
+- `--include embeddings` on embeddinggemma-2-Q8_0 **447 passed**;
+- `--include decision_clef` on Clef Flash Q8_0 **440 passed**;
+- `--include tools` on Llama-3.2-1B-Instruct 446 of 447 (the known round
+  trip);
+- `--include mtp_sidecar` on the Qwen 3.8 27B pair **442 passed, 6
+  skipped**;
+- CPU backend: `--include tools` on Qwen3.5-0.8B **447 passed**,
+  `test/vm_exit_test.exs` **3 passed**.
+
+`scripts/decision_compare.exs` against upstream `llama-server` built from the
+same commit with Metal (`-np 1`): tinylaya, tinyopenjev, d1-2B, d1-3B,
+d1-omni-600M, vllm-decision2-Kai-0.6B, vllm-d3-edge, Clef Flash (Q8_0) and
+h2o-lightning-4b (Q4_K_M) **ALL MATCH**, with identical token counts. Every
+checked answer agrees within 1e-3, and laya, clef and h2o-lightning agree
+exactly. The `sharing` column is unchanged (d1-3B 6.1e-4, Kai 6.4e-4,
+nothing else). Format, credo `--strict` and dialyzer (0 errors) clean; the Hex
+source build clones `785322d17` and compiles. Not run this time: `rpc_live`
+(no `ggml-rpc` change) and granite-switch.
+
 ## v0.8.65
 
 Fixes the Metal abort at VM exit with a model still referenced (#116).

@@ -332,6 +332,12 @@ everything else. The `ggml-cuda.cu` diff is the MMQ MoE gate/up/GLU fusion
 (#31188), RDNA4_M (#31373) and the batched copy hooks (#30881), none of it near
 `ggml_backend_cuda_comm_init`.
 
+Re-checked at `785322d17` (b12032+1), covering the 31 commits from
+`418f905a4`: #1, #2 and #3 are as above. `ggml-cpu/CMakeLists.txt`,
+`ggml-rpc`, `ggml-rpc.h`, `ggml.h` and `ggml-cuda.cu` were not touched, so the
+RPC protocol and op ids are unchanged (#31424 removes `fs_path_to_utf8` from
+`tools/rpc`, not from the backend).
+
 | # | Upstream defect | Our workaround | Still needed? |
 |---|---|---|---|
 | 1 | `GGML_NATIVE=ON` makes ggml's `-mcpu=native` probe resolve to **base ARMv8-A** on Cortex-X925/A725 with GCC 13.3 — silently, with a soft CMake warning and exit 0. Costs every `sdot`/`smmla`/SVE kernel. | `LLAMA_CPU_ARM_ARCH` + `LLAMA_CUDA_ARCH` in the `Makefile`, which must be set together. See [DGX Spark](dgx-spark.md) and [Cross-Platform Builds](cross-platform-builds.md). | `scripts/spark/verify-build-flags.sh` on an aarch64 host. If a default build (no `LLAMA_CPU_ARM_ARCH`) now reports non-zero `sdot`/`smmla`, upstream fixed the probe. |

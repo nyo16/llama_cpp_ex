@@ -2,7 +2,7 @@
 // of tools/server/server-context.cpp (send_decision, the batch layout rules and
 // the /v1/systemone handler). See decision.h for scope.
 //
-// Ported at 418f905a4. Functions that are upstream's carry its name in a
+// Ported at 785322d17. Functions that are upstream's carry its name in a
 // trailing comment so a bump can diff them one by one; everything below the
 // "evaluation" banner replaces server slots and is ours.
 
@@ -2103,8 +2103,9 @@ struct Engine::Impl {
     }
 
     // Tokens every task starts with, capped so each task keeps at least one
-    // token of its own (server_decision_group_tasks) and so no read position
-    // falls inside the prefix, where it would not be an output.
+    // token of its own and stops at its first read position
+    // (server_decision_group_tasks, #30710), and so no output of the last batch
+    // falls inside the prefix.
     int32_t shared_prefix(const std::vector<decision_task> & tasks) const {
         if (!can_share_prompt() || tasks.size() < 2 || llama_n_seq_max(ctx) < 2) {
             return 0;
@@ -2117,6 +2118,10 @@ struct Engine::Impl {
                 n_common++;
             }
             n_shared = std::min({n_shared, n_common, task.tokens.size() - 1});
+            // upstream casts pos_first() to size_t, so -1 (nothing read) caps nothing
+            if (task.pos_first() >= 0) {
+                n_shared = std::min(n_shared, (size_t) task.pos_first());
+            }
             n_shared = std::min(n_shared, (size_t) first_batched(task));
         }
         return (int32_t) n_shared;
