@@ -818,6 +818,18 @@ BEAM unpinned, `b1`, two sessions), two-node decode is **50.6 and 50.8 tok/s**
 against 54.7 and 55.2 single-node, where the vendored build gives 37.4–38.5
 unpinned. Two-node prefill rises to 2731–2750 with the CUDA commits.
 
+With the client fixed, the worker binary shows up. Against the same patched
+`llama-bench` client, this library's `LlamaCppEx.RPC.Server` decodes at
+53.8–54.0 and upstream's `ggml-rpc-server` at 57.6, four restarts each. The
+binding client gives the same split: 50.6–50.8 against 53.9. Both workers run
+the same server code from the same tree. BEAM scheduler flags (`+sbwt none`,
+`+S 1:1`) change nothing, and the GPU clocks the same in both, 2411 MHz. Yet
+the worker's memory-bound kernels run ~5% slower inside the BEAM (`nsys`: 123.7
+against 117–118 µs per expert matvec, 2.84 against 2.71–2.76 ms for the LM
+head). That points at where the weights land in memory, the same family as
+the per-load decode spread on one node, but the cause is not established. For
+the last 7% of two-node decode, run `rpc-worker.sh --upstream`.
+
 ### RDMA versus TCP, and the 10 GbE LAN
 
 `GGML_RPC_NO_RDMA=1` on either peer keeps the connection on TCP
