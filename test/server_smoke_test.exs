@@ -78,6 +78,40 @@ defmodule LlamaCppEx.ServerSmokeTest do
     end
   end
 
+  describe "the prefix-instability heuristic" do
+    # It warns that a chat template is rewriting history, so it must fire on a
+    # prompt that diverges from the cached history early, and never on a prompt
+    # that is wholly cached — the same prompt again used to trip it as soon as
+    # the generated tail made the cached history long enough.
+    @shared "The capital of France is Paris. The capital of Germany is Berlin. " <>
+              "The capital of Spain is Madrid. The capital of Portugal is Lisbon. "
+
+    test "is silent when the same prompt comes back" do
+      server = start_server(n_parallel: 1)
+      attach_collector(server, [:llama_cpp_ex, :server, :prefix_instability])
+
+      {:ok, _} = Server.generate(server, @shared <> "The capital of Italy is", max_tokens: 96)
+      {:ok, _} = Server.generate(server, @shared <> "The capital of Italy is", max_tokens: 8)
+
+      refute_receive {:telemetry, _, _}, 500
+    end
+
+    test "fires when the prompt diverges from the cached history early" do
+      server = start_server(n_parallel: 1)
+      attach_collector(server, [:llama_cpp_ex, :server, :prefix_instability])
+
+      {:ok, _} = Server.generate(server, @shared <> "The capital of Italy is", max_tokens: 96)
+
+      {:ok, _} =
+        Server.generate(server, @shared <> "Name three rivers in each of those countries.",
+          max_tokens: 8
+        )
+
+      {%{matched_tokens: matched, cached_tokens: cached}, _} = next_telemetry()
+      assert matched < cached
+    end
+  end
+
   test "empty token list errors immediately on both call types" do
     server = start_server([])
 

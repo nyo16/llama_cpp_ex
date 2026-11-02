@@ -1156,7 +1156,7 @@ defmodule LlamaCppEx.Server do
     {raw_match, own_match} =
       own_cache_match(state, slot, tokens, n_tokens, cache_prompt?, scope, lcp)
 
-    state = maybe_warn_prefix_instability(state, seq_id, slot, raw_match, cache_prompt?)
+    state = maybe_warn_prefix_instability(state, seq_id, slot, raw_match, n_tokens, cache_prompt?)
 
     {state, n_match} =
       resolve_prefix_cache(state, seq_id, tokens, own_match, cache_prompt?, scope)
@@ -1368,9 +1368,15 @@ defmodule LlamaCppEx.Server do
   # turns (e.g. Qwen thinking-strip re-rendering) — every such request pays a
   # near-full re-prefill that the caller probably believes is cached. Emit
   # telemetry per occurrence and warn in the log once per server.
-  defp maybe_warn_prefix_instability(state, seq_id, slot, raw_match, cache_prompt?) do
+  #
+  # Only when the prompt itself diverges from the cache: own_cache_match caps
+  # the match at n_tokens - 1, so a prompt that is wholly cached (the same
+  # prompt again, a regenerate) matches exactly that and is a perfect hit, not
+  # instability, however long the cached history behind it.
+  defp maybe_warn_prefix_instability(state, seq_id, slot, raw_match, n_tokens, cache_prompt?) do
     suspicious? =
-      cache_prompt? and slot.cached_pos >= @prefix_instability_min_cached and
+      cache_prompt? and raw_match < n_tokens - 1 and
+        slot.cached_pos >= @prefix_instability_min_cached and
         raw_match > slot.cached_pos * 0.1 and raw_match < slot.cached_pos * 0.5
 
     if suspicious? do

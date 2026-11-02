@@ -32,6 +32,12 @@ numbers behind the entries below.
   them given resolves as before. Metal, CPU and discrete CUDA devices support
   mmap, so `auto` maps there exactly as the old default did. The NIF's
   `model_load` now takes the resolved mode instead of three booleans.
+- `LlamaCppEx.Server`'s prefix-instability warning and
+  `[:llama_cpp_ex, :server, :prefix_instability]` event fired when the same
+  prompt came back (a retry, a regenerate, a benchmark loop) once the cached
+  generation made the history long enough — the whole prompt matched, which
+  is a perfect cache hit. They now fire only when the prompt itself diverges
+  from the cached history.
 - `LlamaCppEx.RPC.add_server/1`, `ping/1` and `Model.load/2`'s
   `:rpc_servers` aborted the VM on an RPC build when the endpoint was
   unreachable, unparseable, not an RPC worker, or spoke another protocol
