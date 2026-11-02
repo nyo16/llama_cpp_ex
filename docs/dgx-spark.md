@@ -249,19 +249,36 @@ clean A/B for what speculative decoding buys on this hardware. See
 
 ## Running on ONE Spark
 
-Full numbers and methodology in
-`bench/results/v0.8.43-dgx-spark-baseline.md`, and the two-node numbers in
-`bench/results/v0.8.43-dgx-spark-two-node.md`.
-The short version:
+Measured at `785322d17` with every layer on the GPU. Prefill and the
+single-stream decode reference are `llama-bench` (`-fa 1`, median of 3);
+the rest is the binding through `bench/spark_overhead.exs` — `stream` is
+`LlamaCppEx.stream/3`, the others `LlamaCppEx.Server` with that many
+concurrent streams (per-stream decode, then aggregate):
 
-| model | prefill (pp) | decode (tg) |
-|---|---|---|
-| Qwen3-8B Q4_K_M | 3500–4331 t/s | 40.5 t/s |
-| Qwen3-30B-A3B Q4_K_M | 3287 t/s | 90.9 t/s |
+| model | size | pp512 | pp4096 | tg128 (upstream) | `stream` | server ×1 | server ×4 | server ×8 |
+|---|---|---|---|---|---|---|---|---|
+| Qwen3-8B Q4_K_M | 4.7 GiB | 3623 | 3500 | 43.9 | 44.1 | 43.7 | 39.0 / **153** | 36.4 / **284** |
+| Qwen3-30B-A3B Q4_K_M | 17.3 GiB | 3282 | 3198 | 92.7 | 91.4 | 88.6 | 57.8 / **224** | 34.9 / **272** |
+| Qwen3.6-35B-A3B UD-Q4_K_M | 20.6 GiB | 2918 | 2823 | 69.8 | 68.3 | 63.0 | 43.0 / **165** | 31.5 / **245** |
+| Qwen3.8-27B Q4_K_M | 17.7 GiB | 1004 | 1008 | 11.3 | 11.3 | 11.2 | 9.9 / **39** | 8.4 / **66** |
+| Qwen3.8-27B NVFP4 MID-HIGH | 15.7 GiB | 1278 | 1275 | 14.4 | 14.3 | 14.3 | 12.2 / **48** | 10.0 / **78** |
+| gpt-oss-120b MXFP4 | 59.0 GiB | 1923 | 1990 | 49.2–59.0 | 57.0 | 55.9 | 23.8 / **91** | 13.5 / **105** |
 
-Three of the four figures beat the published single-Spark references; the fourth
-is 7% under. **Prefill is this machine's strong suit** and decode is bandwidth-
-bound, so quote them separately or you describe neither.
+**Prefill is this machine's strong suit** and decode is bandwidth-bound, so
+quote them separately or you describe neither. The dense models scale almost
+linearly with concurrency (8 streams of Qwen3-8B cost 17% per stream for 6.4×
+the aggregate); the MoE models scale less, because each additional stream
+activates different experts and the step reads more weight. The binding's
+single-stream decode is within 2% of `llama-bench` everywhere.
+
+> #### Measure decode more than once per load {: .warning}
+>
+> gpt-oss-120b's `llama-bench` tg128 came out at 49.2 in one run of a
+> six-model sweep and 58.8–59.0 in fourteen others; the same ~17% dip
+> appeared per process, with no change in clocks, page cache or memory
+> fragmentation that would explain it. Forcing `mmap` made it the common
+> case (see the load-mode row below). Treat any single decode figure on
+> this machine as one sample.
 
 ### Settings that matter
 
@@ -415,9 +432,10 @@ than the marketing:
   implements async compute and events, so llama.cpp enables **pipeline
   parallelism** across an RPC split (it used to refuse, and the nodes ran
   sequentially). A prompt's micro-batches now overlap across the two nodes:
-  prefill measured **+16–26%** for gpt-oss-120b and +22% for Qwen3.8-27B NVFP4
-  against one node. A single decode stream has nothing to overlap and stays
-  within noise of one node (see B1 below).
+  prefill measured **+18–26%** for gpt-oss-120b and +22% for Qwen3.8-27B NVFP4
+  against one node. A single decode stream has nothing to overlap and pays a
+  network round trip per token: 14% slower at best for gpt-oss-120b (see the
+  control below).
 - **Tensor parallelism ("tp=2"): technically yes, practically no.** It runs and
   it is correct, and it is 2.7× slower on decode. See the verdict section.
 
@@ -615,24 +633,29 @@ for it, keep the worker's tensor cache on, and do not restart casually.
 ### The control: a model that does fit
 
 gpt-oss-120b MXFP4 (63.4 GB — fits one node, so this isolates RPC cost from
-memory benefit), 1024-token prompt, 128 decode steps, median of 7, RDMA, one
-session at `785322d17`:
+memory benefit) at `785322d17`, after the load-mode fix. Binding rows:
+`bench/spark_two_node.exs`, 1024-token prompt, 128 decode steps, median of 7,
+two sessions each. Upstream rows: `llama-bench --rpc ... -dev CUDA0/RPC0`
+against the same worker.
 
 | run | load s | TTFT ms | prefill t/s | decode t/s |
 |---|---|---|---|---|
-| single-node | 50.9 | 515.2 | 2075.9 | 45.62 |
-| two-node 50/50 | 154.2 | 447.9 | 2418.0 | 40.94 |
-| two-node 50/50, fresh worker | 80.6 | 411.8 | 2625.7 | 45.81 |
+| single node | 30–52 | 491–495 | 2151–2168 | 53.3–53.8 |
+| two nodes 50/50, RDMA | 105–112 | 418–429 | 2552–2614 | 36.2–37.6 |
+| `llama-bench`, single node | — | — | 2046 (pp1024) | 58.8–59.0 |
+| `llama-bench`, two nodes, fresh worker | — | — | 2460 (pp1024) | 50.4, 41.5, 50.5 (three clients in a row) |
 
-**Prefill is now 16–26% faster on two nodes** and TTFT 13–20% lower: with the
-RPC backend async (#18626), llama.cpp pipelines the prompt's micro-batches
-across the nodes, where it used to run them one node after the other. Decode
-is a single stream with nothing to overlap; across four RDMA runs it landed
-between 36.5 and 45.8 tok/s against 45.6 on one node, so call it **no gain,
-and noisier**. Qwen3.8-27B NVFP4 says the same: prefill 1410 → 1725 tok/s,
-decode 14.02 → 13.77.
+**Prefill is 18–26% faster on two nodes** and TTFT ~14% lower: with the RPC
+backend async (#18626), llama.cpp pipelines the prompt's micro-batches across
+the nodes, where it used to run them one node after the other. **Decode is
+slower** — a single stream has nothing to overlap and pays a network round
+trip per token on top of the same total compute: 14% at best through
+`llama-bench`, ~30% through the binding's server. The spread on the
+two-node rows is the worker's: the same worker served three `llama-bench`
+clients in a row at 50.4, 41.5 and 50.5 tok/s, so restart it and re-measure
+before believing any one two-node decode figure.
 
-Load time is still the cost — 1.6–3× one node — because ~30 GB of weights
+Load time is still the cost — 2–3× one node — because ~30 GB of weights
 cross the network and the client still reads and hashes every tensor to check
 the worker's cache.
 
@@ -640,24 +663,26 @@ the worker's cache.
 
 `GGML_RPC_NO_RDMA=1` on either peer keeps the connection on TCP
 (`rpc-worker.sh start spark-2 --tcp`); `--link lan` binds the worker to the
-10 GbE management NIC instead of the fabric. Same 120b model; load is from a
-run with the worker's tensor cache off (every byte crosses the link), the rest
-from a 7-sample run per transport on a freshly restarted worker:
+10 GbE management NIC instead of the fabric. Same 120b model and harness,
+worker restarted with its tensor cache off for every run so every byte crosses
+the link, two sessions per transport:
 
-| transport | load s | TTFT ms | prefill t/s | decode t/s (runs) |
+| transport | load s | TTFT ms | prefill t/s | decode t/s |
 |---|---|---|---|---|
-| RDMA, 200 GbE fabric | 54.5 | 411.8 | 2625.7 | 45.8 (36.5–45.8 over 4 runs) |
-| TCP, 200 GbE fabric | 59.5 | 426.6 | 2545.6 | 41.1 (41.1–42.8 over 3) |
-| TCP, 10 GbE LAN | 75.8 | 426.3 | 2546.8 | 41.2 (40.0–41.2 over 3) |
+| RDMA, 200 GbE fabric | 105–112 | 418–429 | 2552–2614 | 36.2–37.6 |
+| TCP, 200 GbE fabric | 89–91 | 419–422 | 2593–2615 | 36.9–37.6 |
+| TCP, 10 GbE LAN | 76–77 | 422–429 | 2540–2585 | 38.8–39.1 |
 
-**What you lose without RDMA is now small:** ~3% of prefill, decode within
-RDMA's own run-to-run spread, and ~10% of load time on the same link. The 10
-GbE LAN costs the same steady-state and **~40% more load time**, because a
-load is the one phase that moves gigabytes. The −27% prefill / −11% decode TCP
-penalty measured at b10362 is gone: per-token traffic across a layer split is
-one activation row, and the async dispatcher now hides the round trip.
-Keep RDMA for loads and as the default, but TCP — even over the LAN — is a
-working fallback rather than a cliff.
+**On this llama.cpp you lose nothing measurable without RDMA**, and nothing
+on the 10 GbE LAN either: TTFT, prefill and decode overlap across the three
+transports, and load time did not favour RDMA (the LAN was quickest in this
+session; RDMA loaded in 54 s in an earlier one), so it is dominated by the
+client reading and hashing the file, not by the wire.
+Per-token traffic
+across a layer split is one activation row, and the async dispatcher hides the
+round trip; the −27% prefill / −11% decode TCP penalty measured at b10362 is
+gone. RDMA still activates by default on the fabric and costs nothing, so
+leave it on — but a TCP fallback, even over the LAN, is not a cliff.
 
 To confirm which one you got, look at the worker's log with
 `GGML_RPC_DEBUG=1`:

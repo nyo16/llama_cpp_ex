@@ -147,13 +147,16 @@ of a device being a network away — it will budget a remote device as if it wer
 local VRAM. The numbers are not nonsense, but do not read more into them than
 that.
 
-### It buys capacity, not speed
+### It buys capacity, and prefill, not decode
 
-Pipeline parallelism is disabled whenever an RPC device participates: the RPC
-backend reports `async = false, events = false`, and llama.cpp checks that before
-enabling pipelining. The two nodes therefore execute **sequentially**. A model
-that already fits on one machine gains nothing from a second one. See
-[DGX Spark](dgx-spark.md) for the measurements.
+Since llama.cpp #18626 the RPC backend implements async compute and events, so
+llama.cpp enables pipeline parallelism across an RPC layer split: a prompt's
+micro-batches overlap across the nodes, and prefill measured 18–26% faster on
+two DGX Sparks than on one. A single decode stream has nothing to overlap and
+pays a network round trip per token, so it is slower than on one machine. A
+model that already fits on one machine gains capacity and prefill from a
+second one, not decode speed. See [DGX Spark](dgx-spark.md) for the
+measurements.
 
 > #### A peer failure aborts the VM {: .error}
 >
