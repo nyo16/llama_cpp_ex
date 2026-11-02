@@ -3,8 +3,12 @@ Code.require_file("helpers.exs", __DIR__)
 # Two-node measurement suite for a pair of DGX Sparks.
 #
 #   scripts/spark/rpc-worker.sh start spark-2
-#   scripts/spark/remote.sh --env MIX_ENV=bench --env LLAMA_RPC=1 spark-1 \
+#   scripts/spark/remote.sh --little-cores --env MIX_ENV=bench --env LLAMA_RPC=1 spark-1 \
 #     mix run bench/spark_two_node.exs <bench>
+#
+# --little-cores runs this client on the Cortex-A725 cores, where two-node decode
+# is ~25% faster than on the X925s an unpinned BEAM mostly lands on
+# (docs/dgx-spark.md, "Pin the client to the little cores").
 #
 # Benches, each answering one question:
 #

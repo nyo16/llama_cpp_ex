@@ -1359,7 +1359,7 @@ NVFP4 (DFlash 2) and 96.7 on Qwen3.6-35B-A3B (MTP, `n_draft: 2`); see
 [Speculative decoding](#speculative-decoding-mtp-dflash). Concurrency, prefill
 and two-node numbers are in [docs/dgx-spark.md](docs/dgx-spark.md).
 
-Two notes on method, both learned the hard way:
+Three notes, all learned the hard way:
 
 - **Each run uses a distinct prompt, or prompt caching off.** Repeating one
   prompt hits the context reuse path and reports a throughput the engine never
@@ -1368,6 +1368,10 @@ Two notes on method, both learned the hard way:
   slower for its whole lifetime (gpt-oss-120b: 48.5 against 57 tok/s), and a
   forced `use_mmap: true` made that the common case — leave the load-mode
   options unset.
+- **Over two nodes, pin the client to the Cortex-A725 cores**
+  (`taskset -c 0-4,10-14`). Unpinned, the BEAM mostly lands on the X925
+  cores, and decode over RPC runs ~25% slower: gpt-oss-120b layer-split decoded
+  37–38 tok/s unpinned against 47 pinned, with the same prefill.
 
 ### Single-sequence generation (Qwen3-4B Q4_K_M)
 

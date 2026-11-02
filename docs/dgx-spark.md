@@ -25,9 +25,10 @@ Use `free -h`. `LlamaCppEx.devices/0` reports it correctly (130.7 GB total on
 `:igpu` for the same reason.
 
 **The CPU clusters are interleaved.** The performance cores are **5-9, 15-19**;
-the efficiency cores are **0-4, 10-14**. `taskset -c 0-9` therefore pins a job
-entirely to little cores. Measured on a 1-byte RDMA ping-pong: p50 21.5 µs on
-cpu19 versus 29.1 µs on cpu0.
+the efficiency cores are **0-4, 10-14**. `taskset -c 0-9` therefore gives a job
+five of each, not the X925 cluster. Measured on a 1-byte RDMA ping-pong: p50
+21.5 µs on cpu19 versus 29.1 µs on cpu0. Even so, a two-node *client* decodes
+25% faster on the A725 cores (see "Pin the client to the little cores").
 
 **`ping` lies by three orders of magnitude.** ICMP RTT over the 200 Gb/s direct
 link reads ~1.2 ms. That is cpuidle exit latency (LPI-3 is 433 µs), not the wire
@@ -301,7 +302,7 @@ And the settings that do **not** matter, each of which looks like it should:
 | `n_batch`, `n_ubatch` | no measurable effect; the default is fine |
 | `GGML_CUDA_GRAPH_OPT=1` (env) | upstream's experimental concurrent-stream graph optimisation: **+2%** decode on gpt-oss-120b (60.1 against 59.0, three runs each), neutral on Qwen3-8B, Qwen3.6-35B-A3B and Qwen3.8-27B NVFP4 |
 | cpuidle / `idle=poll` | **no effect**, single-node or two-node. See below |
-| `taskset -c 5-9,15-19` | hygiene, not speed. But never use `-c 0-9` — those are the little cores |
+| `taskset` | single node: hygiene, not speed. Two nodes: run the **client** on the A725 cores, `taskset -c 0-4,10-14`, for **+25% decode** (see "Pin the client to the little cores"). Note `-c 0-9` is half little cores, not the X925s |
 
 ### The cpuidle story, and why you can ignore it
 
@@ -513,8 +514,9 @@ than the marketing:
   sequentially). A prompt's micro-batches now overlap across the two nodes:
   prefill measured **+18–26%** for gpt-oss-120b and +22% for Qwen3.8-27B NVFP4
   against one node. A single decode stream has nothing to overlap and pays a
-  network round trip per token: 14% slower at best for gpt-oss-120b (see the
-  control below).
+  network round trip per token. For gpt-oss-120b that costs 8% through
+  `llama-bench` and ~15% through the binding with the client on the A725
+  cores, and 25–30% left unpinned (see the control below).
 - **Tensor parallelism ("tp=2"): technically yes, practically no.** It runs and
   it is correct, and it is 2.7× slower on decode. See the verdict section.
 
@@ -729,22 +731,60 @@ backend async (#18626), llama.cpp pipelines the prompt's micro-batches across
 the nodes, where it used to run them one node after the other. **Decode is
 slower** — a single stream has nothing to overlap and pays a network round
 trip per token on top of the same total compute: 14% at best through
-`llama-bench`, ~30% through the binding's server. The spread on the
-two-node rows is the worker's: the same worker served three `llama-bench`
-clients in a row at 50.4, 41.5 and 50.5 tok/s, so restart it and re-measure
-before believing any one two-node decode figure.
+`llama-bench`, ~30% through the binding's server, with the client unpinned.
+The spread on the two-node rows (one worker served three `llama-bench` clients
+in a row at 50.4, 41.5 and 50.5 tok/s) was not the worker's, as this page used
+to say. It comes from which cluster the *client* runs on, and pinning it
+removes most of the decode cost; see the next section.
 
-The worker binary matters less than that spread. `LlamaCppEx.stream/3` over
+The worker binary matters less than that. `LlamaCppEx.stream/3` over
 two nodes, three fresh contexts per session, worker restarted between
 sessions: this library's `LlamaCppEx.RPC.Server` decoded at 38–48 tok/s
 (sessions at ~38 and ~38/47), upstream's `ggml-rpc-server`
-(`rpc-worker.sh --upstream`) at 40–51 (~50 and ~40). Both land in one of two
-bands per session; upstream's sat in the faster one more often over four
-sessions, which is too few to call.
+(`rpc-worker.sh --upstream`) at 40–51 (~50 and ~40). Both fall into the same
+two bands.
 
 Load time is still the cost — 2–3× one node — because ~30 GB of weights
 cross the network and the client still reads and hashes every tensor to check
 the worker's cache.
+
+### Pin the client to the little cores
+
+Two-node decode lands in one of two bands, ~44 or ~53 tok/s through
+`llama-bench`, and the client's CPU cluster picks the band. The setup was
+gpt-oss-120b over RDMA, upstream's worker restarted before every run, and
+`llama-bench -dev CUDA0/RPC0 -n 128 -r 3`. Single-node is 59:
+
+| worker on | client on | decode t/s |
+|---|---|---|
+| X925 `5-9,15-19` | X925 `5-9,15-19` | 44.2, 44.5, 44.6, 44.1 |
+| X925 | unpinned | 44.3, 53.2 (and ~44 in five more unpinned runs) |
+| A725 `0-4,10-14` | unpinned | 44.0, 44.5 |
+| X925 | **A725 `0-4,10-14`** | **54.0, 54.0, 53.9** |
+| A725 | **A725** | **53.5** |
+| A725 | X925 | 53.1 |
+
+The client's cluster decides the band. With the client on the A725 cores,
+every run lands in the fast band. Leave it unpinned and the scheduler mostly
+puts it on the X925 cores, which is the slow band. llama-bench's own CPU
+threads do not explain it: `--poll 0` and `-t 1` change nothing. Kernel times
+are identical in both bands on both nodes (`nsys`: 118 µs per expert matvec,
+2.7 ms for the LM head). The extra ~4 ms per token is spent on the CPU and in
+the network wait. Why the X925 cluster is slower here is not established. A
+1-byte RDMA ping-pong favours the X925 (top of page), so the cause is not raw
+link latency.
+
+The binding follows the same rule. `bench/spark_two_node.exs b1` with the
+BEAM under `taskset -c 0-4,10-14` (`scripts/spark/remote.sh --little-cores`),
+binding worker on its default cores, two sessions each:
+
+| client BEAM | single-node decode | two-node prefill | two-node decode |
+|---|---|---|---|
+| unpinned | 54.1, 55.0 | 2597, 2599 | 37.4, 38.5 |
+| **A725 cores** | 55.0, 55.1 | 2587, 2593 | **47.1, 46.6** |
+
+That is **+25% two-node decode** at no cost to prefill or single-node decode.
+**Run the client of a two-node setup on the A725 cores.**
 
 ### RDMA versus TCP, and the 10 GbE LAN
 

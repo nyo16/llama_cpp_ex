@@ -76,6 +76,12 @@ numbers behind the entries below.
   TCP (`scripts/spark/rpc-worker.sh --tcp` now uses it), and layer split over
   RPC is pipelined: the RPC backend implements async compute and events
   (#18626), so llama.cpp enables pipeline parallelism across the nodes.
+- Two-node docs: run the client on the GB10's Cortex-A725 cores
+  (`taskset -c 0-4,10-14`, new `scripts/spark/remote.sh --little-cores`).
+  Unpinned or on the X925 cores, decode over RPC sits in a band ~25% slower:
+  gpt-oss-120b layer-split decoded 37–38 tok/s against 47 through the binding,
+  44 against 54 through `llama-bench`. The decode spread the docs blamed on the
+  worker came from the client's placement.
 
 ## v0.8.66
 

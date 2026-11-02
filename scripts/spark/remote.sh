@@ -26,6 +26,8 @@ Options:
                    (default: the synced repo; "-" for $HOME)
   --env K=V        extra environment variable, repeatable
   --big-cores      wrap the command in `taskset -c 5-9,15-19` (Cortex-X925)
+  --little-cores   wrap the command in `taskset -c 0-4,10-14` (Cortex-A725):
+                   where a two-node client decodes ~25% faster
   --tty            allocate a remote tty
   --print          print the remote script instead of running it
 USAGE
@@ -35,6 +37,7 @@ login=0
 tty=0
 print_only=0
 big_cores=0
+little_cores=0
 forward_agent=0
 dir="$SPARK_REMOTE_DIR"
 extra_env=()
@@ -45,6 +48,7 @@ while [ $# -gt 0 ]; do
     --tty) tty=1; shift ;;
     --print) print_only=1; shift ;;
     --big-cores) big_cores=1; shift ;;
+    --little-cores) little_cores=1; shift ;;
     --forward-agent) forward_agent=1; shift ;;
     --dir) dir="${2:?--dir needs a path}"; shift 2 ;;
     --env) extra_env+=("${2:?--env needs K=V}"); shift 2 ;;
@@ -60,8 +64,10 @@ done
 node=$1; shift
 spark_is_node "$node" || spark_die "unknown node '$node' (known: ${SPARK_NODES[*]})"
 
+[ "$big_cores" -eq 1 ] && [ "$little_cores" -eq 1 ] && spark_die "--big-cores and --little-cores are exclusive"
 prefix=()
 [ "$big_cores" -eq 1 ] && prefix=(taskset -c "$SPARK_BIG_CORES")
+[ "$little_cores" -eq 1 ] && prefix=(taskset -c "$SPARK_LITTLE_CORES")
 
 # Assemble the remote script. Every word is quoted here rather than left to
 # ssh's own re-splitting, which joins its arguments with spaces and would mangle
