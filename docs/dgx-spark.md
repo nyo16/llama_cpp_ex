@@ -299,6 +299,7 @@ And the settings that do **not** matter, each of which looks like it should:
 | `type_k` / `type_v` | leave f16. Quantizing the KV cache **loses** 2–7% and buys nothing: there is no separate VRAM to free |
 | `use_mmap`, `use_mlock`, `use_direct_io` | **leave all three unset.** Upstream's `auto` then reads the file instead of mapping it on this iGPU. A forced `use_mmap: true` — the binding's default before this run — left most gpt-oss-120b loads decoding at 48.5 tok/s against 57 with `auto`, `use_mmap: false` or `use_direct_io: true`; about one forced-mmap load in five came out fast, so single-load comparisons from before (this row used to say mlock and dio cost 3–4%) are not reliable |
 | `n_batch`, `n_ubatch` | no measurable effect; the default is fine |
+| `GGML_CUDA_GRAPH_OPT=1` (env) | upstream's experimental concurrent-stream graph optimisation: **+2%** decode on gpt-oss-120b (60.1 against 59.0, three runs each), neutral on Qwen3-8B, Qwen3.6-35B-A3B and Qwen3.8-27B NVFP4 |
 | cpuidle / `idle=poll` | **no effect**, single-node or two-node. See below |
 | `taskset -c 5-9,15-19` | hygiene, not speed. But never use `-c 0-9` — those are the little cores |
 
@@ -721,9 +722,15 @@ DFlash still pays 1.6× across two nodes. The drafter must be loaded on every
 device the target uses, because it computes with the target's embeddings and
 LM head: with the target on `["CUDA0", "RPC0"]` and the drafter on `CUDA0`
 alone, upstream aborts the process ("pre-allocated tensor (output.weight) in
-a buffer (RPC0) that cannot run the operation"). `MTP.init/2` refuses that
-pairing; load the drafter with the target's `:devices` and
-`tensor_split: [1.0, 0.0]` to keep its own layers local.
+a buffer (RPC0) that cannot run the operation") — `llama-server
+--spec-draft-device CUDA0` does it too. `MTP.init/2` refuses that pairing;
+load the drafter with the target's `:devices` and `tensor_split: [1.0, 0.0]`
+to keep its own layers local.
+
+The upstream fix is branch `draft-ctx-other-devices` on `nyo16/llama.cpp`: a
+context with `ctx_other` gets a backend for each of the other model's devices.
+With it, that same `llama-server` command runs, at 26.4 tok/s (566 drafted,
+173 accepted) on one 256-token completion.
 
 ### Concurrency across two nodes
 

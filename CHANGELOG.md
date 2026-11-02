@@ -24,7 +24,9 @@ numbers behind the entries below.
   embeddings and LM head, and a target split onto an RPC worker with the
   drafter on `CUDA0` alone aborted the VM. Loaded with the target's
   `:devices`, DFlash runs over a two-node split (Qwen3.8-27B NVFP4: 22.3
-  tok/s against 14.0 plain).
+  tok/s against 14.0 plain). Upstream fix (the draft context gets backends
+  for the target's devices): `nyo16/llama.cpp` branch
+  `draft-ctx-other-devices`.
 
 ### Fixed
 
