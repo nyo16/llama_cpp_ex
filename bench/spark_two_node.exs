@@ -17,8 +17,10 @@ Code.require_file("helpers.exs", __DIR__)
 #        justifies the second Spark, and it is allowed to come out negative.
 #   b3   RDMA versus TCP, in tokens. One run per transport; see the b3 clause
 #        for the worker flags (`--tcp` sets GGML_RPC_NO_RDMA, `--link lan`).
-#   b4   Batching amortisation. Per-token RTT is fixed per *graph*, not per
-#        token, so n_parallel should amortise it. Measure, do not assume.
+#
+#   Concurrency across two nodes is bench/spark_overhead.exs with
+#   SPARK_RPC_ENDPOINT set: it runs N streams at once, which a slot count alone
+#   does not.
 #
 # Every run reports worker RSS before and after: upstream's worker is reported
 # to grow and never release, and RSS is a column here rather than an afterthought.
@@ -367,34 +369,7 @@ case which do
 
     TwoNode.table([row])
 
-  "b4" ->
-    # Per-token RTT is fixed per graph, not per token, so a bigger batch should
-    # amortise it.
-    path = models["120b"]
-    register.()
-    {local, remote} = device_names.()
-
-    rows =
-      for n_parallel <- [1, 4, 8] do
-        TwoNode.measure(
-          "120b two-node n_parallel=#{n_parallel}",
-          path,
-          [
-            n_parallel: n_parallel,
-            n_ctx: n_ctx * n_parallel,
-            cache_prompt: false,
-            devices: [local, remote],
-            split_mode: :layer,
-            tensor_split: [0.5, 0.5]
-          ],
-          prompt_tokens,
-          worker_node
-        )
-      end
-
-    TwoNode.table(rows)
-
   other ->
-    IO.puts(:stderr, "unknown bench #{inspect(other)}; expected b1, b2, b3 or b4")
+    IO.puts(:stderr, "unknown bench #{inspect(other)}; expected b1, b2 or b3")
     System.halt(2)
 end

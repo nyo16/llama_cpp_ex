@@ -1,6 +1,7 @@
 # Binding overhead against upstream's own tools, on one model.
 #
 #   scripts/spark/remote.sh --env MIX_ENV=bench --env LLAMA_MODEL_PATH=<gguf> \
+#     [--env SPARK_RPC_ENDPOINT=10.100.64.2:50052] \
 #     --big-cores spark-1 mix run bench/spark_overhead.exs
 #
 # Compare with, from the same llama.cpp commit:
@@ -66,7 +67,24 @@ defmodule Overhead do
 end
 
 :ok = LlamaCppEx.init()
-{:ok, model} = LlamaCppEx.load_model(model_path, n_gpu_layers: -1)
+
+# SPARK_RPC_ENDPOINT=host:port splits every load 50/50 with that worker, so the
+# same table measures two nodes.
+placement =
+  case System.get_env("SPARK_RPC_ENDPOINT") do
+    nil ->
+      []
+
+    endpoint ->
+      [
+        rpc_servers: [endpoint],
+        devices: ["CUDA0", "RPC0"],
+        split_mode: :layer,
+        tensor_split: [0.5, 0.5]
+      ]
+  end
+
+{:ok, model} = LlamaCppEx.load_model(model_path, [n_gpu_layers: -1] ++ placement)
 
 IO.puts("model: #{Path.basename(model_path)}  n_gen: #{n_gen}  samples: #{samples}\n")
 IO.puts("| path | streams | tokens/stream | per-stream t/s | aggregate t/s |")
@@ -85,12 +103,14 @@ IO.puts("| stream | 1 | #{n} | #{Float.round(tps, 2)} | #{Float.round(tps, 2)} |
 for n_par <- [1 | parallel] do
   {:ok, server} =
     LlamaCppEx.Server.start_link(
-      model_path: model_path,
-      n_gpu_layers: -1,
-      n_parallel: n_par,
-      n_ctx: 4096 * n_par,
-      temp: 0.0,
-      cache_prompt: false
+      [
+        model_path: model_path,
+        n_gpu_layers: -1,
+        n_parallel: n_par,
+        n_ctx: 4096 * n_par,
+        temp: 0.0,
+        cache_prompt: false
+      ] ++ placement
     )
 
   # start_link returns before the load; a generate call queues behind it.

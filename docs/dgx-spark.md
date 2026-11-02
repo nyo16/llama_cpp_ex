@@ -727,14 +727,23 @@ pairing; load the drafter with the target's `:devices` and
 
 ### Concurrency across two nodes
 
-| `n_parallel` | decode t/s per request |
-|---|---|
-| 1 | 49.48 |
-| 4 | 44.71 |
-| 8 | 44.25 |
+gpt-oss-120b through `bench/spark_overhead.exs` with `SPARK_RPC_ENDPOINT`
+set (every load split 50/50 over the fabric), against the same bench on one
+node; per-stream decode, then aggregate:
 
-Per-token RTT is fixed per *graph*, not per token, so batching amortises it
-well: 8 concurrent requests cost 11% of per-request decode for 8× the aggregate.
+| streams | one node | two nodes |
+|---|---|---|
+| 1 (`stream/3`) | 57.0 | 47.8 |
+| 1 (server) | 55.9 | 45.7 |
+| 4 | 23.8 / **91** | 18.2 / **70** |
+| 8 | 13.5 / **105** | 11.8 / **92** |
+
+Two nodes keep 77–88% of one node's throughput at every concurrency, so the
+per-token round trip does not grow with the batch. (This section used to
+quote 49.5 / 44.7 / 44.3 for `n_parallel` 1 / 4 / 8 from `spark_two_node.exs
+b4`, which allocates that many slots but sends one request, so it measured
+load-to-load variation rather than concurrency.) A MoE does not batch well on
+either: each extra stream routes to different experts.
 
 ### The decode fast path is holding
 
