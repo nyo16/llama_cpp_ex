@@ -44,26 +44,33 @@ defmodule Spec do
   def median(xs) do
     s = Enum.sort(xs)
     n = length(s)
-    if rem(n, 2) == 1, do: Enum.at(s, div(n, 2)), else: (Enum.at(s, div(n, 2) - 1) + Enum.at(s, div(n, 2))) / 2
+
+    if rem(n, 2) == 1,
+      do: Enum.at(s, div(n, 2)),
+      else: (Enum.at(s, div(n, 2) - 1) + Enum.at(s, div(n, 2))) / 2
   end
 
   # {text, tokens_after_first / seconds}
   def run(enum) do
     {pieces, first, last, n} =
       Enum.reduce(enum, {[], nil, nil, 0}, fn
-        {:error, reason}, _ -> raise "generation failed: #{inspect(reason)}"
+        {:error, reason}, _ ->
+          raise "generation failed: #{inspect(reason)}"
+
         piece, {acc, f, _, n} when is_binary(piece) ->
           now = System.monotonic_time(:microsecond)
           {[piece | acc], f || now, now, n + 1}
       end)
 
-    {pieces |> Enum.reverse() |> IO.iodata_to_binary(), (n - 1) * 1_000_000 / max(last - first, 1)}
+    {pieces |> Enum.reverse() |> IO.iodata_to_binary(),
+     (n - 1) * 1_000_000 / max(last - first, 1)}
   end
 end
 
 opts = [max_tokens: n_gen, temp: 0.0]
 
 IO.puts("target: #{Path.basename(target)}\n")
+
 IO.puts(
   "| config | median t/s | range | vs plain | acceptance | output == plain | ms/iter draft / verify / ckpt / sample / other |"
 )
@@ -75,14 +82,18 @@ IO.puts("|---|---|---|---|---|---|---|")
     {runner, cleanup, label} =
       case String.split(config, ":", parts: 3) do
         ["plain"] ->
-          {fn prompt -> Spec.run(LlamaCppEx.stream(model, prompt, Keyword.put(opts, :n_ctx, 4096))) end,
-           fn -> nil end, "plain"}
+          {fn prompt ->
+             Spec.run(LlamaCppEx.stream(model, prompt, Keyword.put(opts, :n_ctx, 4096)))
+           end, fn -> nil end, "plain"}
 
         [type, n | rest] ->
           draft =
             case rest do
-              [path] -> elem(LlamaCppEx.load_model(path, n_gpu_layers: -1, load_mtp: type == "mtp"), 1)
-              [] -> nil
+              [path] ->
+                elem(LlamaCppEx.load_model(path, n_gpu_layers: -1, load_mtp: type == "mtp"), 1)
+
+              [] ->
+                nil
             end
 
           {:ok, mtp} =

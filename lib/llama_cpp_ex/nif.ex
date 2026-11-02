@@ -39,12 +39,10 @@ defmodule LlamaCppEx.NIF do
   def model_load(
         _path,
         _n_gpu_layers,
-        _use_mmap,
+        _load_mode,
         _main_gpu,
         _split_mode,
         _tensor_split,
-        _use_mlock,
-        _use_direct_io,
         _vocab_only,
         _check_tensors,
         _load_mtp,

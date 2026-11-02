@@ -21,6 +21,17 @@ numbers behind the entries below.
 
 ### Fixed
 
+- `LlamaCppEx.Model.load/2` no longer forces `mmap`. `:use_mmap` defaulted to
+  `true`, which mapped to an explicit `LLAMA_LOAD_MODE_MMAP` and overrode
+  upstream's default `auto` — the mode that skips mmap on integrated GPUs
+  (#26081). On DGX Spark (GB10) a forced mmap left most gpt-oss-120b loads
+  decoding at 48.5 tok/s instead of 57 (+17.6%; an `nsys` profile shows the
+  same kernels running ~22% longer), and about one load in five came out fast,
+  which is why single benchmark runs disagreed. With `:use_mmap`,
+  `:use_mlock` and `:use_direct_io` all unset the mode is now `auto`; any of
+  them given resolves as before. Metal, CPU and discrete CUDA devices support
+  mmap, so `auto` maps there exactly as the old default did. The NIF's
+  `model_load` now takes the resolved mode instead of three booleans.
 - `LlamaCppEx.RPC.add_server/1`, `ping/1` and `Model.load/2`'s
   `:rpc_servers` aborted the VM on an RPC build when the endpoint was
   unreachable, unparseable, not an RPC worker, or spoke another protocol

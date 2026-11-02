@@ -38,7 +38,10 @@ defmodule Overhead do
   def median([_ | _] = xs) do
     s = Enum.sort(xs)
     n = length(s)
-    if rem(n, 2) == 1, do: Enum.at(s, div(n, 2)), else: (Enum.at(s, div(n, 2) - 1) + Enum.at(s, div(n, 2))) / 2
+
+    if rem(n, 2) == 1,
+      do: Enum.at(s, div(n, 2)),
+      else: (Enum.at(s, div(n, 2) - 1) + Enum.at(s, div(n, 2))) / 2
   end
 
   # Consumes an enumerable of chunks and returns {tokens_after_first, seconds}.

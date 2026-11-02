@@ -47,15 +47,17 @@ defmodule LlamaCppEx.Model do
 
     * `:n_gpu_layers` - Number of layers to offload to GPU. Use `-1` for all layers.
       Defaults to `99` (offload all layers).
-    * `:use_mmap` - Whether to memory-map the model file. Defaults to `true`.
+    * `:use_mmap` - Memory-map the model file (`true`) or read it (`false`).
+      Unset by default, which leaves the choice to llama.cpp — see "Load mode"
+      below.
     * `:main_gpu` - GPU device index for single-GPU mode. Defaults to `0`.
     * `:split_mode` - How to split the model across devices: `:none`, `:layer`,
       `:row` or `:tensor`. Defaults to `:none`. Only `:none` and `:layer` are
       generally usable at this llama.cpp version — see the note below.
     * `:tensor_split` - List of floats specifying the proportion of work per GPU
       (e.g. `[0.5, 0.5]` for two GPUs). Defaults to `[]`.
-    * `:use_mlock` - Pin model memory in RAM to prevent swapping. Implies `:use_mmap`.
-      Defaults to `false`.
+    * `:use_mlock` - Pin model memory in RAM to prevent swapping. Combined with
+      `:use_mmap` unless that is `false`. Defaults to `false`.
     * `:use_direct_io` - Bypass page cache when loading (takes precedence over mmap).
       Defaults to `false`.
     * `:vocab_only` - Load vocabulary and metadata only, skip weights. Defaults to `false`.
@@ -101,10 +103,15 @@ defmodule LlamaCppEx.Model do
   >
   > llama.cpp collapsed its three loading booleans into one `load_mode` enum, so
   > these options resolve to a single mode. `:use_direct_io` takes precedence
-  > over everything and selects `dio`; otherwise `:use_mlock` and `:use_mmap`
-  > combine — both true selects `mmap_mlock`, `:use_mlock` alone selects `mlock`
-  > (read into anonymous memory, no mapping), `:use_mmap` alone selects `mmap`,
-  > and all false selects `none`.
+  > over everything and selects `dio`; otherwise `:use_mlock` selects
+  > `mmap_mlock`, or `mlock` (read into anonymous memory, no mapping) with
+  > `use_mmap: false`; `use_mmap: true` alone selects `mmap` and
+  > `use_mmap: false` alone `none`. With none of the three given, the mode is
+  > upstream's `auto`: mmap, except on devices that do not support it — an
+  > integrated GPU such as DGX Spark's GB10 — where the file is read instead
+  > (llama.cpp #26081). On GB10 a forced `mmap` left most loads of
+  > gpt-oss-120b decoding ~15% slower (48.5 against 57 tok/s), so leave these
+  > unset unless you have measured otherwise.
 
   > #### Untrusted models {: .warning}
   >
@@ -126,12 +133,17 @@ defmodule LlamaCppEx.Model do
   @spec load(String.t(), keyword()) :: {:ok, t()} | {:error, String.t()}
   def load(path, opts \\ []) do
     n_gpu_layers = Keyword.get(opts, :n_gpu_layers, 99)
-    use_mmap = Keyword.get(opts, :use_mmap, true)
+
+    load_mode =
+      resolve_load_mode(
+        Keyword.get(opts, :use_mmap),
+        Keyword.get(opts, :use_mlock, false),
+        Keyword.get(opts, :use_direct_io, false)
+      )
+
     main_gpu = Keyword.get(opts, :main_gpu, 0)
     split_mode = Keyword.get(opts, :split_mode, :none) |> encode_split_mode()
     tensor_split = Keyword.get(opts, :tensor_split, [])
-    use_mlock = Keyword.get(opts, :use_mlock, false)
-    use_direct_io = Keyword.get(opts, :use_direct_io, false)
     vocab_only = Keyword.get(opts, :vocab_only, false)
     check_tensors = Keyword.get(opts, :check_tensors, false)
     load_mtp = Keyword.get(opts, :load_mtp, false)
@@ -151,12 +163,10 @@ defmodule LlamaCppEx.Model do
            LlamaCppEx.NIF.model_load(
              path,
              n_gpu_layers,
-             use_mmap,
+             load_mode,
              main_gpu,
              split_mode,
              tensor_split,
-             use_mlock,
-             use_direct_io,
              vocab_only,
              check_tensors,
              load_mtp,
@@ -165,6 +175,23 @@ defmodule LlamaCppEx.Model do
       {:ok, %__MODULE__{ref: ref, load_mtp: load_mtp}}
     end
   end
+
+  # llama_load_mode values (llama.h). `nil` for :use_mmap means the caller did
+  # not choose, and only then is the result upstream's AUTO.
+  @load_mode_auto -1
+  @load_mode_none 0
+  @load_mode_mmap 1
+  @load_mode_mlock 2
+  @load_mode_mmap_mlock 3
+  @load_mode_direct_io 4
+
+  @doc false
+  def resolve_load_mode(_use_mmap, _use_mlock, true), do: @load_mode_direct_io
+  def resolve_load_mode(false, true, _), do: @load_mode_mlock
+  def resolve_load_mode(_use_mmap, true, _), do: @load_mode_mmap_mlock
+  def resolve_load_mode(true, _, _), do: @load_mode_mmap
+  def resolve_load_mode(false, _, _), do: @load_mode_none
+  def resolve_load_mode(nil, _, _), do: @load_mode_auto
 
   defp register_rpc_servers([]), do: :ok
 

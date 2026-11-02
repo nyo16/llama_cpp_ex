@@ -280,7 +280,7 @@ And the settings that do **not** matter, each of which looks like it should:
 |---|---|
 | `flash_attn` | leave `:auto` — it is already on, and `:disabled` costs 24% of prefill |
 | `type_k` / `type_v` | leave f16. Quantizing the KV cache **loses** 2–7% and buys nothing: there is no separate VRAM to free |
-| `use_mlock`, `use_direct_io` | leave off. Both cost 3–4%; "pinned in RAM" and "resident on the GPU" are the same DRAM here |
+| `use_mmap`, `use_mlock`, `use_direct_io` | **leave all three unset.** Upstream's `auto` then reads the file instead of mapping it on this iGPU. A forced `use_mmap: true` — the binding's default before this run — left most gpt-oss-120b loads decoding at 48.5 tok/s against 57 with `auto`, `use_mmap: false` or `use_direct_io: true`; about one forced-mmap load in five came out fast, so single-load comparisons from before (this row used to say mlock and dio cost 3–4%) are not reliable |
 | `n_batch`, `n_ubatch` | no measurable effect; the default is fine |
 | cpuidle / `idle=poll` | **no effect**, single-node or two-node. See below |
 | `taskset -c 5-9,15-19` | hygiene, not speed. But never use `-c 0-9` — those are the little cores |
@@ -591,17 +591,20 @@ This is load-bearing, not hygiene.
 ### The headline: a model that does not fit on one node
 
 Qwen3-235B-A22B Q4_K_M, **142.1 GB** of weights against 130.0 GB of unified
-memory per node. 512-token prompt, 32 decode steps.
+memory per node. 32 decode steps.
 
-| run | load s | TTFT ms | prefill t/s | decode t/s | worker RSS |
-|---|---|---|---|---|---|
-| single-node, mmap overflow | — | — | — | — | **global OOM, killed `avahi-daemon`** |
-| two-node 50/50, RDMA | 538.4 | 1281.9 | 423.5 | **13.69** | 344 → 580 MiB |
+| run | prompt | load s | TTFT ms | prefill t/s | decode t/s | worker RSS |
+|---|---|---|---|---|---|---|
+| single-node, mmap overflow | — | — | — | — | — | **global OOM, killed `avahi-daemon`** |
+| two-node 50/50, RDMA, b10362 (sequential) | 512 | 538.4 | 1281.9 | 423.5 | 13.69 | 344 → 580 MiB |
+| two-node 50/50, RDMA, `785322d17` (pipelined) | 1024 | 575.2 | 1432.5 | **760.3** | 11.67 | 348 → 628 MiB |
 
 There is no percentage to quote here, and that is the point: on one Spark this
 model does not run slowly, it takes the machine's memory out from under the OOM
-killer. On two it runs at **13.7 tokens/s**, which is a usable interactive speed
-for a 235B model.
+killer. On two it runs at **12–14 tokens/s**, which is a usable interactive speed
+for a 235B model, and with pipelining its prefill is 1.8× what it was. (The
+decode gap between the two rows is within the load-to-load spread described
+under the control below.)
 
 The cold load is nine minutes, because ~71 GB of weights cross the fabric. Budget
 for it, keep the worker's tensor cache on, and do not restart casually.

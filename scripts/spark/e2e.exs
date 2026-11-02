@@ -23,7 +23,10 @@ home = System.user_home!()
 
 big =
   System.get_env("SPARK_E2E_BIG") ||
-    Path.join(home, "models/esatapedico/Qwen3.8-27B-NVFP4-MTP-GGUF/main/Qwen3.8-27B-NVFP4-MTP-MID-HIGH.gguf")
+    Path.join(
+      home,
+      "models/esatapedico/Qwen3.8-27B-NVFP4-MTP-GGUF/main/Qwen3.8-27B-NVFP4-MTP-MID-HIGH.gguf"
+    )
 
 moe =
   System.get_env("SPARK_E2E_MOE") ||
@@ -157,6 +160,7 @@ defmodule E2E do
   def mem_gb do
     {out, 0} = System.cmd("free", ["-b"])
     [_, total, used | _] = out |> String.split("\n") |> Enum.at(1) |> String.split()
+
     "#{Float.round(String.to_integer(used) / 1.0e9, 1)} / #{Float.round(String.to_integer(total) / 1.0e9, 1)} GB used"
   end
 end
@@ -173,23 +177,32 @@ case System.argv() do
 
     E2E.step("CUDA0 is the GPU and reports unified memory", fn ->
       case Enum.find(LlamaCppEx.devices(), &(&1.backend == "CUDA")) do
-        %{name: "CUDA0", type: :igpu} = d -> {:ok, "#{d.description}, #{div(d.memory_total, 1_000_000_000)} GB"}
-        other -> {:error, inspect(other)}
+        %{name: "CUDA0", type: :igpu} = d ->
+          {:ok, "#{d.description}, #{div(d.memory_total, 1_000_000_000)} GB"}
+
+        other ->
+          {:error, inspect(other)}
       end
     end)
 
     E2E.step("load NVFP4 27B (server, n_parallel 4)", fn ->
-      {:ok, _} = ModelManager.load("big", {:path, big}, n_gpu_layers: -1, n_parallel: 4, n_ctx: 16_384)
+      {:ok, _} =
+        ModelManager.load("big", {:path, big}, n_gpu_layers: -1, n_parallel: 4, n_ctx: 16_384)
+
       {:ok, Path.basename(big)}
     end)
 
     E2E.step("load Qwen3-30B-A3B MoE (server, n_parallel 4)", fn ->
-      {:ok, _} = ModelManager.load("moe", {:path, moe}, n_gpu_layers: -1, n_parallel: 4, n_ctx: 16_384)
+      {:ok, _} =
+        ModelManager.load("moe", {:path, moe}, n_gpu_layers: -1, n_parallel: 4, n_ctx: 16_384)
+
       {:ok, Path.basename(moe)}
     end)
 
     E2E.step("load embedding model (direct)", fn ->
-      {:ok, _} = ModelManager.load("embed", {:path, embed}, capabilities: [:embed], n_gpu_layers: -1)
+      {:ok, _} =
+        ModelManager.load("embed", {:path, embed}, capabilities: [:embed], n_gpu_layers: -1)
+
       {:ok, Path.basename(embed)}
     end)
 
@@ -205,8 +218,10 @@ case System.argv() do
     E2E.step("both chat models at once, 8 requests each", fn ->
       [a, b] =
         Task.await_many(
-          [Task.async(fn -> E2E.concurrent({:manager, "big"}, 8) end),
-           Task.async(fn -> E2E.concurrent({:manager, "moe"}, 8) end)],
+          [
+            Task.async(fn -> E2E.concurrent({:manager, "big"}, 8) end),
+            Task.async(fn -> E2E.concurrent({:manager, "moe"}, 8) end)
+          ],
           600_000
         )
 
@@ -221,7 +236,10 @@ case System.argv() do
       {:ok, b} = ModelManager.embed("embed", "A cat was sitting on a rug.")
       {:ok, c} = ModelManager.embed("embed", "Quarterly revenue grew by eight percent.")
       {sim, far} = {E2E.cosine(a, b), E2E.cosine(a, c)}
-      if sim > far, do: {:ok, "#{Float.round(sim, 3)} > #{Float.round(far, 3)}"}, else: {:error, "#{sim} <= #{far}"}
+
+      if sim > far,
+        do: {:ok, "#{Float.round(sim, 3)} > #{Float.round(far, 3)}"},
+        else: {:error, "#{sim} <= #{far}"}
     end)
 
     E2E.step("unload one model, the other keeps serving", fn ->
@@ -276,13 +294,19 @@ case System.argv() do
 
     E2E.step("split: streaming chat completion", fn ->
       {n, text} = E2E.stream_text(split, "What is the capital of France? One word.")
-      if text =~ ~r/Paris/i, do: {:ok, "#{n} chunks, #{inspect(String.trim(text))}"}, else: {:error, inspect(text)}
+
+      if text =~ ~r/Paris/i,
+        do: {:ok, "#{n} chunks, #{inspect(String.trim(text))}"},
+        else: {:error, inspect(text)}
     end)
 
     E2E.step("split + local at once, 8 requests each", fn ->
       [a, b] =
         Task.await_many(
-          [Task.async(fn -> E2E.concurrent(split, 8) end), Task.async(fn -> E2E.concurrent(local, 8) end)],
+          [
+            Task.async(fn -> E2E.concurrent(split, 8) end),
+            Task.async(fn -> E2E.concurrent(local, 8) end)
+          ],
           600_000
         )
 
@@ -309,7 +333,9 @@ case System.argv() do
       ]
 
       {:ok, %{choices: [%{message: msg, finish_reason: reason} | _]}} =
-        LlamaCppEx.chat_completion(split, [%{role: "user", content: "What's the weather in Paris right now?"}],
+        LlamaCppEx.chat_completion(
+          split,
+          [%{role: "user", content: "What's the weather in Paris right now?"}],
           tools: tools,
           max_tokens: 512,
           temp: 0.0
