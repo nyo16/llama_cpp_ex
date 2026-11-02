@@ -354,6 +354,15 @@ Blackwell FP4 MMA (`mma.sync ... kind::mxf4nvf4`); an `nsys` profile of pp2048
 puts 53% of GPU time in that matmul, 9% in activation quantization and ~23% in
 element-wise ops (SwiGLU, gating muls, adds, the GDN conv-state concat).
 
+Part of that 9% is waste: projections that read the same activations (Q/K/V,
+gate/up, the GDN input projections) quantize them once each — 4450
+`quantize_mmq_nvfp4` launches for a 2048-token prefill. Branch
+`cuda-mmq-src1-reuse` on `nyo16/llama.cpp` keeps the last quantized MMQ
+input and reuses it until something overwrites the source: 2540 launches,
+**+2–2.6% prefill** on Qwen3.8-27B NVFP4 (1279 → 1312 tok/s at pp512), +0.5–1%
+on the Q4_K models, perplexity bit-identical. It is not in the vendored
+llama.cpp; it is a candidate for upstream.
+
 ## Speculative decoding: MTP, DFlash 2, DSpark
 
 256-token greedy chat completions (thinking off), four prompts run twice,
