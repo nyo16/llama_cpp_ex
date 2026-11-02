@@ -1,6 +1,13 @@
 # Changelog
 
-## Unreleased
+## v0.8.67
+
+llama.cpp stays at `785322d17`. **Behaviour change:** `LlamaCppEx.Model.load/2`
+no longer forces `use_mmap: true`; with no load flag given, llama.cpp picks the
+mode (it reads the file instead of mapping it on iGPUs such as GB10). Pass
+`use_mmap: true` to keep the old behaviour. The `model_load` and
+`speculative_init` NIFs changed signature, so this release ships new
+precompiled NIFs.
 
 Validated on two DGX Sparks (GB10, CUDA 13.0): the full suite with every
 model tag on CUDA, an end-to-end run with three models resident, a model
