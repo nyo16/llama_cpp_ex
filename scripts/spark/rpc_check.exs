@@ -7,8 +7,9 @@
 #   scripts/spark/rpc-worker.sh logs spark-2
 #
 # Set GGML_RPC_DEBUG=1 for the client side of the transport negotiation. The
-# only way to know whether you got RDMA or TCP is that log: selection is silent
-# auto-negotiation with no env var, no endpoint scheme and no return value.
+# only way to know whether you got RDMA or TCP is that log: selection is
+# auto-negotiation with no endpoint scheme and no return value
+# (GGML_RPC_NO_RDMA=1 on either peer forces TCP).
 
 endpoint =
   case System.argv() do

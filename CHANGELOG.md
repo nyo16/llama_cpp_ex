@@ -1,5 +1,56 @@
 # Changelog
 
+## Unreleased
+
+Validated on two DGX Sparks (GB10, CUDA 13.0): the full suite with every
+model tag on CUDA, an end-to-end run with three models resident, a model
+layer-split across both nodes beside a local one, and the published 0.8.66
+package source-built from a fresh project. See `docs/dgx-spark.md` for the
+numbers behind the entries below.
+
+### Added
+
+- `LlamaCppEx.MTP.init/2` takes `type: :dflash` or `type: :dspark` with the
+  drafter passed as `:draft_model`, for upstream's DFlash / DFlash 2
+  block-diffusion drafters and DSpark. On Qwen3.8-27B NVFP4 on GB10, DFlash 2
+  decodes at 3.1× plain (44.2 against 14.3 tok/s), where the model's MTP head
+  reaches 2.0×; on an M1 Max, 2.5× on the Q4_K_M build. A drafter that is not
+  a DFlash checkpoint, or reads layers the target does not have, is refused
+  with an error: upstream asserts on it. `n_draft` is clamped to the drafter's
+  block size and `%MTP{}.n_draft` reports the clamped value.
+
+### Fixed
+
+- `LlamaCppEx.RPC.add_server/1`, `ping/1` and `Model.load/2`'s
+  `:rpc_servers` aborted the VM on an RPC build when the endpoint was
+  unreachable, unparseable, not an RPC worker, or spoke another protocol
+  version. Upstream's registration has aborted on all four since #18626
+  moved the connect into `rpc_dispatcher::start`; the NIF now connects and
+  exchanges the HELLO itself first (5 s timeout) and returns
+  `{:error, :unreachable}`. The default build (no `LLAMA_RPC`) was never
+  affected. The upstream fix is on `nyo16/llama.cpp` branch
+  `rpc-add-server-no-abort`.
+- MTP on a hybrid target (Qwen 3.6 / 3.8: recurrent layers beside attention)
+  no longer saves the recurrent state every iteration and re-decodes the
+  accepted prefix on every partial accept. `MTP.init/2` creates the target
+  context with one recurrent snapshot per draft position, as upstream's server
+  does, so a rejected draft rolls back natively. GB10, `n_draft: 2`:
+  Qwen3.8-27B NVFP4 21.1 → 26.8 tok/s, Qwen3.6-35B-A3B 1.42× plain where the
+  docs had it at 0.95×. M1 Max: Qwen3.8-27B with its sidecar head went from a
+  net loss at every `n_draft` to 1.96× at `n_draft: 3`.
+- After a checkpoint rollback the re-decoded prefix is now fed to the
+  drafter, which had been left with a gap in its context; DFlash acceptance
+  was ~3% without it.
+
+### Changed
+
+- `LlamaCppEx.Context`'s `:n_rs_seq` docs, `LlamaCppEx.MTP`'s hybrid-model
+  note and `stats/1`'s `:ckpt` description describe the snapshot rollback.
+- RPC docs: `GGML_RPC_NO_RDMA` is upstream's runtime switch to keep a peer on
+  TCP (`scripts/spark/rpc-worker.sh --tcp` now uses it), and layer split over
+  RPC is pipelined: the RPC backend implements async compute and events
+  (#18626), so llama.cpp enables pipeline parallelism across the nodes.
+
 ## v0.8.66
 
 llama.cpp bumped to `785322d17`

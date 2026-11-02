@@ -4,7 +4,8 @@
 #     mix run bench/spark_spec.exs <target.gguf> [config ...]
 #
 # A config is `plain`, `mtp:<n>` (the head inside the target GGUF),
-# `dflash:<n>:<drafter.gguf>` or `dspark:<n>:<drafter.gguf>`. With none given:
+# `mtp:<n>:<sidecar.gguf>`, `dflash:<n>:<drafter.gguf>` or
+# `dspark:<n>:<drafter.gguf>`. With none given:
 # plain, mtp:1..4. Each config runs the same four chat-templated prompts twice,
 # greedy, 256 tokens, thinking off, and reports the median decode rate (first
 # token to last, so prefill is excluded) and the draft acceptance.
@@ -80,7 +81,7 @@ IO.puts("|---|---|---|---|---|---|---|")
         [type, n | rest] ->
           draft =
             case rest do
-              [path] -> elem(LlamaCppEx.load_model(path, n_gpu_layers: -1), 1)
+              [path] -> elem(LlamaCppEx.load_model(path, n_gpu_layers: -1, load_mtp: type == "mtp"), 1)
               [] -> nil
             end
 

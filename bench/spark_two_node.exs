@@ -15,8 +15,8 @@ Code.require_file("helpers.exs", __DIR__)
 #   b2   The actual point. A model that does NOT fit one node: two-node RPC
 #        versus single-node paging weights off NVMe. This is the number that
 #        justifies the second Spark, and it is allowed to come out negative.
-#   b3   RDMA versus TCP, in tokens. There is no runtime switch, so TCP is
-#        forced with GGML_RDMA_DEV set to a device that does not exist.
+#   b3   RDMA versus TCP, in tokens. One run per transport; see the b3 clause
+#        for the worker flags (`--tcp` sets GGML_RPC_NO_RDMA, `--link lan`).
 #   b4   Batching amortisation. Per-token RTT is fixed per *graph*, not per
 #        token, so n_parallel should amortise it. Measure, do not assume.
 #

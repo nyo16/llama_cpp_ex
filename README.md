@@ -1006,84 +1006,73 @@ The manager estimates footprint from GGUF size (plus a coarse KV-cache estimate 
 
 Model cleanup is garbage-collection based. `unload/1` stops the backing server (dropping its context and model references) and forces a GC. Because reclamation is by GC, **any caller still holding a `%LlamaCppEx.Model{}` obtained via `fetch_model/1` keeps the model alive** past `unload/1` — prefer id-based routing and avoid holding raw refs.
 
-## Speculative decoding (MTP)
+## Speculative decoding (MTP, DFlash)
 
-Multi-Token Prediction speculative decoding (upstream PR [#22673](https://github.com/ggml-org/llama.cpp/pull/22673)) drafts several tokens at once via a head shipped inside the same GGUF as the target model. Upstream llama-server reports ~2x speedup at ~75% draft acceptance on Qwen 3.6.
+`LlamaCppEx.MTP` drives upstream's `common_speculative` loop: a drafter proposes
+several tokens, the target verifies them in one batched decode, and greedy
+output is the target's own (up to the batch-width rounding noted in the
+`MTPSidecarTest` comments — upstream's server diverges from its own plain decode
+at the same places). Three drafters are supported through `:type`:
 
-> **Performance note: Apple Silicon.** The upstream 2× claim is from NVIDIA datacenter GPUs, where a batched verify decode costs ~1.2× a single-token decode. On Apple Silicon (Metal), a 4-wide verify costs ~2.4× a single decode, which cancels MTP's iteration savings. We measured upstream's own `llama-server --spec-type draft-mtp` on M1 Max: **39.80 tok/s with MTP vs 39.14 tok/s plain** on Qwen 3.6 35B-A3B (1.02×) — i.e. effectively zero speedup from the reference implementation itself. This matches the pattern in upstream [#23011](https://github.com/ggml-org/llama.cpp/issues/23011); a Metal MTP optimization is tracked in [#23114](https://github.com/ggml-org/llama.cpp/pull/23114).
->
-> **Tuning for Apple Silicon:** use `n_draft: 1`. With one draft per iteration the verify batch is only 2-wide (much cheaper on Metal) and acceptance jumps to ~79% on Qwen 3.6 35B-A3B. Our measurements on M1 Max with `n_draft: 1`:
-> - Qwen 3.6 35B-A3B-MTP (hybrid MoE): plain 39.5 → MTP **44.0 tok/s (1.11×)**
-> - Qwen 3.6 27B (dense): plain 10.7 → MTP **10.6 tok/s (~1.0×, neutral)**
->
-> Larger `n_draft` hurts on Metal because verify cost grows faster than acceptance benefit.
+- `:mtp` (default) — a Multi-Token Prediction head (upstream PR
+  [#22673](https://github.com/ggml-org/llama.cpp/pull/22673)), inside the
+  target GGUF or in a sidecar passed as `:draft_model`.
+- `:dflash` — a DFlash / DFlash 2 block-diffusion drafter: a separate small
+  GGUF (architecture `dflash`) that drafts a whole block in one pass from the
+  target's hidden states. Pass it as `:draft_model`.
+- `:dspark` — DSpark (DFlash plus a Markov head), the same way.
 
-> **Performance note: NVIDIA GB10 (DGX Spark).** MTP does pay here, but nothing
-> like the upstream 2×, and the best `n_draft` is not 3. Qwen3.6-35B-A3B
-> UD-Q4_K_XL from the `-MTP` build, 128-token greedy generations, plain and MTP
-> interleaved in one process so drift hits both arms equally (n=11 each):
->
-> | | median tok/s | range | vs plain |
-> |---|---|---|---|
-> | plain | 61.4 | 61.2–62.4 | — |
-> | MTP `n_draft: 2` | **71.2** | 62.5–75.5 | **+16%** |
->
-> The ranges do not overlap — MTP's slowest run beat plain's fastest — so the
-> gain is real despite MTP being the noisier arm by an order of magnitude.
->
-> Sweeping `n_draft` on the same model, though, puts the optimum at 2 rather
-> than 3, and the engine's own counters say why:
->
-> | `n_draft` | acceptance | tokens/iteration | tok/s |
-> |---|---|---|---|
-> | 2 | 68.5% | 2.38 | 63.0 |
-> | 3 | 57.2% | 2.73 | 52.8 |
->
-> Going from 2 to 3 buys 15% more tokens per iteration and pays 31% more drafting
-> plus 10% more verify for them, because the third draft position is the one
-> least likely to be accepted. Marginal acceptance decays faster than marginal
-> cost, so the extra draft loses money. In a five-run sweep `n_draft: 3` came out
-> 2% *below* plain and `n_draft: 4` 14% below.
->
-> So the shape matches Apple Silicon even though the cause differs: on Metal the
-> wide verify is expensive, while GB10 is a unified-memory part whose MoE decode
-> is memory-bandwidth bound, and a wider verify reads more expert weights per
-> step. Both end up wanting a narrower draft than a datacenter GPU does. Treat
-> `n_draft: 3` as the datacenter default the upstream 2× assumes, not as a value
-> that transfers.
+```elixir
+{:ok, target} = LlamaCppEx.load_model("Qwen3.8-27B-Q4_K_M.gguf", n_gpu_layers: -1)
+{:ok, drafter} = LlamaCppEx.load_model("Qwen3.8-27B-DFlash2-Q4_K_M.gguf", n_gpu_layers: -1)
+{:ok, spec} = LlamaCppEx.MTP.init(target, type: :dflash, draft_model: drafter, n_draft: 7)
+```
 
-> **Performance note: Qwen 3.8 27B (hybrid SSM, sidecar head).** This one is
-> shaped by a cost the models above do not pay. Qwen 3.8 puts 48 SSM layers
-> beside 16 attention ones, and a recurrent layer cannot be rolled back to an
-> arbitrary position, so every speculative iteration snapshots and restores the
-> whole recurrent state — 150 MiB of it at these sizes. `stats/1` reports that
-> separately as `timing_us.ckpt`. Q4_K_M target + Q4_0 sidecar head, 120-token
-> greedy generations:
->
-> | `n_draft` | acceptance | M1 Max (Metal) | GB10 (DGX Spark) |
-> |---|---|---|---|
-> | 1 | 75.0% | 0.89× | **1.24×** |
-> | 2 | 54–59% | 0.66× | 1.17× |
-> | 3 | 40–44% | 0.68× | 1.09× |
-> | 4 | 32% | — | 0.96× |
-> | 5 | 30% | 0.56× | — |
->
-> On Metal MTP is a net loss at every draft length: `ckpt` alone was 1.8 s of a
-> 12.5 s run at `n_draft: 1` and 6.9 s of 16.3 s at `n_draft: 3`. On GB10 the
-> same snapshot is cheap enough that `n_draft: 1` wins, and — unlike the MoE
-> above, whose optimum was 2 — the optimum here is 1, monotonically decreasing
-> after it. Measure `ckpt` against `total` before trusting speculation on any
-> hybrid model.
->
-> Both arms of the GB10 column are warm-cache numbers. A first run off cold page
-> cache reads ~19 GB and reported a 4.18 tok/s baseline against 10.83 tok/s warm,
-> which inverts the comparison entirely.
+**Measured.** 256-token greedy chat completions (thinking off), four prompts
+run twice, median decode rate; `bench/spark_spec.exs` reproduces it on either
+machine:
 
-### Other speculative types (EAGLE-3, DFlash, n-gram)
+| Qwen3.8-27B (dense, hybrid SSM) | GB10, NVFP4 MID-HIGH | M1 Max, Q4_K_M + sidecar head |
+|---|---|---|
+| plain | 14.3 tok/s | 12.7 tok/s |
+| MTP `n_draft: 2` | 26.8 (1.87×, 76% accepted) | 22.1 (1.75×) |
+| MTP `n_draft: 3` | 28.6 (2.00×) | 24.8 (1.96×) |
+| DFlash 2 `n_draft: 7` | **44.2 (3.10×, 42% accepted)** | **31.8 (2.53×)** |
 
-Upstream llama.cpp implements more speculative types behind the same `common_speculative` API — `draft-eagle3`, `draft-dflash` (block-diffusion drafting via a separate drafter GGUF), and several n-gram self-speculation modes, plus `--spec-default`, which stacks n-gram speculation on top of a model-based drafter. **This binding currently exposes only MTP**: `MTP.init/2` pins `COMMON_SPECULATIVE_TYPE_DRAFT_MTP`, so the other types and the combinations are not reachable from here. The draft *model* is no longer tied to the target, though — see `:draft_model` below for the target/sidecar split.
+| Qwen3.6-35B-A3B (MoE, hybrid SSM) | GB10, UD-Q4_K_M | M1 Max, UD-Q4_K_XL |
+|---|---|---|
+| plain | 68.3 tok/s | 55.4 tok/s |
+| MTP `n_draft: 1` | 86.9 (1.27×) | 69.3 (1.25×) |
+| MTP `n_draft: 2` | **96.7 (1.42×)** | **74.5 (1.34×)** |
+| MTP `n_draft: 3` | 91.6 (1.34×) | 73.5 (1.33×) |
 
-> **DFlash status (July 2026, llama.cpp b9932).** DFlash runs end-to-end on Metal via upstream `llama-cli`/`llama-server`, but we measured it *slower* than plain decoding on Apple Silicon at small target sizes: Qwen3.5-4B target + z-lab 0.6B drafter on M4 Max reached 42 tok/s with DFlash vs 85 tok/s plain (greedy sampling; 30% draft acceptance, mean accepted run 2.8 — and stochastic sampling at `temp 0.8` collapses acceptance to ~7%). The Metal economics are the same as the MTP note above (wide verify batches are expensive), and the community drafter-GGUF conversions are still churning: of three third-party Qwen 4B drafter repos tested, only one loads with current upstream (the others hit the `dflash-draft` arch mismatch [#25116](https://github.com/ggml-org/llama.cpp/issues/25116) or lack the `target_layers` metadata added by the conversion refactor [#25110](https://github.com/ggml-org/llama.cpp/pull/25110)). Worth revisiting when the drafter format settles; the natural entry point is a `spec_type` + drafter-model option on `speculative_init`.
+- **DFlash 2 is the fastest drafter where one exists for the model** — 3.1× on
+  GB10, against 2.0× for the same checkpoint's MTP head and 1.8× for DSpark
+  (`magnitudedev/Qwen3.8-27B-DSpark-GGUF`, measured through upstream's
+  `llama-server`). Its `n_draft` caps at the drafter's block size minus one (7
+  for these), which is also where it measured best.
+- **MTP wants `n_draft: 2–3` on a dense model and 2 on a sparse MoE**, where
+  only ~3B parameters move per token and a wider verify reads more experts.
+- Within 2–5% of upstream's `llama-server` with the same drafters, on GB10.
+
+These numbers postdate a rollback fix: hybrid targets used to save their whole
+recurrent state every iteration and re-decode the accepted prefix on every
+partial accept, which made MTP a net loss on Apple Silicon and held GB10 to
+~1.5×. `MTP.init/2` now gives the target context one recurrent snapshot per
+draft position (`n_rs_seq`), as upstream's server does, and `stats/1`'s
+`timing_us.ckpt` stays zero.
+
+### Other speculative types (EAGLE-3, n-gram)
+
+Upstream also implements `draft-eagle3` and several n-gram self-speculation
+modes behind the same API, plus `--spec-default`, which stacks n-gram
+speculation on top of a model-based drafter. Those are not exposed here.
+
+### Drafters
+
+- [`z-lab/Qwen3.8-27B-DFlash2-GGUF`](https://huggingface.co/z-lab/Qwen3.8-27B-DFlash2-GGUF)
+  — DFlash 2 for Qwen3.8-27B (Q4_K_M 1.1 GB). Pairs with any quantization of
+  the target, NVFP4 included.
 
 ### Models with MTP heads
 
