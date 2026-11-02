@@ -348,6 +348,16 @@ step, and that serial dependency is the 8%. Upstream's `--backend-sampling`
 exposed. Tuning on this machine is therefore model and drafter choice, not the
 binding.
 
+The one gap that remains is on MoE decode, and it is inside the GPU kernels.
+gpt-oss-120b, 256 greedy tokens: `LlamaCppEx.stream/3` gives 55.5–55.9 tok/s
+and `llama-bench` tg256 gives 57.8. Under `nsys`, the expert matvec (MXFP4
+`mul_mat_vec_q`, 55k calls) averages **123.0 µs in the BEAM against 118.1 µs**
+in `llama-bench`, while the dense LM head is equal (2.75 against 2.74 ms). The
+RPC worker shows the same split, 123.7 against 117–118 µs (two-node section).
+Same kernels, same clocks, and only the scattered expert reads slow down. That
+points at how the weight memory is mapped inside a BEAM process; the cause is
+not established.
+
 ## Qwen3.8-27B NVFP4
 
 `esatapedico/Qwen3.8-27B-NVFP4-MTP-GGUF`, `MID-HIGH` tier: every attention and
