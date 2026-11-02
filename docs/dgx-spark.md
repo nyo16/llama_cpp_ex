@@ -843,7 +843,10 @@ Branch `rpc-client-spin-wait` on `nyo16/llama.cpp` (also merged into
 the dispatcher on its queue, and the caller on its future, up to 100 ms
 before blocking. An idle client still sleeps. A `llama-server` holding an
 RPC-split model used 0 CPU ticks in the 10 s after a request, against 2
-unpatched. With that client and the same unpatched worker:
+unpatched. The cost is paid while generating. On a 512-token gpt-oss-120b
+completion over two nodes, `llama-server` used 1.99 cores on average against
+0.89 unpatched, and decoded at 55.7 tok/s against 48.4. That is one extra core
+for +15%. With that client and the same unpatched worker:
 
 | client | `llama-bench` decode, before | after |
 |---|---|---|
