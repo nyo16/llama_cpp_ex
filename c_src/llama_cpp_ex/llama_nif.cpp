@@ -26,8 +26,12 @@
 // with only -I flags.
 #ifdef GGML_USE_RPC
 #include <ggml-rpc.h>
+#include <fcntl.h>
 #include <netdb.h>
+#include <netinet/in.h>
+#include <poll.h>
 #include <sys/socket.h>
+#include <sys/time.h>
 #include <thread>
 #include <unistd.h>
 #endif
@@ -524,10 +528,13 @@ LLAMA_NIF(backend_free, 0);
 //   1. RPC_STATUS_ASSERT is GGML_ABORT (ggml-rpc.cpp:30). Any peer crash,
 //      network failure or malformed response terminates the OS process — the
 //      whole BEAM. There is no error return, no retry, no reconnect.
-//   2. Registration, by contrast, is safe: an unreachable endpoint makes
-//      ggml_backend_rpc_add_server return nullptr. So failures are *detectable
-//      before load* and *fatal during it*, and that asymmetry is why
-//      rpc_add_server reports rather than logs.
+//   2. Since #18626 (d0132a680) registration aborts too: the connect and the
+//      HELLO moved into rpc_dispatcher::start, which GGML_ABORTs on an
+//      unreachable endpoint, an unparseable one, or a version mismatch where
+//      ggml_backend_rpc_add_server used to return nullptr. rpc_add_server
+//      therefore probes the endpoint itself first (rpc_probe_hello), so a dead
+//      or mismatched node is still *detectable before load* and only *fatal
+//      during it*.
 
 #ifdef GGML_USE_RPC
 
@@ -607,6 +614,122 @@ bool rpc_wait_until_listening(const std::string& host, const std::string& port, 
     return false;
 }
 
+// rpc_probe_hello speaks the HELLO exchange by hand, so it has to track the
+// wire layout in ggml-rpc.cpp. Upstream changes that layout only together with
+// the major version (the server's "client needs upgrade to protocol v%d.x"),
+// so a major bump stops the build here instead of failing every probe at run
+// time.
+static_assert(RPC_PROTO_MAJOR_VERSION == 8,
+              "RPC protocol major changed: re-check rpc_probe_hello against "
+              "rpc_msg_hello_req/rsp and RPC_CMD_HELLO in ggml-rpc.cpp");
+
+constexpr uint8_t kRpcCmdHello = 14;      // static_assert'ed stable upstream
+constexpr size_t kRpcConnCapsSize = 24;   // transport.h RPC_CONN_CAPS_SIZE
+// rpc_msg_hello_rsp: major, minor, patch, padding, conn_caps[24]
+constexpr size_t kRpcHelloRspSize = 4 + kRpcConnCapsSize;
+
+bool rpc_send_all(int fd, const void* data, size_t len) {
+    const auto* p = static_cast<const uint8_t*>(data);
+    while (len > 0) {
+        ssize_t n = send(fd, p, len, MSG_NOSIGNAL);
+        if (n <= 0) {
+            if (n < 0 && errno == EINTR) continue;
+            return false;
+        }
+        p += n;
+        len -= static_cast<size_t>(n);
+    }
+    return true;
+}
+
+bool rpc_recv_all(int fd, void* data, size_t len) {
+    auto* p = static_cast<uint8_t*>(data);
+    while (len > 0) {
+        ssize_t n = recv(fd, p, len, 0);
+        if (n <= 0) {
+            if (n < 0 && errno == EINTR) continue;
+            return false;
+        }
+        p += n;
+        len -= static_cast<size_t>(n);
+    }
+    return true;
+}
+
+// Connects to the endpoint and performs a TCP-only HELLO (no transport
+// capabilities advertised, so the worker never starts an RDMA upgrade for it),
+// then closes. True when the peer answered with a protocol the client side
+// accepts — the same test negotiate_hello applies.
+//
+// The endpoint is parsed and resolved exactly as rpc_dispatcher::start does
+// (first ':', std::stoi, IPv4 only), because anything this accepts goes on to
+// that function, where every failure is an abort. A worker that dies between
+// the probe and the registration still aborts; that window is upstream's.
+bool rpc_probe_hello(const std::string& endpoint, int timeout_ms) {
+    size_t colon = endpoint.find(':');
+    if (colon == std::string::npos) return false;
+    std::string host = endpoint.substr(0, colon);
+    int port;
+    try {
+        port = std::stoi(endpoint.substr(colon + 1));
+    } catch (...) {
+        return false;
+    }
+    if (port <= 0 || port > 65535) return false;
+
+    addrinfo hints{};
+    hints.ai_family = AF_INET;
+    hints.ai_socktype = SOCK_STREAM;
+    addrinfo* res = nullptr;
+    if (getaddrinfo(host.c_str(), std::to_string(port).c_str(), &hints, &res) != 0 || !res) {
+        return false;
+    }
+
+    bool ok = false;
+    for (addrinfo* ai = res; ai && !ok; ai = ai->ai_next) {
+        int fd = socket(ai->ai_family, ai->ai_socktype | SOCK_CLOEXEC, ai->ai_protocol);
+        if (fd < 0) continue;
+
+        int flags = fcntl(fd, F_GETFL, 0);
+        fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+        int rc = connect(fd, ai->ai_addr, ai->ai_addrlen);
+        if (rc != 0 && errno == EINPROGRESS) {
+            pollfd pfd{fd, POLLOUT, 0};
+            int err = 0;
+            socklen_t len = sizeof(err);
+            rc = (poll(&pfd, 1, timeout_ms) == 1 &&
+                  getsockopt(fd, SOL_SOCKET, SO_ERROR, &err, &len) == 0 && err == 0)
+                     ? 0 : -1;
+        }
+        if (rc != 0) {
+            close(fd);
+            continue;
+        }
+        fcntl(fd, F_SETFL, flags);
+        timeval tv{timeout_ms / 1000, (timeout_ms % 1000) * 1000};
+        setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+        setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+
+        // | cmd (1) | request_size (8) | conn_caps (24, zeroed) |
+        uint8_t req[1 + sizeof(uint64_t) + kRpcConnCapsSize] = {};
+        req[0] = kRpcCmdHello;
+        const uint64_t req_size = kRpcConnCapsSize;
+        std::memcpy(req + 1, &req_size, sizeof(req_size));
+
+        uint64_t rsp_size = 0;
+        uint8_t rsp[kRpcHelloRspSize] = {};
+        ok = rpc_send_all(fd, req, sizeof(req)) &&
+             rpc_recv_all(fd, &rsp_size, sizeof(rsp_size)) &&
+             rsp_size == kRpcHelloRspSize &&
+             rpc_recv_all(fd, rsp, sizeof(rsp)) &&
+             rsp[0] == RPC_PROTO_MAJOR_VERSION &&
+             rsp[1] <= RPC_PROTO_MINOR_VERSION;
+        close(fd);
+    }
+    freeaddrinfo(res);
+    return ok;
+}
+
 } // namespace
 #endif // GGML_USE_RPC
 
@@ -636,7 +759,9 @@ LLAMA_NIF(rpc_supported, 0);
 // the remote devices.
 //
 // Returns the number of devices the endpoint contributed. Upstream memoizes per
-// endpoint, so a repeat call is a no-op and returns 0 added.
+// endpoint, so a repeat call is a no-op and returns 0 added — but the probe
+// still runs, so a registered peer that has since gone away reports
+// :unreachable.
 std::variant<fine::Ok<int64_t>, fine::Error<fine::Atom>>
 rpc_add_server(ErlNifEnv* env, std::string endpoint) {
 #ifndef GGML_USE_RPC
@@ -645,12 +770,18 @@ rpc_add_server(ErlNifEnv* env, std::string endpoint) {
 #else
     size_t before = ggml_backend_dev_count();
 
+    // ggml_backend_rpc_add_server aborts the VM on an unreachable or
+    // mismatched endpoint (see the top of this section), so check first.
+    if (!rpc_probe_hello(endpoint, 5000)) {
+        return fine::Error(atoms::unreachable);
+    }
+
     ggml_backend_reg_t reg = ggml_backend_rpc_add_server(endpoint.c_str());
     if (!reg) {
-        // Both an unreachable endpoint and a HELLO major/minor mismatch collapse
-        // to nullptr here, and ggml_backend_register silently no-ops on nullptr
-        // — so without this check a dead or mismatched node simply vanishes and
-        // the model loads onto the wrong devices.
+        // A worker reporting zero devices still comes back as nullptr, and
+        // ggml_backend_register silently no-ops on nullptr — so without this
+        // check that node simply vanishes and the model loads onto the wrong
+        // devices.
         return fine::Error(atoms::unreachable);
     }
 
