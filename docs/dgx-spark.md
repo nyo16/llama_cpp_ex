@@ -513,15 +513,18 @@ than the marketing:
 
 - **Capacity: yes.** A model that does not fit in 130 GB runs. Nothing else on
   this pair will run it at all.
-- **Speed: prefill yes, decode no.** Since llama.cpp #18626 the RPC backend
-  implements async compute and events, so llama.cpp enables **pipeline
-  parallelism** across an RPC split (it used to refuse, and the nodes ran
-  sequentially). A prompt's micro-batches now overlap across the two nodes:
-  prefill measured **+18–26%** for gpt-oss-120b and +22% for Qwen3.8-27B NVFP4
-  against one node. A single decode stream has nothing to overlap and pays a
-  network round trip per token. For gpt-oss-120b that costs 8% through
+- **Speed: prefill yes, decode roughly even.** Since llama.cpp #18626, the RPC
+  backend implements async compute and events, so llama.cpp enables
+  **pipeline parallelism** across an RPC split. It used to refuse, and the
+  nodes ran one after the other. A prompt's micro-batches now overlap across
+  the two nodes: prefill measured **+18–26%** for gpt-oss-120b and +22% for
+  Qwen3.8-27B NVFP4 against one node. A single decode stream has nothing to
+  overlap. On the vendored llama.cpp, it pays thread wake-ups in the RPC
+  client on every command. For gpt-oss-120b, that costs 8% through
   `llama-bench` and ~15% through the binding with the client on the A725
-  cores, and 25–30% left unpinned (see the control below).
+  cores, and 25–30% left unpinned. With the RPC client fix on `spark-all`, it
+  costs 2–3%, and the dense NVFP4 model decodes faster on two nodes than on
+  one (see the control below).
 - **Tensor parallelism ("tp=2"): technically yes, practically no.** It runs and
   it is correct, and it is 2.7× slower on decode. See the verdict section.
 
