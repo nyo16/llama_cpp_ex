@@ -86,6 +86,10 @@ numbers behind the entries below.
   cores. Upstream fix on `nyo16/llama.cpp` branch `rpc-client-spin-wait`:
   57.6 tok/s on any cores through `llama-bench` (single node 59), 50.6–50.8
   through the binding unpinned.
+- `test/embeddings_test.exs`: `embed_batch` is compared with per-text `embed`
+  by cosine similarity (> 0.999) instead of a 0.001 elementwise bound, which
+  CUDA missed (0.0027 on bge-small) because a batch runs different kernels.
+  Swapped rows still fail it (cos 0.41).
 
 ## v0.8.66
 

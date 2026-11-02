@@ -457,13 +457,13 @@ tree. Then remove the
 `scripts/spark/e2e.exs` passes 12/12 on that build, both `single` and `two-node`. So do the test
 suite's `smoke`, `embeddings`, `tools` and `decision` tags (602 tests), `mtp` and
 `dflash` (458), `rpc_live` against a worker, `vm_exit_test.exs`, and
-`rpc_check.exs` over the fabric (VM exit 0). The embeddings run used
-Qwen3-Embedding-0.6B. With bge-small-en-v1.5 Q8_0, `embed_batch matches
-per-text embed` fails on CUDA by 0.0027 against its 0.001 bound, on the
-vendored tree as well, and passes on the CPU backend. Batching is not the
-cause. Per-text embeddings on CUDA already differ from CPU by 0.0026, with
-elements up to 0.42. The CUDA backend's numerics on this BERT simply exceed a
-bound calibrated on CPU. Speculative
+`rpc_check.exs` over the fabric (VM exit 0). `embed_batch matches per-text
+embed` used to fail on CUDA with bge-small-en-v1.5 Q8_0, on the vendored tree
+as well: batched and per-text embeddings differed by up to 0.0027 per element
+against a 0.001 bound tuned on CPU, because a batch runs different kernels.
+The test now compares cosine similarity (> 0.999; CUDA gives 0.99988, swapped
+rows 0.41–0.70, the wrong pooling ≤ 0.93) and passes on CUDA with bge-small,
+embeddinggemma and Qwen3-Embedding, and on CPU. Speculative
 decoding on Qwen3.8-27B NVFP4 (`bench/spark_spec.exs`) runs at plain 14.3, MTP
 `n_draft: 2` 26.5 and DFlash 2 `n_draft: 7` 45.9 tok/s, against 14.3 / 26.8 /
 44.2 vendored. No source change in the binding is needed for the swap, but a

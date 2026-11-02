@@ -41,6 +41,13 @@ defmodule LlamaCppEx.EmbeddingsTest do
   # Guards the multi-sequence batch refactor: batched embeddings (single
   # context, many sequences) must match one-context-per-text, including when
   # grouping splits the batch (max_batch_sequences forces multiple groups).
+  #
+  # Compared by cosine similarity, not elementwise. A batch runs different
+  # kernels than a single text on GPU backends (CUDA: up to 0.0027 per element
+  # with bge-small, cos 0.99988), so an absolute bound tuned on CPU fails there.
+  # The bugs this guards against are far away: rows swapped between sequences
+  # give the cosine of two different texts (at most 0.70 on bge-small,
+  # embeddinggemma and Qwen3-Embedding), and the wrong pooling at most 0.93.
   test "embed_batch matches per-text embed (incl. multi-group)", %{emb_model: em} do
     texts = [
       "Elixir is a functional programming language.",
@@ -60,8 +67,8 @@ defmodule LlamaCppEx.EmbeddingsTest do
     assert {:ok, grouped} = LlamaCppEx.embed_batch(em, texts, max_batch_sequences: 2)
 
     assert length(batched) == length(texts)
-    assert max_elementwise_diff(batched, reference) < 1.0e-3
-    assert max_elementwise_diff(grouped, reference) < 1.0e-3
+    assert min_pairwise_cosine(batched, reference) > 0.999
+    assert min_pairwise_cosine(grouped, reference) > 0.999
   end
 
   # Regression: llama_context reserves its prompt graph for n_ubatch rounded up
@@ -78,11 +85,16 @@ defmodule LlamaCppEx.EmbeddingsTest do
     assert Enum.all?(vectors, &(length(&1) == LlamaCppEx.Model.n_embd_out(em)))
   end
 
-  defp max_elementwise_diff(a, b) do
-    Enum.zip(a, b)
+  # Lowest cosine similarity between the i-th vectors of two equally long lists.
+  defp min_pairwise_cosine(a, b) do
+    a
+    |> Enum.zip(b)
     |> Enum.map(fn {va, vb} ->
-      Enum.zip(va, vb) |> Enum.map(fn {x, y} -> abs(x - y) end) |> Enum.max()
+      dot = va |> Enum.zip(vb) |> Enum.reduce(0.0, fn {x, y}, acc -> acc + x * y end)
+      dot / (norm(va) * norm(vb))
     end)
-    |> Enum.max()
+    |> Enum.min()
   end
+
+  defp norm(v), do: :math.sqrt(Enum.reduce(v, 0.0, &(&1 * &1 + &2)))
 end
