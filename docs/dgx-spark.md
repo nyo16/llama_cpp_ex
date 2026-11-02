@@ -710,8 +710,11 @@ There is no percentage to quote here, and that is the point: on one Spark this
 model does not run slowly, it takes the machine's memory out from under the OOM
 killer. On two it runs at **12–14 tokens/s**, which is a usable interactive speed
 for a 235B model, and with pipelining its prefill is 1.8× what it was. (The
-decode gap between the two rows is within the load-to-load spread described
-under the control below.)
+decode gap between the two rows is the client wake-up band described under
+the control below.) Through `llama-bench` (`-p 512 -n 64`, upstream worker
+restarted per run), the vendored client decodes at 13.35 tok/s and the
+`spark-all` client with the RPC fix at **14.27**, with the same pp512 (475,
+479).
 
 The cold load is nine minutes, because ~71 GB of weights cross the fabric. Budget
 for it, keep the worker's tensor cache on, and do not restart casually.
