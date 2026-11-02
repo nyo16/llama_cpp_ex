@@ -360,8 +360,30 @@ gate/up, the GDN input projections) quantize them once each — 4450
 `cuda-mmq-src1-reuse` on `nyo16/llama.cpp` keeps the last quantized MMQ
 input and reuses it until something overwrites the source: 2540 launches,
 **+2–2.6% prefill** on Qwen3.8-27B NVFP4 (1279 → 1312 tok/s at pp512), +0.5–1%
-on the Q4_K models, perplexity bit-identical. It is not in the vendored
-llama.cpp; it is a candidate for upstream.
+on the Q4_K models, perplexity bit-identical.
+
+The per-tensor NVFP4 weight scale is the other cheap win. llama.cpp builds each
+NVFP4 projection as `mul(mul_mat(w, x), w_s)` with a scalar `w_s`. Decode
+(MMVQ) already fuses that multiply, but batched MMQ runs it as a separate
+broadcast kernel over the output: 224 launches and ~14% of pp512 GPU time. The
+second commit on the same branch folds `w_s` into the per-token activation
+scale that the NVFP4 write-back already applies:
+
+| `llama-bench -fa 1` | pp512 | pp2048 | pp8192 | tg128 |
+|---|---|---|---|---|
+| Qwen3.8-27B NVFP4, upstream | 1284 | 1297 | 1250 | 14.35 |
+| + src1 reuse + scale fold | **1411** | **1422** | **1373** | 14.31 |
+| Qwen3-8B Q4_K_M, upstream | 3577 | 3565 | 3214 | 43.97 |
+| + src1 reuse (no NVFP4 to fold) | 3626 | 3611 | 3237 | 44.07 |
+
+That is +9.8% NVFP4 prefill, with decode unchanged. The fold changes where the
+scale is rounded in. Over 8×512 tokens, its KL divergence against the unfused
+path is 0.051. Upstream's native FP4 path differs from itself by about the same
+amount (0.052) when only `-ub 256` changes, and with Q8 activations
+(`GGML_CUDA_MMQ_PREC=q8`) the divergence is 0.0007. A new `test-backend-ops`
+case, `MUL_MAT_SCALE`, compares the fused graph against the CPU backend. It
+fails when the fold is deliberately off by 2×. Neither patch is in the vendored
+llama.cpp; both are upstream candidates.
 
 ## Speculative decoding: MTP, DFlash 2, DSpark
 
