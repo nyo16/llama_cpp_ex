@@ -809,10 +809,11 @@ gpt-oss-120b over RDMA, upstream's worker restarted before every run, and
 The client's cluster decides the band. With the client on the A725 cores,
 every run lands in the fast band. Leave it unpinned and the scheduler mostly
 puts it on the X925 cores, which is the slow band. llama-bench's own CPU
-threads do not explain it: `--poll 0` and `-t 1` change nothing. Kernel times
-are identical in both bands on both nodes (`nsys`: 118 µs per expert matvec,
-2.7 ms for the LM head). The extra ~4 ms per token is spent on the CPU and in
-the network wait; the next section has the cause.
+threads do not explain it: `--poll 0` and `-t 1` change nothing. On the
+worker, kernel times are identical in fast and slow sessions (`nsys`: 118 µs
+per expert matvec, 2.7 ms for the LM head), and the client's slow-band expert
+matvecs run at the same 118 µs. The extra ~4 ms per token is spent on the CPU
+and in the network wait; the next section has the cause.
 
 The binding follows the same rule. `bench/spark_two_node.exs b1` with the
 BEAM under `taskset -c 0-4,10-14` (`scripts/spark/remote.sh --little-cores`),
