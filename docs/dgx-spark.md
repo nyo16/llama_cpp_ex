@@ -1004,6 +1004,15 @@ Essentially free. So the Meta device is not the problem. Now two nodes:
 It runs, and the output is byte-identical to the layer-split reference. It is
 **2.7× slower on decode and 23× slower on prefill**.
 
+At `785322d17` the RPC backend has its own pairwise communicator for this
+(#26610, `ggml_backend_rpc_comm_init`), so the next section describes the older
+commit. Re-measured on gpt-oss-120b (`llama-bench -sm tensor -p 512 -n 64`,
+fresh upstream worker), the vendored client decodes at 8.9 tok/s with pp512
+1135. The `spark-all` client, whose RPC fix also spins the callers that the
+communicator's own spin left blocking, decodes at **24.1** with pp512 1553.
+That is 2.7× better, and still less than half of a layer split's 57.6. The
+verdict below stands.
+
 ## Why, and why the comm-mode knob cannot help
 
 `ggml_backend_cuda_comm_init` returns `nullptr` the moment **any** member backend
