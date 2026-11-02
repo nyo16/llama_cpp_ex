@@ -432,9 +432,11 @@ tree. Then remove the
 | Qwen3.8-27B NVFP4 | 1304 tok/s | **1560 tok/s** (+20%) |
 | gpt-oss-120b MXFP4 | 2352 tok/s | **2583 tok/s** (+10%) |
 
-`scripts/spark/e2e.exs single` passes 12/12 on that build. The binding is
-unaffected by the swap, but a release would have to vendor the branch or wait
-for upstream.
+`scripts/spark/e2e.exs single` passes 12/12 on that build. Speculative
+decoding on Qwen3.8-27B NVFP4 (`bench/spark_spec.exs`) runs at plain 14.3, MTP
+`n_draft: 2` 26.5 and DFlash 2 `n_draft: 7` 45.9 tok/s, against 14.3 / 26.8 /
+44.2 vendored. No source change in the binding is needed for the swap, but a
+release would have to vendor the branch or wait for upstream.
 
 ## Speculative decoding: MTP, DFlash 2, DSpark
 
