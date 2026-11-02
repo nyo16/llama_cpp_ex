@@ -446,7 +446,10 @@ tree. Then remove the
 `scripts/spark/e2e.exs single` passes 12/12 on that build. So do the test
 suite's `smoke`, `embeddings`, `tools` and `decision` tags (602 tests), `mtp` and
 `dflash` (458), `rpc_live` against a worker, `vm_exit_test.exs`, and
-`rpc_check.exs` over the fabric (VM exit 0). Speculative
+`rpc_check.exs` over the fabric (VM exit 0). The embeddings run used
+Qwen3-Embedding-0.6B. With bge-small-en-v1.5 Q8_0, `embed_batch matches
+per-text embed` fails on CUDA by 0.0027 against its 0.001 bound, on the
+vendored tree as well, and passes on the CPU backend. Speculative
 decoding on Qwen3.8-27B NVFP4 (`bench/spark_spec.exs`) runs at plain 14.3, MTP
 `n_draft: 2` 26.5 and DFlash 2 `n_draft: 7` 45.9 tok/s, against 14.3 / 26.8 /
 44.2 vendored. No source change in the binding is needed for the swap, but a
