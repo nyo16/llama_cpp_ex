@@ -849,12 +849,16 @@ completion over two nodes, `llama-server` used 1.99 cores on average against
 0.89 unpatched, and decoded at 55.7 tok/s against 48.4. That is one extra core
 for +15%. Both spins are needed. With an X925 client, `llama-bench` decodes at
 44.2 with neither, 52.4 with the dispatcher spin only, 54.1 with the caller
-spin only and 57.5 with both. With that client and the same unpatched worker:
+spin only and 57.5 with both. A 30-minute soak of `llama-server` on that
+client (`-np 4`, six concurrent clients, random 16/64/256-token completions,
+gpt-oss-120b over RDMA) served 1419 completions and 146k tokens with no
+errors, and exited 0. Upstream's worker grew from 332 to 1565 MiB RSS over it.
+With that client and the same unpatched worker:
 
 | client | `llama-bench` decode, before | after |
 |---|---|---|
 | X925 cores | 44.2–44.6 | **57.6** |
-| unpinned | 44.0–44.5 (one run in seven 53.2) | **57.4, 57.6** |
+| unpinned | 42.3–44.5 (4 of 18 runs at 52–53) | **57.4, 57.6** |
 | A725 cores | 53.5–54.0 | **57.3** |
 | single node | 59.0 | — |
 
@@ -1068,8 +1072,11 @@ only cross-host mode that is both correct and fast, and it buys capacity.
   cannot span hosts as designed. Across hosts it silently falls back to a generic
   path that is 2.7× slower. It is the right tool for several GPUs in **one** box,
   which a Spark does not have.
-- Layer split over RPC buys **capacity, not speed**. If your model fits in
-  130 GB, one Spark is the answer.
+- Layer split over RPC buys **capacity** first. On the vendored llama.cpp it
+  also buys +18–26% prefill and costs 9–30% decode, depending on where the
+  client runs. With the `rpc-client-spin-wait` fix, decode costs 2–3% on
+  gpt-oss-120b and nothing on the dense NVFP4 model. For a model that fits in
+  130 GB, a second Spark is a prefill and throughput option, not a requirement.
 
 Re-check these claims against a future llama.cpp bump using upstream commits
 `d6f303004` (`-sm tensor`), `adb541a6a` and `91fef9536`.
