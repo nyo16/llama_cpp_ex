@@ -443,7 +443,10 @@ tree. Then remove the
 | Qwen3.8-27B NVFP4 | 1304 tok/s | **1560 tok/s** (+20%) |
 | gpt-oss-120b MXFP4 | 2352 tok/s | **2583 tok/s** (+10%) |
 
-`scripts/spark/e2e.exs single` passes 12/12 on that build. Speculative
+`scripts/spark/e2e.exs single` passes 12/12 on that build. So do the test
+suite's `smoke`, `embeddings`, `tools` and `decision` tags (602 tests), `mtp` and
+`dflash` (458), `rpc_live` against a worker, `vm_exit_test.exs`, and
+`rpc_check.exs` over the fabric (VM exit 0). Speculative
 decoding on Qwen3.8-27B NVFP4 (`bench/spark_spec.exs`) runs at plain 14.3, MTP
 `n_draft: 2` 26.5 and DFlash 2 `n_draft: 7` 45.9 tok/s, against 14.3 / 26.8 /
 44.2 vendored. No source change in the binding is needed for the swap, but a
