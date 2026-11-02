@@ -154,9 +154,8 @@ llama.cpp enables pipeline parallelism across an RPC layer split: a prompt's
 micro-batches overlap across the nodes, and prefill measured 18–26% faster on
 two DGX Sparks than on one. A single decode stream has nothing to overlap and
 pays a network round trip per token, so it is slower than on one machine. A
-model that already fits on one machine gains capacity and prefill from a
-second one, not decode speed. See [DGX Spark](dgx-spark.md) for the
-measurements.
+model that already fits on one machine gains prefill from a second one, and
+loses some decode. See [DGX Spark](dgx-spark.md) for the measurements.
 
 > #### A peer failure aborts the VM {: .error}
 >

@@ -1287,10 +1287,14 @@ end)
 
 `LlamaCppEx.MTP.init/2`:
 
+  * `:type` — `:mtp` (default), `:dflash` or `:dspark`. The last two need the
+    drafter GGUF as `:draft_model`.
+  * `:draft_model` — a separate `%LlamaCppEx.Model{}`: a DFlash/DSpark drafter,
+    or an MTP sidecar head loaded with `load_mtp: true`.
   * `:n_draft` — draft tokens proposed per iteration (default `3`). The optimum
-    is hardware-specific and worth measuring rather than assuming: `1` on Apple
-    Silicon, `2` on GB10 (where `3` measured *slower* than no speculation at
-    all), `2–4` on datacenter NVIDIA. See the two performance notes above.
+    is model- and hardware-shaped, so measure it: for MTP, `2–3` on a dense
+    model and `2` on a sparse MoE on both GB10 and M1 Max; for DFlash 2, the
+    drafter's block size minus one (`7`), which is also its cap.
   * `:n_ctx`, `:n_threads`, `:flash_attn`, `:type_k`/`:type_v`, `:offload_kqv`, … — any `LlamaCppEx.Context` option; applied to both target and draft contexts.
 
 `LlamaCppEx.MTP.stream/3`:
@@ -1336,45 +1340,34 @@ New `qwen35moe` architecture with Gated Delta Net (hybrid linear/full attention)
 
 ### CUDA: NVIDIA DGX Spark (GB10)
 
-Same model and quantization as the M1 Max row above, so the two are directly
-comparable. GB10 (`sm_121a`, aarch64, 128 GB unified), CUDA 13.0.2, driver
-580.173.02, llama.cpp b10280, source build with `LLAMA_BACKEND=cuda`.
+GB10 (`sm_121a`, aarch64, 128 GB unified), CUDA 13.0, driver 580.173.02,
+llama.cpp `785322d17`, source build with `LLAMA_BACKEND=cuda`. Single-stream
+decode through `LlamaCppEx.stream/3`, 128 greedy tokens, against upstream's
+`llama-bench` on the same build:
 
-| Model | Quantization | Tokens/sec (GB10) | Tokens/sec (M1 Max) |
-|-------|-------------|-------------------|---------------------|
-| Qwen3.6-35B-A3B | UD-Q4_K_XL | **62.1** | 43.8 |
+| Model | Quantization | llama_cpp_ex | llama-bench tg128 |
+|-------|-------------|--------------|-------------------|
+| Qwen3-8B | Q4_K_M | 44.1 | 43.9 |
+| Qwen3-30B-A3B | Q4_K_M | 91.4 | 92.7 |
+| Qwen3.6-35B-A3B | UD-Q4_K_M | 68.3 | 69.8 |
+| Qwen3.8-27B | Q4_K_M | 11.3 | 11.3 |
+| Qwen3.8-27B | NVFP4 (MID-HIGH) | 14.3 | 14.4 |
+| gpt-oss-120b | MXFP4 | 57.0 | 58.8–59.0 |
 
-128-token generation, `temp: 0.0`, `n_gpu_layers: -1`. Median of 5 runs after a
-discarded warm-up: 61.7 / 62.0 / 62.1 / 62.2 / 62.2 t/s — a 0.9% spread, so the
-1.42x over M1 Max is well outside the noise. All 41 layers offload; the model
-takes 20 799 MiB of device memory.
+With speculative decoding the same machine does 44.2 tok/s on Qwen3.8-27B
+NVFP4 (DFlash 2) and 96.7 on Qwen3.6-35B-A3B (MTP, `n_draft: 2`); see
+[Speculative decoding](#speculative-decoding-mtp-dflash). Concurrency, prefill
+and two-node numbers are in [docs/dgx-spark.md](docs/dgx-spark.md).
 
 Two notes on method, both learned the hard way:
 
-- **Each run uses a distinct prompt.** Repeating one prompt hits the context
-  reuse path and reports a throughput the engine never achieved.
-- **Tokens are counted by re-encoding the output**, not by counting stream
-  chunks — a chunk is not a token, and under speculative decoding it can carry
-  several.
-
-The first call after load is discarded: it pays CUDA graph capture and the
-allocator's first-touch layout, and is not representative of steady state.
-
-With MTP speculative decoding, using the separate `-MTP` build of the same model
-(the plain UD-Q4_K_XL carries no MTP head — `MTP.init/2` now says so rather than
-failing with a bare context error):
-
-| | median tok/s | vs plain |
-|---|---|---|
-| plain | 61.4 | — |
-| `n_draft: 2` | **71.2** | +16% |
-| `n_draft: 3` | 61.1 | −2% |
-| `n_draft: 4` | 53.8 | −14% |
-
-`n_draft: 2` is the optimum on this hardware, not the documented default of 3.
-See the GB10 performance note under [Speculative decoding
-(MTP)](#speculative-decoding-mtp) for the acceptance and timing counters behind
-that.
+- **Each run uses a distinct prompt, or prompt caching off.** Repeating one
+  prompt hits the context reuse path and reports a throughput the engine never
+  achieved.
+- **Measure decode more than once per load.** On GB10 a load can land ~17%
+  slower for its whole lifetime (gpt-oss-120b: 48.5 against 57 tok/s), and a
+  forced `use_mmap: true` made that the common case — leave the load-mode
+  options unset.
 
 ### Single-sequence generation (Qwen3-4B Q4_K_M)
 
