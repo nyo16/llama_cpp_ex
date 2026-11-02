@@ -890,8 +890,12 @@ With the client fixed, the worker binary shows up. Against the same patched
 binding client gives the same split: 50.6–50.8 against 53.9. Both workers run
 the same server code from the same tree and build flags. Several things change
 nothing: BEAM scheduler flags (`+sbwt none`, `+S 1:1`), no super carriers
-(`+MMscs 0 +MMmcs 0`), and running the worker on the A725 cores instead of the
-X925s. GPU clocks are the same in both, 2411 MHz. Kernel times under `nsys` do
+(`+MMscs 0 +MMmcs 0`), running the worker on the A725 cores instead of the
+X925s, and an explicit `-ts 1/1` split (53.7 against 57.4), which rules out the
+layers moving with a different free-memory report. The server thread's context
+switches and CPU time match the upstream worker's (1032 / 199 / 25.9 s against
+1036 / 190 / 25.2 s over a 256-token run). GPU clocks are the same in both,
+2411 MHz. Kernel times under `nsys` do
 not settle it, because profiling slows the BEAM process more than a bare
 binary (one-node section). The cause is not established. For the last 7% of
 two-node decode, run `rpc-worker.sh --upstream`.
