@@ -846,7 +846,9 @@ RPC-split model used 0 CPU ticks in the 10 s after a request, against 2
 unpatched. The cost is paid while generating. On a 512-token gpt-oss-120b
 completion over two nodes, `llama-server` used 1.99 cores on average against
 0.89 unpatched, and decoded at 55.7 tok/s against 48.4. That is one extra core
-for +15%. With that client and the same unpatched worker:
+for +15%. Both spins are needed. With an X925 client, `llama-bench` decodes at
+44.2 with neither, 52.4 with the dispatcher spin only, 54.1 with the caller
+spin only and 57.5 with both. With that client and the same unpatched worker:
 
 | client | `llama-bench` decode, before | after |
 |---|---|---|
