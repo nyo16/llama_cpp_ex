@@ -145,10 +145,11 @@ defmodule LlamaCppEx.Context do
       with a separate `:default` context to drive multi-token-prediction speculative
       decoding via `LlamaCppEx.MTP`.
     * `:n_rs_seq` - Number of recurrent-state snapshots per sequence to retain for
-      partial rollback of speculative drafts. `0` (default) disables rollback. For an
-      MTP draft context, use `0` — the MTP implementation handles rollback
-      internally via cached hidden states (`pending_h` / `verify_h`), not
-      recurrent-state snapshots.
+      partial rollback of speculative drafts. `0` (default) disables rollback.
+      `LlamaCppEx.MTP.init/2` gives the target context one per draft position,
+      as upstream's server does; the draft context gets `0` — the drafters
+      handle their own rollback (MTP via cached hidden states, DFlash by
+      re-injecting target features), not via recurrent-state snapshots.
     * `:ctx_other` - An existing `%Context{}` whose raw pointer is passed as
       `llama_context_params.ctx_other`. Optional; omitted or `nil` is
       `nullptr`. `gemma4-assistant` requires it at construction. `MTP.init/2`

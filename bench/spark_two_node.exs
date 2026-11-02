@@ -248,12 +248,12 @@ case which do
   "b1" ->
     # Controlled: the model fits one node, so anything the second node costs is
     # pure RPC overhead rather than a memory benefit.
-    path = models["120b"]
+    path = System.get_env("SPARK_TWO_NODE_MODEL") || models["120b"]
     File.exists?(path) || raise "missing #{path}"
 
     single =
       TwoNode.measure(
-        "120b single-node",
+        "#{Path.basename(path, ".gguf")} single-node",
         path,
         [n_parallel: 1, n_ctx: n_ctx, cache_prompt: false],
         prompt_tokens,
@@ -265,7 +265,7 @@ case which do
 
     two =
       TwoNode.measure(
-        "120b two-node 50/50",
+        "#{Path.basename(path, ".gguf")} two-node 50/50",
         path,
         [
           n_parallel: 1,
@@ -339,18 +339,19 @@ case which do
     TwoNode.table(single ++ [two])
 
   "b3" ->
-    # Transport A/B. Run this twice: once normally, once with the worker AND this
-    # process started under GGML_RDMA_DEV=nonexistent. There is no runtime
-    # switch — that variable and a -DGGML_RPC_RDMA=OFF build are the only levers.
-    path = models["120b"]
+    # Transport A/B. Run once per transport: normally (RDMA on the fabric), with
+    # GGML_RPC_NO_RDMA=1 set on the worker (`rpc-worker.sh start --tcp`) for TCP
+    # over the same 200 GbE link, and with the worker on the 10 GbE LAN
+    # (`--link lan`) for the management network. SPARK_TRANSPORT labels the row.
+    path = System.get_env("SPARK_TWO_NODE_MODEL") || models["120b"]
     register.()
     {local, remote} = device_names.()
 
-    transport = if System.get_env("GGML_RDMA_DEV") in [nil, ""], do: "RDMA", else: "TCP (forced)"
+    transport = System.get_env("SPARK_TRANSPORT") || "RDMA"
 
     row =
       TwoNode.measure(
-        "120b two-node over #{transport}",
+        "#{Path.basename(path, ".gguf")} two-node over #{transport}",
         path,
         [
           n_parallel: 1,

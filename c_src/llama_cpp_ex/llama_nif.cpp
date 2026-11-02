@@ -6,6 +6,9 @@
 #include "log.h"
 #include "sampling.h"
 #include "speculative.h"
+// Staging API: llama_model_target_layer_ids{,_n}, to validate a DFlash drafter
+// before upstream's constructor asserts on it. decision.cpp includes it the same way.
+#include "../../vendor/llama.cpp/src/llama-ext.h"
 #include <cctype>
 #include <random>
 #include <string>
@@ -2782,14 +2785,15 @@ chat_session_parse(ErlNifEnv* env, fine::ResourcePtr<LlamaChatSession> session, 
 // Dirty: re-parses the whole reply, so its cost grows with the reply.
 LLAMA_NIF(chat_session_parse, ERL_NIF_DIRTY_JOB_CPU_BOUND);
 
-// --- Speculative decoding (MTP) ---
+// --- Speculative decoding (MTP, DFlash, DSpark) ---
 
 std::variant<fine::Ok<fine::ResourcePtr<LlamaSpeculative>>, fine::Error<std::string>>
 speculative_init(
     ErlNifEnv* env,
     fine::ResourcePtr<LlamaContext> ctx_tgt,
     fine::ResourcePtr<LlamaContext> ctx_dft,
-    int64_t n_draft)
+    int64_t n_draft,
+    fine::Atom type)
 {
     if (n_draft <= 0) {
         return fine::Error(std::string("n_draft must be > 0"));
@@ -2798,22 +2802,66 @@ speculative_init(
         return fine::Error(kNoLogitsMessage);
     }
 
+    common_speculative_type spec_type;
+    const std::string type_name = type.to_string();
+    if (type_name == "mtp") {
+        spec_type = COMMON_SPECULATIVE_TYPE_DRAFT_MTP;
+    } else if (type_name == "dflash") {
+        spec_type = COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH;
+    } else if (type_name == "dspark") {
+        spec_type = COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK;
+    } else {
+        return fine::Error("unknown speculative type :" + type_name);
+    }
+
+    const llama_model* model_tgt = llama_get_model(ctx_tgt->ctx);
+    const llama_model* model_dft = llama_get_model(ctx_dft->ctx);
+
+    // The DFlash/DSpark constructor GGML_ASSERTs that the draft names the
+    // target layers it reads, and it reads them by index from the target: a
+    // draft that is not a DFlash checkpoint, or one trained for a different
+    // target, aborts the VM instead of failing. Check both here.
+    if (spec_type != COMMON_SPECULATIVE_TYPE_DRAFT_MTP) {
+        const uint32_t n_ids = llama_model_target_layer_ids_n(model_dft);
+        if (n_ids == 0) {
+            return fine::Error(std::string(
+                "draft model is not a DFlash/DSpark drafter (it names no target layers)"));
+        }
+        const int32_t* ids = llama_model_target_layer_ids(model_dft);
+        const int32_t n_layer_tgt = llama_model_n_layer(model_tgt);
+        for (uint32_t k = 0; k < n_ids; k++) {
+            if (ids[k] < 0 || ids[k] >= n_layer_tgt) {
+                return fine::Error("draft model reads target layer " + std::to_string(ids[k]) +
+                                   ", but the target has " + std::to_string(n_layer_tgt) +
+                                   " layers; the drafter belongs to a different model");
+            }
+        }
+        if (!common_speculative_are_compatible(model_tgt, model_dft)) {
+            return fine::Error(std::string(
+                "draft and target vocabularies are incompatible; the drafter belongs to a different model"));
+        }
+    }
+
     // Probe partial-rollback support on the target context BEFORE
     // common_speculative_init. Two reasons:
     //   1. common_context_can_seq_rm clears the context's KV memory as a
     //      side effect (see common.h:904).
     //   2. common_speculative_init's MTP impl calls
-    //      llama_set_embeddings_pre_norm(ctx_tgt, true) in its constructor.
-    //      Probing afterwards would clobber that flag and the MTP head
-    //      would see garbage hidden states (acceptance drops to ~5%).
-    // Dense attention-only models report PART → partial seq_rm is native,
-    // skip the per-iter checkpoint path. Hybrid models (Qwen 3.6 MoE with
-    // GDN layers) report FULL → checkpoint every iteration.
+    //      llama_set_embeddings_pre_norm(ctx_tgt, true) in its constructor,
+    //      and the DFlash impl turns on the target-layer extraction there.
+    //      Probing afterwards would clobber those flags and the draft would
+    //      see garbage hidden states (MTP acceptance drops to ~5%).
+    // Dense attention-only models report PART → partial seq_rm is native.
+    // A hybrid target (Qwen 3.6/3.8: GDN layers beside attention) reports RS
+    // when it was created with n_rs_seq > 0 — it keeps that many recurrent
+    // snapshots and rolls back natively up to that depth, which is how
+    // upstream's server runs it (n_rs_seq = n_draft) — and FULL without them,
+    // which costs a state save every iteration plus a restore and re-decode on
+    // every partial accept. needs_ckpt is settled below, once n_draft is.
     const auto rm_type_tgt = common_context_can_seq_rm(ctx_tgt->ctx);
-    const bool needs_ckpt = (rm_type_tgt == COMMON_CONTEXT_SEQ_RM_TYPE_FULL);
 
     common_params_speculative params;
-    params.types        = { COMMON_SPECULATIVE_TYPE_DRAFT_MTP };
+    params.types        = { spec_type };
     params.draft.n_max  = static_cast<int32_t>(n_draft);
     params.draft.ctx_tgt = ctx_tgt->ctx;
     params.draft.ctx_dft = ctx_dft->ctx;
@@ -2827,9 +2875,24 @@ speculative_init(
 
     if (!spec) {
         return fine::Error(std::string(
-            "common_speculative_init returned null — does the model contain MTP heads "
-            "and does the draft context have ctx_type=:mtp with n_rs_seq>0?"));
+            "common_speculative_init returned null — does the draft context match "
+            "the speculative type (ctx_type: :mtp for MTP heads)?"));
     }
+
+    // The DFlash impl clamps n_max to the drafter's trained block size; keep
+    // what it settled on so the loop never asks for more.
+    const int32_t n_max = common_speculative_n_max(spec);
+    if (n_max > 0 && n_max < n_draft) {
+        n_draft = n_max;
+    }
+
+    // Snapshots cover a verify batch of up to n_rs_seq + 1 tokens, i.e. a draft
+    // of up to n_rs_seq; past that the RS path is not guaranteed and the loop
+    // falls back to checkpoints, like upstream's server.
+    const bool needs_ckpt =
+        rm_type_tgt == COMMON_CONTEXT_SEQ_RM_TYPE_FULL ||
+        (rm_type_tgt == COMMON_CONTEXT_SEQ_RM_TYPE_RS &&
+         static_cast<uint32_t>(n_draft) > llama_n_rs_seq(ctx_tgt->ctx));
 
     auto res = fine::make_resource<LlamaSpeculative>(
         spec, std::move(ctx_tgt), std::move(ctx_dft),
@@ -3338,6 +3401,15 @@ fine::Ok<> generate_mtp_tokens(
                 // then — including it here would duplicate it in the context.
                 // `sampled` sits at prompt[size - n_accepted_total - 1], since
                 // the accept loop pushed n_accepted_total tokens after it.
+                //
+                // The draft context was rolled back to n_past above, so the
+                // drafter has lost these positions too: hand the re-decode to
+                // common_speculative_process exactly as the verify batch was,
+                // or the next draft is conditioned on a hole. A DFlash drafter
+                // reads the target's hidden states only through process, and
+                // without this its acceptance collapsed to ~3% on a hybrid
+                // target. Every row asks for output, as the verify batch did,
+                // because the drafter's extraction follows the output rows.
                 if (n_accepted_total > 0) {
                     llama_batch redo = llama_batch_init(n_accepted_total, 0, 1);
                     BatchFreeGuard redo_guard(redo);
@@ -3346,11 +3418,15 @@ fine::Ok<> generate_mtp_tokens(
                             prompt[prompt.size() - n_accepted_total - 1 + i];
                         batch_push(redo, tok,
                                    n_past + static_cast<llama_pos>(i), seq_id,
-                                   /*logits=*/ i == n_accepted_total - 1);
+                                   /*logits=*/ true);
                     }
                     int ret = decode_tracked(*sp.ctx_tgt, redo);
                     if (ret != 0) {
                         send_error("rollback re-decode failed: code=" + std::to_string(ret));
+                        return fine::Ok();
+                    }
+                    if (!speculative_process(sp.spec, spec_batch, redo)) {
+                        send_error("common_speculative_process failed after rollback");
                         return fine::Ok();
                     }
                 }

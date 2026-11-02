@@ -26,6 +26,10 @@
 #                 (3 of 4 runs) and did not abort; by b11479 it aborts again
 #                 (4 of 6 runs at 23b0202a1). Either way it does not belong in
 #                 a green run. See test/mtp_model_test.exs.
+#   :dflash     — DFlash speculative decoding (MTP.init type: :dflash); needs
+#                 LLAMA_SMOKE_DFLASH_MODEL and LLAMA_SMOKE_DFLASH_DRAFT_MODEL,
+#                 a target and the `dflash` drafter trained for it (e.g.
+#                 Qwen3.8-27B-Q4_K_M and z-lab/Qwen3.8-27B-DFlash2-GGUF).
 #   :slow       — long-running comparison matrices (F16 vs Q8_0 KV cache);
 #                 needs LLAMA_SMOKE_GEN_MODEL
 #   :decision   — decision models (LlamaCppEx.Decision); needs both
@@ -120,6 +124,7 @@ ExUnit.start(
     :mtp_sidecar,
     :decision,
     :decision_clef,
+    :dflash,
     :rpc_live
   ]
 )

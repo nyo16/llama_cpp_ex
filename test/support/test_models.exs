@@ -29,6 +29,12 @@ defmodule LlamaCppEx.TestModels do
     # Its own env var because the two files are provisioned independently.
     mtp_e4b_draft:
       {"LLAMA_SMOKE_MTP_E4B_DRAFT_MODEL", "a Gemma4 E4B MTP sidecar (gemma4-assistant)"},
+    # A DFlash / DFlash 2 drafter and the target it was trained for, e.g.
+    # Qwen3.8-27B-Q4_K_M.gguf with z-lab/Qwen3.8-27B-DFlash2-GGUF. The target
+    # is its own var even though it is usually the :mtp file, because a DFlash
+    # drafter reads specific target layers and only pairs with its own model.
+    dflash: {"LLAMA_SMOKE_DFLASH_MODEL", "a DFlash target"},
+    dflash_draft: {"LLAMA_SMOKE_DFLASH_DRAFT_MODEL", "a DFlash drafter"},
     # Decision models, one per readout: laya reads the embeddings output,
     # openjev reads label logits. Upstream's own test models
     # (ggml-org/tinylaya-for-testing-gguf, ggml-org/tinyopenjev-for-testing-gguf)
@@ -52,6 +58,8 @@ defmodule LlamaCppEx.TestModels do
           | :mtp_draft
           | :mtp_e4b
           | :mtp_e4b_draft
+          | :dflash
+          | :dflash_draft
           | :decision_laya
           | :decision_openjev
           | :decision_clef

@@ -177,7 +177,7 @@ defmodule LlamaCppEx.NIF do
     do: :erlang.nif_error(:not_loaded)
 
   # Speculative decoding (MTP)
-  def speculative_init(_ctx_tgt, _ctx_dft, _n_draft), do: :erlang.nif_error(:not_loaded)
+  def speculative_init(_ctx_tgt, _ctx_dft, _n_draft, _type), do: :erlang.nif_error(:not_loaded)
   def speculative_stats(_spec), do: :erlang.nif_error(:not_loaded)
   def speculative_print_stats(_spec), do: :erlang.nif_error(:not_loaded)
 

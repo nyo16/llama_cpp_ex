@@ -1092,12 +1092,14 @@ defmodule LlamaCppExTest do
       %{model: model, mtp: mtp}
     end
 
-    test "contexts use no recurrent-state rollback slots", %{mtp: mtp} do
-      # Matching upstream server, the draft ctx is created with n_rs_seq=0 —
-      # MTP rolls back via cached hidden states (pending_h / verify_h), not
-      # recurrent-state snapshots. Both contexts report 0.
+    test "the target keeps a recurrent snapshot per draft position, the draft none", %{
+      mtp: mtp
+    } do
+      # Matching upstream (need_n_rs_seq / common_speculative_init_result): the
+      # target rolls a rejected draft back on n_draft recurrent snapshots, and
+      # the draft ctx has none — MTP rolls back via cached hidden states.
       assert LlamaCppEx.Context.n_rs_seq(mtp.mtp_ctx) == 0
-      assert LlamaCppEx.Context.n_rs_seq(mtp.main_ctx) == 0
+      assert LlamaCppEx.Context.n_rs_seq(mtp.main_ctx) == mtp.n_draft
     end
 
     test "stream produces text and a sensible acceptance rate", %{mtp: mtp} do

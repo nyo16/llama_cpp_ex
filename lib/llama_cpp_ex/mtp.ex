@@ -52,17 +52,19 @@ defmodule LlamaCppEx.MTP do
   target's token embeddings); Qwen's constructor leaves `cparams.ctx_other`
   as `nullptr`.
 
-  > #### Speculation is not always a win on hybrid models {: .warning}
+  > #### Hybrid models roll back on recurrent snapshots {: .info}
   >
   > A model that mixes recurrent (SSM) layers with attention ones — Qwen 3.8 is
   > 48 SSM layers to 16 attention layers — cannot roll back part of a sequence
-  > natively, so every speculative iteration snapshots and restores the whole
-  > recurrent state. That state is over 100 MiB at Qwen 3.8's sizes, and the
-  > cost lands in `stats/1`'s `timing_us.ckpt`. Measured on an M1 Max (Metal,
-  > Q4_K_M target + Q4_0 head), MTP was a net *slowdown* at every draft length:
-  > 0.89x at `n_draft: 1` (75% acceptance) falling to 0.56x at `n_draft: 5`
-  > (30%). Check `timing_us.ckpt` against `timing_us.total` before assuming
-  > speculation is helping, and prefer small `n_draft` when it is not.
+  > from its KV cache alone. `init/2` therefore creates the target context with
+  > one recurrent-state snapshot per draft position (`n_rs_seq: n_draft`), as
+  > upstream's server does, and a rejected draft is rolled back natively. Before
+  > that, every iteration saved the whole recurrent state (over 100 MiB at Qwen
+  > 3.8's sizes) and every partial accept restored it and re-decoded the
+  > accepted prefix: on GB10 that held Qwen3.8-27B NVFP4 to 21 tok/s at
+  > `n_draft: 2` where the snapshot path does 27, and on an M1 Max it made MTP a
+  > net slowdown. `stats/1`'s `timing_us.ckpt` is that save/restore, and stays
+  > zero unless `n_draft` exceeds the snapshots.
 
   Upstream currently requires `n_parallel = 1` for MTP. This module reflects
   that — a single MTP session decodes one sequence at a time. Reuse the same
@@ -110,22 +112,34 @@ defmodule LlamaCppEx.MTP do
   end
 
   @doc """
-  Initializes an MTP speculative session: builds the target context, the MTP
-  draft context (`ctx_type: :mtp`), and the underlying `common_speculative`
-  state.
+  Initializes a speculative session: builds the target context, the draft
+  context, and the underlying `common_speculative` state.
 
   ## Options
 
-    * `:draft_model` - A separate `LlamaCppEx.Model` holding the MTP head, for
-      checkpoints that ship it as a sidecar GGUF rather than inside the target
-      file (Qwen 3.8: `Qwen3.8-27B-Q4_K_M.gguf` plus `mtp-Qwen3.8-27B-Q4_0.gguf`;
-      Gemma4 E4B: a `gemma4` target plus a `gemma4-assistant` head). It must be
-      loaded with `load_mtp: true`.
-      Defaults to `nil`, meaning the head is expected inside the target model
-      and the draft context is built against it.
+    * `:type` - The drafter. Defaults to `:mtp`.
+      * `:mtp` - a Multi-Token Prediction head, inside the target GGUF or in a
+        sidecar passed as `:draft_model`. The draft context is built with
+        `ctx_type: :mtp`.
+      * `:dflash` - a DFlash / DFlash 2 block-diffusion drafter (GGUF
+        architecture `dflash`), passed as `:draft_model`. It drafts a whole
+        block in one pass from the target's hidden states, and is the fastest
+        option measured on GB10: 3.3× plain decode on Qwen3.8-27B NVFP4 against
+        2.1× for its MTP head (see `docs/dgx-spark.md`).
+      * `:dspark` - a DSpark drafter (DFlash plus a Markov head), passed as
+        `:draft_model`.
+    * `:draft_model` - A separate `LlamaCppEx.Model` holding the drafter.
+      Required for `:dflash` and `:dspark`. For `:mtp` it is the sidecar head
+      for checkpoints that ship one rather than embedding it (Qwen 3.8:
+      `Qwen3.8-27B-Q4_K_M.gguf` plus `mtp-Qwen3.8-27B-Q4_0.gguf`; Gemma4 E4B:
+      a `gemma4` target plus a `gemma4-assistant` head), loaded with
+      `load_mtp: true`. Defaults to `nil`, meaning the MTP head is expected
+      inside the target model and the draft context is built against it.
     * `:n_draft` - Max draft tokens generated per iteration. Defaults to `3`.
       Larger values mean fewer model forward passes but lower per-iteration
-      acceptance; 2–4 is the sweet spot in practice.
+      acceptance; 2–4 is the sweet spot for MTP in practice. A DFlash drafter
+      caps it at its trained block size minus one (7 for Qwen3.8 DFlash 2),
+      and that is also where it measured fastest.
     * `:n_ctx` - Context size for both contexts. Defaults to `2048`.
     * Any `Context` tuning option (e.g. `:n_threads`, `:flash_attn`,
       `:type_k`/`:type_v`, `:offload_kqv`). Applied to both contexts.
@@ -137,15 +151,33 @@ defmodule LlamaCppEx.MTP do
   def init(%Model{} = model, opts \\ []) do
     n_draft = Keyword.get(opts, :n_draft, 3)
     draft_model = Keyword.get(opts, :draft_model)
+    type = Keyword.get(opts, :type, :mtp)
 
     with :ok <- validate_n_draft(n_draft),
-         {:ok, head_model} <- validate_head(model, draft_model) do
-      do_init(model, head_model, opts, n_draft)
+         {:ok, head_model} <- validate_drafter(type, model, draft_model) do
+      do_init(model, head_model, opts, n_draft, type)
     end
   end
 
   defp validate_n_draft(n) when is_integer(n) and n > 0, do: :ok
   defp validate_n_draft(_), do: {:error, ":n_draft must be a positive integer"}
+
+  defp validate_drafter(:mtp, target, draft), do: validate_head(target, draft)
+
+  # Whether the drafter really is a DFlash checkpoint for this target is checked
+  # in the NIF, where the model's target-layer metadata is readable: upstream's
+  # constructor asserts on it, so it has to be refused before init.
+  defp validate_drafter(type, _target, %Model{} = draft) when type in [:dflash, :dspark],
+    do: {:ok, draft}
+
+  defp validate_drafter(type, _target, nil) when type in [:dflash, :dspark],
+    do: {:error, "type: #{inspect(type)} needs the drafter GGUF passed as draft_model:"}
+
+  defp validate_drafter(type, _target, other) when type in [:dflash, :dspark],
+    do: {:error, ":draft_model must be a LlamaCppEx.Model, got: #{inspect(other)}"}
+
+  defp validate_drafter(type, _target, _draft),
+    do: {:error, ":type must be :mtp, :dflash or :dspark, got: #{inspect(type)}"}
 
   # Which model the draft context is built from, and whether it can actually
   # serve as one. Two shapes reach this: the head inside the target GGUF (no
@@ -216,25 +248,38 @@ defmodule LlamaCppEx.MTP do
     {:error, ":draft_model must be a LlamaCppEx.Model, got: #{inspect(other)}"}
   end
 
-  defp do_init(model, head_model, opts, n_draft) do
+  defp do_init(model, head_model, opts, n_draft, type) do
     base_ctx_opts = forwardable_context_opts(opts)
-    main_opts = Keyword.merge(base_ctx_opts, ctx_type: :default)
-    # Match upstream server: MTP draft context is created with n_rs_seq=0.
-    # The MTP impl handles state rollback internally via cached hidden
-    # states (pending_h / verify_h), not via recurrent-state snapshots.
-    draft_opts = Keyword.merge(base_ctx_opts, ctx_type: :mtp, n_rs_seq: 0)
+
+    # Recurrent-state snapshots on the target, one per draft position, as
+    # upstream's server sizes them (common_params_speculative.need_n_rs_seq).
+    # A hybrid target (GDN layers beside attention) then rolls a rejected draft
+    # back natively instead of saving its state every iteration and re-decoding
+    # the accepted prefix on every partial accept: measured on Qwen3.8-27B
+    # NVFP4 with DFlash 2, that re-decode was the largest cost in the loop. A
+    # DFlash drafter clamps n_draft to its block size (at most 16) after init,
+    # so the snapshots are capped there rather than sized from what was asked.
+    n_rs_seq = if type == :mtp, do: n_draft, else: min(n_draft, 16)
+    main_opts = Keyword.merge(base_ctx_opts, ctx_type: :default, n_rs_seq: n_rs_seq)
+    # Match upstream (common_speculative_init_result): the draft context is
+    # created with n_rs_seq=0, as an MTP context only for an MTP head. The
+    # drafters handle rollback themselves (MTP via cached hidden states,
+    # DFlash by re-injecting target features), not via recurrent snapshots.
+    draft_ctx_type = if type == :mtp, do: :mtp, else: :default
+    draft_opts = Keyword.merge(base_ctx_opts, ctx_type: draft_ctx_type, n_rs_seq: 0)
 
     with {:ok, main_ctx} <- Context.create(model, main_opts),
          {:ok, mtp_ctx} <-
            Context.create(head_model, Keyword.merge(draft_opts, ctx_other: main_ctx)),
          {:ok, spec_ref} <-
-           LlamaCppEx.NIF.speculative_init(main_ctx.ref, mtp_ctx.ref, n_draft) do
+           LlamaCppEx.NIF.speculative_init(main_ctx.ref, mtp_ctx.ref, n_draft, type) do
       {:ok,
        %__MODULE__{
          main_ctx: main_ctx,
          mtp_ctx: mtp_ctx,
          spec_ref: spec_ref,
-         n_draft: n_draft
+         # A DFlash drafter clamps n_draft to its block size; report what runs.
+         n_draft: LlamaCppEx.NIF.speculative_stats(spec_ref).n_draft
        }}
     end
   end
@@ -404,11 +449,11 @@ defmodule LlamaCppEx.MTP do
     * `:tokens_emitted` - tokens streamed back to the caller
     * `:tokens_per_sec` - throughput over the active generation window
     * `:timing_us` - `%{draft: μs, verify: μs, sample: μs, ckpt: μs, other: μs,
-      total: μs}`. `:ckpt` is the recurrent-state save/restore that only hybrid
-      models pay and is zero elsewhere; on Qwen 3.8 it is large enough to decide
-      whether speculation helps at all. `:other` is whatever falls outside the
-      named buckets, dominated on Metal by GPU-sync waits from the previous
-      iteration's async verify decode.
+      total: μs}`. `:ckpt` is the recurrent-state save/restore a hybrid target
+      pays when it has fewer recurrent snapshots than `n_draft` (never, for a
+      session built by `init/2`), and is zero elsewhere. `:other` is whatever
+      falls outside the named buckets, dominated on Metal by GPU-sync waits
+      from the previous iteration's async verify decode.
     * `:n_draft` - max draft length configured at init
 
   Counters are cumulative across all `stream/3` / `generate/3` calls on this
