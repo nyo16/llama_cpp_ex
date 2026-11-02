@@ -1371,7 +1371,9 @@ Three notes, all learned the hard way:
 - **Over two nodes, pin the client to the Cortex-A725 cores**
   (`taskset -c 0-4,10-14`). Unpinned, the BEAM mostly lands on the X925
   cores, and decode over RPC runs ~25% slower: gpt-oss-120b layer-split decoded
-  37–38 tok/s unpinned against 47 pinned, with the same prefill.
+  37–38 tok/s unpinned against 47 pinned, with the same prefill. The cause is
+  thread wake-ups in ggml's RPC client. A fix on `nyo16/llama.cpp`
+  (`rpc-client-spin-wait`) gives 50.6–50.8 unpinned, against 55 single-node.
 
 ### Single-sequence generation (Qwen3-4B Q4_K_M)
 

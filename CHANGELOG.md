@@ -81,7 +81,11 @@ numbers behind the entries below.
   Unpinned or on the X925 cores, decode over RPC sits in a band ~25% slower:
   gpt-oss-120b layer-split decoded 37–38 tok/s against 47 through the binding,
   44 against 54 through `llama-bench`. The decode spread the docs blamed on the
-  worker came from the client's placement.
+  worker came from the client's placement: ggml's RPC client hands every
+  command between two threads, and those wake-ups are slow on the X925
+  cores. Upstream fix on `nyo16/llama.cpp` branch `rpc-client-spin-wait`:
+  57.6 tok/s on any cores through `llama-bench` (single node 59), 50.6–50.8
+  through the binding unpinned.
 
 ## v0.8.66
 

@@ -417,9 +417,12 @@ suite passes on the branch (19246/19246).
 ### Through the binding
 
 `nyo16/llama.cpp` branch `spark-all` is `785322d17`, the vendored commit, plus
-these four CUDA commits, the `draft-ctx-other-devices` fix and the
-`rpc-add-server-no-abort` fix. To test it, copy the checkout on spark-1 and
-replace `vendor/llama.cpp` with the branch tree. Then remove the
+these four CUDA commits, the `draft-ctx-other-devices` and
+`rpc-add-server-no-abort` fixes, and the RPC client spin
+(`rpc-client-spin-wait`, see the two-node section). The prefill numbers below
+predate the RPC commit, which does not touch single-node runs. To test it,
+copy the checkout on spark-1 and replace `vendor/llama.cpp` with the branch
+tree. Then remove the
 `_build/*/lib/llama_cpp_ex/obj/llama_build-*` directories and run
 `mix compile`. In that build, `Context.decode/2` of a 2048-token prompt
 (`n_ubatch: 512`, flash attention, median of 5) gives:
@@ -770,9 +773,7 @@ puts it on the X925 cores, which is the slow band. llama-bench's own CPU
 threads do not explain it: `--poll 0` and `-t 1` change nothing. Kernel times
 are identical in both bands on both nodes (`nsys`: 118 µs per expert matvec,
 2.7 ms for the LM head). The extra ~4 ms per token is spent on the CPU and in
-the network wait. Why the X925 cluster is slower here is not established. A
-1-byte RDMA ping-pong favours the X925 (top of page), so the cause is not raw
-link latency.
+the network wait; the next section has the cause.
 
 The binding follows the same rule. `bench/spark_two_node.exs b1` with the
 BEAM under `taskset -c 0-4,10-14` (`scripts/spark/remote.sh --little-cores`),
@@ -784,7 +785,38 @@ binding worker on its default cores, two sessions each:
 | **A725 cores** | 55.0, 55.1 | 2587, 2593 | **47.1, 46.6** |
 
 That is **+25% two-node decode** at no cost to prefill or single-node decode.
-**Run the client of a two-node setup on the A725 cores.**
+On the vendored llama.cpp, **run the client of a two-node setup on the A725
+cores.**
+
+### The cause, and a fix that makes pinning unnecessary
+
+Every RPC command the client sends is two thread handoffs. The calling thread
+queues it and blocks on a future. The RPC dispatcher thread wakes from its
+queue, does the network round trip, then wakes the caller. The dispatcher
+already busy-spins on its queue, but only while a `-sm tensor` communicator
+holds it. For a layer split, each handoff is a futex wake of an idle core,
+and a token takes several commands. On the X925 cores those wakes add up to
+the ~4 ms per token: removing them, below, recovers it. Why the A725 cores
+wake faster is not established.
+
+Branch `rpc-client-spin-wait` on `nyo16/llama.cpp` (also merged into
+`spark-all`) spins both sides whenever a command arrived in the last 100 ms:
+the dispatcher on its queue, and the caller on its future, up to 100 ms
+before blocking. An idle client still sleeps. With that client and the same
+unpatched worker:
+
+| client | `llama-bench` decode, before | after |
+|---|---|---|
+| X925 cores | 44.2–44.6 | **57.6** |
+| unpinned | 44.0–44.5 (one run in seven 53.2) | **57.4, 57.6** |
+| A725 cores | 53.5–54.0 | **57.3** |
+| single node | 59.0 | — |
+
+Prefill is unchanged (pp1024 2487–2513). Two-node decode now costs 2–3% against
+one node, wherever the client runs. Through the binding (`spark-all` vendored,
+BEAM unpinned, `b1`, two sessions), two-node decode is **50.6 and 50.8 tok/s**
+against 54.7 and 55.2 single-node, where the vendored build gives 37.4–38.5
+unpinned. Two-node prefill rises to 2731–2750 with the CUDA commits.
 
 ### RDMA versus TCP, and the 10 GbE LAN
 
