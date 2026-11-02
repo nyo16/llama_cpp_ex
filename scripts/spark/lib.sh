@@ -18,12 +18,18 @@ SPARK_NODES=(spark-1 spark-2)
 # a GID against the socket's local address, so one peer connection can only ever
 # use one link. Link 0 is the one everything uses; link 1 is listed so the fact
 # sheet can prove both trained.
+#
+# `lan` is the 10 GbE management NIC (enP7s7, MTU 1500, no RDMA-capable HCA on
+# that subnet). It exists only as the slow arm of a transport comparison: a
+# two-node run belongs on the fabric.
 spark_fabric_ip() {
   case "$1:${2:-0}" in
     spark-1:0) printf '10.100.64.1' ;;
     spark-1:1) printf '10.100.65.1' ;;
+    spark-1:lan) printf '10.0.20.26' ;;
     spark-2:0) printf '10.100.64.2' ;;
     spark-2:1) printf '10.100.65.2' ;;
+    spark-2:lan) printf '10.0.20.25' ;;
     *) return 1 ;;
   esac
 }

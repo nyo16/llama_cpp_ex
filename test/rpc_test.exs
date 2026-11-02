@@ -75,6 +75,39 @@ defmodule LlamaCppEx.RPCTest do
     test "ping/1 reports the same refusal" do
       assert RPC.ping("127.0.0.1:1") == {:error, expected_refusal()}
     end
+
+    test "a listener that is not an RPC worker is an error, never a crash" do
+      # Since llama.cpp #18626 upstream's own handshake aborts the process when
+      # the peer accepts and then answers wrongly, so this is the case the NIF's
+      # pre-flight HELLO exists for: one peer closes after reading the request,
+      # the other answers with bytes that are not a HELLO response.
+      for reply <- [:close, "HTTP/1.1 400 Bad Request\r\n\r\n"] do
+        {:ok, listen} = :gen_tcp.listen(0, [:binary, active: false, ip: {127, 0, 0, 1}])
+        {:ok, port} = :inet.port(listen)
+
+        acceptor =
+          Task.async(fn ->
+            {:ok, sock} = :gen_tcp.accept(listen, 10_000)
+            _ = :gen_tcp.recv(sock, 0, 5_000)
+            if is_binary(reply), do: :gen_tcp.send(sock, reply)
+            :gen_tcp.close(sock)
+          end)
+
+        endpoint = "127.0.0.1:#{port}"
+        assert RPC.add_server(endpoint) == {:error, expected_refusal()}
+
+        # A non-RPC build never connects, so nobody is accepted; do not wait.
+        if RPC.supported?(), do: Task.await(acceptor), else: Task.shutdown(acceptor, :brutal_kill)
+        :gen_tcp.close(listen)
+      end
+    end
+
+    test "an endpoint that is not host:port is an error, never a crash" do
+      # Upstream parses with std::stoi and GGML_ABORTs when that fails.
+      for endpoint <- ["no-port-here", "127.0.0.1:", "127.0.0.1:http"] do
+        assert RPC.add_server(endpoint) == {:error, expected_refusal()}
+      end
+    end
   end
 
   describe "add_servers/1" do
