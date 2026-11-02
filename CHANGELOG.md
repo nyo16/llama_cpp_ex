@@ -18,6 +18,13 @@ numbers behind the entries below.
   a DFlash checkpoint, or reads layers the target does not have, is refused
   with an error: upstream asserts on it. `n_draft` is clamped to the drafter's
   block size and `%MTP{}.n_draft` reports the clamped value.
+- `LlamaCppEx.Model.devices/1`: the devices a model's layers were placed on.
+  `MTP.init/2` uses it to refuse a DFlash/DSpark drafter that is not loaded on
+  every device the target uses — the drafter computes with the target's
+  embeddings and LM head, and a target split onto an RPC worker with the
+  drafter on `CUDA0` alone aborted the VM. Loaded with the target's
+  `:devices`, DFlash runs over a two-node split (Qwen3.8-27B NVFP4: 22.3
+  tok/s against 14.0 plain).
 
 ### Fixed
 

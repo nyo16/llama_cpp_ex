@@ -250,6 +250,14 @@ defmodule LlamaCppEx.Model do
   @spec n_layer_nextn(t()) :: non_neg_integer()
   def n_layer_nextn(%__MODULE__{ref: ref}), do: LlamaCppEx.NIF.model_n_layer_nextn(ref)
 
+  @doc """
+  Names of the devices the model's layers were placed on, in placement order —
+  e.g. `["CUDA0", "RPC0"]` for a model split across a local GPU and an RPC
+  worker. Empty for a CPU-only load.
+  """
+  @spec devices(t()) :: [String.t()]
+  def devices(%__MODULE__{ref: ref}), do: LlamaCppEx.NIF.model_devices(ref)
+
   @doc "Returns a human-readable description of the model."
   @spec desc(t()) :: String.t()
   def desc(%__MODULE__{ref: ref}), do: LlamaCppEx.NIF.model_desc(ref)

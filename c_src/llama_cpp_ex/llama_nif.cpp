@@ -1082,6 +1082,22 @@ int64_t model_n_layer_nextn(ErlNifEnv* env, fine::ResourcePtr<LlamaModel> model)
 }
 LLAMA_NIF(model_n_layer_nextn, 0);
 
+// Names of the devices the model's layers were placed on, in placement order.
+// LlamaCppEx.MTP uses it to refuse a DFlash drafter that cannot reach the
+// target's embeddings and LM head (shared via ctx_other): a draft context
+// without the device holding them hits "pre-allocated tensor ... in a buffer
+// that cannot run the operation", a GGML_ABORT.
+std::vector<std::string> model_devices(ErlNifEnv* env, fine::ResourcePtr<LlamaModel> model) {
+    std::vector<std::string> names;
+    const int32_t n = llama_model_n_devices(model->model);
+    for (int32_t i = 0; i < n; i++) {
+        ggml_backend_dev_t dev = llama_model_get_device(model->model, i);
+        if (dev) names.emplace_back(ggml_backend_dev_name(dev));
+    }
+    return names;
+}
+LLAMA_NIF(model_devices, 0);
+
 std::string model_desc(ErlNifEnv* env, fine::ResourcePtr<LlamaModel> model) {
     char buf[256];
     llama_model_desc(model->model, buf, sizeof(buf));

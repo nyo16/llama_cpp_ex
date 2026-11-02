@@ -350,6 +350,59 @@ case System.argv() do
       end
     end)
 
+    drafter =
+      System.get_env("SPARK_E2E_DFLASH") ||
+        Path.join(
+          home,
+          "models/z-lab/Qwen3.8-27B-DFlash2-GGUF/main/Qwen3.8-27B-DFlash2-Q4_K_M.gguf"
+        )
+
+    {:ok, target} =
+      LlamaCppEx.Model.load(big,
+        devices: ["CUDA0", "RPC0"],
+        split_mode: :layer,
+        tensor_split: [0.5, 0.5],
+        n_gpu_layers: -1
+      )
+
+    E2E.step("DFlash drafter on CUDA0 alone is refused, not aborted", fn ->
+      {:ok, local_only} = LlamaCppEx.Model.load(drafter, devices: ["CUDA0"], n_gpu_layers: -1)
+
+      case LlamaCppEx.MTP.init(target, type: :dflash, draft_model: local_only, n_ctx: 2048) do
+        {:error, msg} -> if msg =~ "RPC0", do: {:ok, "names RPC0"}, else: {:error, msg}
+        other -> {:error, inspect(other)}
+      end
+    end)
+
+    E2E.step("DFlash over the split target", fn ->
+      {:ok, d} =
+        LlamaCppEx.Model.load(drafter,
+          devices: ["CUDA0", "RPC0"],
+          split_mode: :layer,
+          tensor_split: [1.0, 0.0],
+          n_gpu_layers: -1
+        )
+
+      {:ok, spec} =
+        LlamaCppEx.MTP.init(target, type: :dflash, draft_model: d, n_draft: 7, n_ctx: 2048)
+
+      {:ok, prompt} =
+        LlamaCppEx.Chat.apply_template(
+          target,
+          [%{role: "user", content: "What is the capital of France? One word."}],
+          enable_thinking: false
+        )
+
+      {:ok, text} = LlamaCppEx.MTP.generate(spec, prompt, max_tokens: 8, temp: 0.0)
+      stats = LlamaCppEx.MTP.stats(spec)
+
+      if text =~ ~r/Paris/i,
+        do:
+          {:ok,
+           "#{inspect(String.trim(text))}, #{stats.drafts_accepted}/#{stats.drafts_generated} drafts"},
+        else: {:error, inspect(text)}
+    end)
+
     GenServer.stop(local)
     GenServer.stop(split)
 

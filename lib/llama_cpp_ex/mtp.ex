@@ -129,7 +129,11 @@ defmodule LlamaCppEx.MTP do
       * `:dspark` - a DSpark drafter (DFlash plus a Markov head), passed as
         `:draft_model`.
     * `:draft_model` - A separate `LlamaCppEx.Model` holding the drafter.
-      Required for `:dflash` and `:dspark`. For `:mtp` it is the sidecar head
+      Required for `:dflash` and `:dspark`, and loaded on every device the
+      target uses (`LlamaCppEx.Model.devices/1`): a DFlash drafter computes
+      with the target's embeddings and LM head. For a target split across an
+      RPC worker, load the drafter with the same `:devices` and a
+      `:tensor_split` that keeps its layers local. For `:mtp` it is the sidecar head
       for checkpoints that ship one rather than embedding it (Qwen 3.8:
       `Qwen3.8-27B-Q4_K_M.gguf` plus `mtp-Qwen3.8-27B-Q4_0.gguf`; Gemma4 E4B:
       a `gemma4` target plus a `gemma4-assistant` head), loaded with
@@ -167,8 +171,26 @@ defmodule LlamaCppEx.MTP do
   # Whether the drafter really is a DFlash checkpoint for this target is checked
   # in the NIF, where the model's target-layer metadata is readable: upstream's
   # constructor asserts on it, so it has to be refused before init.
-  defp validate_drafter(type, _target, %Model{} = draft) when type in [:dflash, :dspark],
-    do: {:ok, draft}
+  #
+  # The device check has to happen here, before the draft context exists. A
+  # DFlash drafter computes with the target's token embeddings and LM head
+  # (shared through ctx_other), so its context needs a backend for every device
+  # the target placed weights on. A target split onto an RPC worker with the
+  # drafter on CUDA0 alone aborted the VM with "pre-allocated tensor
+  # (output.weight) in a buffer (RPC0) that cannot run the operation".
+  defp validate_drafter(type, target, %Model{} = draft) when type in [:dflash, :dspark] do
+    case Model.devices(target) -- Model.devices(draft) do
+      [] ->
+        {:ok, draft}
+
+      missing ->
+        {:error,
+         "the drafter reads the target's embeddings and LM head, so it must be loaded " <>
+           "on every device the target uses; it is missing #{Enum.join(missing, ", ")}. " <>
+           "Load it with the target's :devices (a :tensor_split can still keep its " <>
+           "own layers on one of them)"}
+    end
+  end
 
   defp validate_drafter(type, _target, nil) when type in [:dflash, :dspark],
     do: {:error, "type: #{inspect(type)} needs the drafter GGUF passed as draft_model:"}
