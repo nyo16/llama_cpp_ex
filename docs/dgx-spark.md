@@ -431,7 +431,10 @@ so the KL divergence against upstream is 0.000000 with 100% same top token:
 | branch (src1 reuse + bias fusions) | **2209** | **2244** | **2147** | 58.02 |
 
 That is +8% prefill with decode unchanged. The full CUDA `test-backend-ops`
-suite passes on the branch (19246/19246).
+suite passes on the branch (19246/19246). Models with nothing to fuse stay
+level. On Qwen3.6-35B-A3B and Qwen3-30B-A3B (Q4_K_M), pp512 / pp2048 / tg128
+read 2956 / 2896 / 69.9 → 2940 / 2918 / 69.8 and 3288 / 3309 / 92.6 → 3302 /
+3353 / 92.6.
 
 ### Through the binding
 
