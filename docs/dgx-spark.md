@@ -395,6 +395,24 @@ compares the fused graphs against the CPU backend. It fails when the fold is
 deliberately off by 2× or the silu is dropped. None of these patches are in
 the vendored llama.cpp; all three are upstream candidates.
 
+## gpt-oss-120b prefill: the expert biases
+
+gpt-oss adds a per-expert bias after every expert projection: an `ADD_ID` after
+the up, gate and down `MUL_MAT_ID`s. Decode fuses these into MMVQ, but prefill
+made three passes over the `[n_ff, n_expert_used, n_tokens]` projections. That
+was 7% of pp2048 GPU time. A fourth commit on the same branch moves the
+up and gate biases into the GLU kernel and the down bias into the
+weighted expert reduction. It keeps the unfused order of float operations,
+so the KL divergence against upstream is 0.000000 with 100% same top token:
+
+| gpt-oss-120b, `llama-bench -fa 1 -r 5` | pp512 | pp2048 | pp8192 | tg128 |
+|---|---|---|---|---|
+| upstream | 2037 | 2080 | 1993 | 58.07 |
+| branch (src1 reuse + bias fusions) | **2209** | **2244** | **2147** | 58.02 |
+
+That is +8% prefill with decode unchanged. The full CUDA `test-backend-ops`
+suite passes on the branch (19246/19246).
+
 ## Speculative decoding: MTP, DFlash 2, DSpark
 
 256-token greedy chat completions (thinking off), four prompts run twice,
