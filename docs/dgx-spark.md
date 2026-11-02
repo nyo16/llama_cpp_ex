@@ -943,7 +943,7 @@ harness above, so acceptance is not comparable with the one-node table):
 | config | decode t/s | acceptance | `spark-all` client, upstream worker |
 |---|---|---|---|
 | plain | 14.02–14.03 | — | **14.79–14.81** |
-| MTP `n_draft: 3` | 17.7–19.7 | 50% | not run |
+| MTP `n_draft: 3` | 17.7–19.7 | 50% | **24.8** (53%) |
 | DFlash 2 `n_draft: 7` | **22.2–22.4** | 27% | **27.8–27.9** (29%) |
 
 DFlash still pays 1.6× across two nodes, and 1.9× with the RPC client fix. With
