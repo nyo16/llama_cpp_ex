@@ -841,8 +841,9 @@ wake faster is not established.
 Branch `rpc-client-spin-wait` on `nyo16/llama.cpp` (also merged into
 `spark-all`) spins both sides whenever a command arrived in the last 100 ms:
 the dispatcher on its queue, and the caller on its future, up to 100 ms
-before blocking. An idle client still sleeps. With that client and the same
-unpatched worker:
+before blocking. An idle client still sleeps. A `llama-server` holding an
+RPC-split model used 0 CPU ticks in the 10 s after a request, against 2
+unpatched. With that client and the same unpatched worker:
 
 | client | `llama-bench` decode, before | after |
 |---|---|---|
