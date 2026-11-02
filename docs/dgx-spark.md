@@ -5,6 +5,17 @@ across two nodes. Everything here is measured on the hardware rather than
 inferred from spec sheets; where a number differs from the marketing figure, the
 measurement wins and the reason is given.
 
+The work behind this page produced four llama.cpp branches on
+`nyo16/llama.cpp`, each based on `785322d17`, the vendored commit. None of them
+is in the vendored tree. A fifth, `spark-all`, merges all four.
+
+| branch | effect on GB10 | section |
+|---|---|---|
+| `cuda-mmq-src1-reuse` | NVFP4 prefill +19–20% (src1 reuse, weight-scale fold, SWIGLU in MMQ); gpt-oss-120b prefill +8% (expert biases) | Qwen3.8-27B NVFP4, gpt-oss-120b prefill |
+| `rpc-client-spin-wait` | two-node decode +30% unpinned (gpt-oss-120b 44 → 57.6 tok/s, single node 59) | The cause, and a fix |
+| `rpc-add-server-no-abort` | an unreachable worker returns an error instead of aborting | Five things, #1 |
+| `draft-ctx-other-devices` | DFlash with the target split over RPC | Speculative decoding across two nodes |
+
 ## The machine
 
 | | |
