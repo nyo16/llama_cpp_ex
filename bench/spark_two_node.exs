@@ -7,7 +7,7 @@ Code.require_file("helpers.exs", __DIR__)
 #     mix run bench/spark_two_node.exs <bench>
 #
 # --little-cores runs this client on the Cortex-A725 cores, where two-node decode
-# is ~25% faster than on the X925s an unpinned BEAM mostly lands on
+# is ~25% faster than in the band an unpinned BEAM usually lands in
 # (docs/dgx-spark.md, "Pin the client to the little cores").
 #
 # Benches, each answering one question:

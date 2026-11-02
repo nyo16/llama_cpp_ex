@@ -807,8 +807,8 @@ gpt-oss-120b over RDMA, upstream's worker restarted before every run, and
 | A725 | X925 | 53.1 |
 
 The client's cluster decides the band. With the client on the A725 cores,
-every run lands in the fast band. Leave it unpinned and the scheduler mostly
-puts it on the X925 cores, which is the slow band. llama-bench's own CPU
+every run lands in the fast band. Unpinned, 14 of 18 `llama-bench` runs landed
+in the slow band, the same band as X925 pinning. llama-bench's own CPU
 threads do not explain it: `--poll 0` and `-t 1` change nothing. On the
 worker, kernel times are identical in fast and slow sessions (`nsys`: 118 µs
 per expert matvec, 2.7 ms for the LM head), and the client's slow-band expert
