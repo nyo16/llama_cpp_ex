@@ -71,3 +71,14 @@ release problem.
 - A test-side `:telemetry.attach` filters on an identity the test owns
   (`%{server: ^server}`, a ref) and detaches in `on_exit`. A linked server can
   outlive its test and emit after replying.
+
+## RPC and performance
+
+- After a llama.cpp bump, run the default `mix test` on an `LLAMA_RPC=1` build
+  too (a DGX Spark has one): CI never builds RPC, and upstream's registration
+  started aborting on a dead endpoint without any test noticing (#18626).
+- Do not override an upstream default with a binding default that looks
+  equivalent. `Model.load/2` leaves the load mode `auto` unless the caller
+  sets a flag; a forced `mmap` cost ~15% decode on GB10.
+- On a DGX Spark a decode figure is one sample: a load can land ~17% slow for
+  its lifetime. Re-run in a fresh process before comparing.
