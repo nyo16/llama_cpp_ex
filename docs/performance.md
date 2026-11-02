@@ -276,17 +276,20 @@ Additional options when loading models:
 ```elixir
 {:ok, model} = LlamaCppEx.load_model("model.gguf",
   n_gpu_layers: -1,       # Offload all layers to GPU
-  use_mmap: true,          # Memory-map file (default, faster loading)
-  use_mlock: true,         # Pin in RAM (prevent swapping); implies use_mmap
+  use_mmap: true,          # Memory-map the file (unset: llama.cpp decides)
+  use_mlock: true,         # Pin in RAM (prevent swapping)
   use_direct_io: false,    # Bypass page cache
   check_tensors: true      # Validate tensor data (debugging)
 )
 ```
 
 These three flags resolve to llama.cpp's single `load_mode` enum, with
-`use_direct_io` > `use_mlock` > `use_mmap` precedence (`dio`, `mlock`, `mmap`,
-or `none` when all are false). Only one mode is ever active, so combining them
-is not additive.
+`use_direct_io` > `use_mlock` > `use_mmap` precedence (`dio`, `mmap_mlock` or
+`mlock`, `mmap`, `none`). Only one mode is ever active, so combining them is
+not additive. With none of them given the mode is upstream's `auto`, which
+memory-maps except on integrated GPUs, where it reads the file instead; on
+DGX Spark's GB10 that is worth ~15% of decode on large models against a forced
+`use_mmap: true`. Leave them unset unless you have a reason.
 
 ## Complete Optimization Example
 

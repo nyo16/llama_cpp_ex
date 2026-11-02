@@ -56,10 +56,10 @@ cache=1
 # legitimately holds tens of GB of weights, so an absolute default would be
 # either useless or a footgun; this catches the leak, not the workload.
 rss_fraction=0.92
-# Force the TCP path. There is no runtime switch for the transport: selection is
-# silent auto-negotiation, and GGML_RDMA_DEV pointing at a device that does not
-# exist is the only lever short of a -DGGML_RPC_RDMA=OFF build. Both ends have
-# to agree, so pass --tcp here and GGML_RDMA_DEV to the client too.
+# Force the TCP path with GGML_RPC_NO_RDMA, upstream's runtime switch: a peer
+# with it set advertises no RDMA capability in the HELLO, so the connection
+# stays on TCP whatever the other end can do. Setting it on the worker alone is
+# enough; the client can set it too.
 tcp=0
 # `logs` takes a bare line count.
 lines=100
@@ -137,7 +137,7 @@ exec taskset -c $SPARK_BIG_CORES mix run scripts/spark/rpc_worker.exs"
     # trees coexist and switching back is a cache hit.
     printf 'export LLAMA_RPC=1\n'
     [ "$debug" -eq 1 ] && printf 'export GGML_RPC_DEBUG=1\n'
-    [ "$tcp" -eq 1 ] && printf 'export GGML_RDMA_DEV=no-such-hca\n'
+    [ "$tcp" -eq 1 ] && printf 'export GGML_RPC_NO_RDMA=1\n'
     printf 'cd "$HOME/%s"\n' "$SPARK_REMOTE_DIR"
     printf '%s\n' "$inner"
   )

@@ -30,6 +30,32 @@ defmodule LlamaCppEx.MTPTest do
     end
   end
 
+  describe "init/2 :type validation" do
+    @unloaded %LlamaCppEx.Model{ref: nil, load_mtp: true}
+
+    test "a DFlash or DSpark drafter must be passed as :draft_model" do
+      # Without one there is nothing to build the draft context from; the MTP
+      # fallback (draft context against the target) would hand upstream's DFlash
+      # constructor a model with no target layers, which it asserts on.
+      for type <- [:dflash, :dspark] do
+        assert {:error, message} = MTP.init(@unloaded, type: type)
+        assert message =~ "draft_model"
+      end
+    end
+
+    test "the drafter must be a Model" do
+      assert {:error, message} = MTP.init(@unloaded, type: :dflash, draft_model: "/path.gguf")
+      assert message =~ "must be a LlamaCppEx.Model"
+    end
+
+    test "an unknown type is refused before any context exists" do
+      for type <- [:eagle3, "dflash", nil] do
+        assert {:error, message} = MTP.init(@unloaded, type: type)
+        assert message =~ ":type must be :mtp, :dflash or :dspark"
+      end
+    end
+  end
+
   describe "init/2 requires a model loaded with load_mtp: true" do
     # Regression test for a silent break: upstream #26296 made the MTP head's
     # tensors opt-in at load time via a flag defaulting to false. Nothing on the

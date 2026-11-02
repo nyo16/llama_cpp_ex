@@ -24,9 +24,10 @@ defmodule LlamaCppEx.RPC do
 
       LLAMA_RPC=1 LLAMA_BACKEND=cuda mix compile
 
-  On Linux the transport auto-negotiates RDMA when both peers have a usable HCA,
-  which is a build-time choice (`LLAMA_RPC_RDMA`, default on) with no runtime
-  switch. See `LlamaCppEx.RPC.Server` for how to tell which transport you got.
+  On Linux the transport auto-negotiates RDMA when both peers have a usable HCA
+  (`LLAMA_RPC_RDMA`, default on). Setting `GGML_RPC_NO_RDMA` in either peer's
+  environment keeps that peer on TCP. See `LlamaCppEx.RPC.Server` for how to
+  tell which transport you got.
 
   > #### A peer failure kills the VM {: .error}
   >
@@ -38,11 +39,14 @@ defmodule LlamaCppEx.RPC do
   > to catch.
   >
   > Registration is the exception and the reason this module is shaped the way it
-  > is: an unreachable endpoint is reported as `{:error, :unreachable}` rather
-  > than aborting, so a two-node setup can be *checked* before a model load and
-  > is only *fatal* during one. Check with `ping/1` before you load; treat the VM
-  > as the unit of restart afterwards. Real fault isolation would mean running
-  > the RPC client in a separate OS process, which is a different architecture.
+  > is. Upstream's registration aborts too (since llama.cpp #18626), so
+  > `add_server/1` first connects and exchanges the protocol HELLO itself: an
+  > unreachable or incompatible endpoint is reported as `{:error, :unreachable}`
+  > rather than aborting, so a two-node setup can be *checked* before a model
+  > load and is only *fatal* during one. Check with `ping/1` before you load;
+  > treat the VM as the unit of restart afterwards. Real fault isolation would
+  > mean running the RPC client in a separate OS process, which is a different
+  > architecture.
 
   ## Two device orderings, and they disagree
 
@@ -96,7 +100,8 @@ defmodule LlamaCppEx.RPC do
 
   Returns the number of devices the endpoint contributed. Idempotent: upstream
   memoizes the registration per endpoint, so registering the same endpoint twice
-  succeeds and reports `0` added the second time.
+  succeeds and reports `0` added the second time. Every call still connects and
+  exchanges the HELLO first, with a 5-second timeout.
 
   Must be called **before** `LlamaCppEx.Model.load/2`, because tensor placement
   is computed from the devices that exist at load time.
@@ -107,11 +112,12 @@ defmodule LlamaCppEx.RPC do
   ## Errors
 
     * `{:error, :rpc_unsupported}` — the NIF was built without `LLAMA_RPC=1`.
-    * `{:error, :unreachable}` — nothing answered, or the peer's RPC protocol
-      major/minor did not match ours. Upstream collapses both to a null
-      registration, and a null registration is silently ignored by
-      `ggml_backend_register`, so this check is the only thing standing between
-      you and a model that quietly loads onto the wrong devices.
+    * `{:error, :unreachable}` — nothing answered within 5 seconds, the
+      endpoint is not `host:port`, the peer's RPC protocol major/minor did not
+      match ours, or the worker reported no devices. Upstream aborts the VM on
+      the first three, and silently ignores the last one at registration, so
+      this check is the only thing standing between you and a crash or a model
+      that quietly loads onto the wrong devices.
   """
   @spec add_server(endpoint()) :: {:ok, non_neg_integer()} | {:error, error()}
   def add_server(endpoint) when is_binary(endpoint) do
@@ -160,13 +166,13 @@ defmodule LlamaCppEx.RPC do
   Reports whether an endpoint is reachable and speaks a compatible protocol.
 
   This is `add_server/1` under a name that says what it is good for. It has the
-  same side effect — a reachable endpoint stays registered — and it is **not** a
-  health check you can repeat to monitor a peer: the answer is memoized after the
-  first success, and once a model is loaded a dead peer aborts the VM rather than
-  failing a probe.
+  same side effect — a reachable endpoint stays registered. Each call connects
+  and exchanges the HELLO again, so it does report a peer that has gone away
+  since registering; but once a model is loaded a dead peer aborts the VM on
+  the next RPC command, before any probe gets a say.
 
-  Use it once, before loading, to turn "the model landed on the wrong devices"
-  into a clear error.
+  Use it before loading, to turn "the model landed on the wrong devices" or a
+  VM abort into a clear error.
   """
   @spec ping(endpoint()) :: :ok | {:error, error()}
   def ping(endpoint) when is_binary(endpoint) do

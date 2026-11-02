@@ -3,8 +3,12 @@ Code.require_file("helpers.exs", __DIR__)
 # Two-node measurement suite for a pair of DGX Sparks.
 #
 #   scripts/spark/rpc-worker.sh start spark-2
-#   scripts/spark/remote.sh --env MIX_ENV=bench --env LLAMA_RPC=1 spark-1 \
+#   scripts/spark/remote.sh --little-cores --env MIX_ENV=bench --env LLAMA_RPC=1 spark-1 \
 #     mix run bench/spark_two_node.exs <bench>
+#
+# --little-cores runs this client on the Cortex-A725 cores, where two-node decode
+# is ~25% faster than in the band an unpinned BEAM usually lands in
+# (docs/dgx-spark.md, "Pin the client to the little cores").
 #
 # Benches, each answering one question:
 #
@@ -15,10 +19,12 @@ Code.require_file("helpers.exs", __DIR__)
 #   b2   The actual point. A model that does NOT fit one node: two-node RPC
 #        versus single-node paging weights off NVMe. This is the number that
 #        justifies the second Spark, and it is allowed to come out negative.
-#   b3   RDMA versus TCP, in tokens. There is no runtime switch, so TCP is
-#        forced with GGML_RDMA_DEV set to a device that does not exist.
-#   b4   Batching amortisation. Per-token RTT is fixed per *graph*, not per
-#        token, so n_parallel should amortise it. Measure, do not assume.
+#   b3   RDMA versus TCP, in tokens. One run per transport; see the b3 clause
+#        for the worker flags (`--tcp` sets GGML_RPC_NO_RDMA, `--link lan`).
+#
+#   Concurrency across two nodes is bench/spark_overhead.exs with
+#   SPARK_RPC_ENDPOINT set: it runs N streams at once, which a slot count alone
+#   does not.
 #
 # Every run reports worker RSS before and after: upstream's worker is reported
 # to grow and never release, and RSS is a column here rather than an afterthought.
@@ -248,12 +254,12 @@ case which do
   "b1" ->
     # Controlled: the model fits one node, so anything the second node costs is
     # pure RPC overhead rather than a memory benefit.
-    path = models["120b"]
+    path = System.get_env("SPARK_TWO_NODE_MODEL") || models["120b"]
     File.exists?(path) || raise "missing #{path}"
 
     single =
       TwoNode.measure(
-        "120b single-node",
+        "#{Path.basename(path, ".gguf")} single-node",
         path,
         [n_parallel: 1, n_ctx: n_ctx, cache_prompt: false],
         prompt_tokens,
@@ -265,7 +271,7 @@ case which do
 
     two =
       TwoNode.measure(
-        "120b two-node 50/50",
+        "#{Path.basename(path, ".gguf")} two-node 50/50",
         path,
         [
           n_parallel: 1,
@@ -339,18 +345,19 @@ case which do
     TwoNode.table(single ++ [two])
 
   "b3" ->
-    # Transport A/B. Run this twice: once normally, once with the worker AND this
-    # process started under GGML_RDMA_DEV=nonexistent. There is no runtime
-    # switch — that variable and a -DGGML_RPC_RDMA=OFF build are the only levers.
-    path = models["120b"]
+    # Transport A/B. Run once per transport: normally (RDMA on the fabric), with
+    # GGML_RPC_NO_RDMA=1 set on the worker (`rpc-worker.sh start --tcp`) for TCP
+    # over the same 200 GbE link, and with the worker on the 10 GbE LAN
+    # (`--link lan`) for the management network. SPARK_TRANSPORT labels the row.
+    path = System.get_env("SPARK_TWO_NODE_MODEL") || models["120b"]
     register.()
     {local, remote} = device_names.()
 
-    transport = if System.get_env("GGML_RDMA_DEV") in [nil, ""], do: "RDMA", else: "TCP (forced)"
+    transport = System.get_env("SPARK_TRANSPORT") || "RDMA"
 
     row =
       TwoNode.measure(
-        "120b two-node over #{transport}",
+        "#{Path.basename(path, ".gguf")} two-node over #{transport}",
         path,
         [
           n_parallel: 1,
@@ -366,34 +373,7 @@ case which do
 
     TwoNode.table([row])
 
-  "b4" ->
-    # Per-token RTT is fixed per graph, not per token, so a bigger batch should
-    # amortise it.
-    path = models["120b"]
-    register.()
-    {local, remote} = device_names.()
-
-    rows =
-      for n_parallel <- [1, 4, 8] do
-        TwoNode.measure(
-          "120b two-node n_parallel=#{n_parallel}",
-          path,
-          [
-            n_parallel: n_parallel,
-            n_ctx: n_ctx * n_parallel,
-            cache_prompt: false,
-            devices: [local, remote],
-            split_mode: :layer,
-            tensor_split: [0.5, 0.5]
-          ],
-          prompt_tokens,
-          worker_node
-        )
-      end
-
-    TwoNode.table(rows)
-
   other ->
-    IO.puts(:stderr, "unknown bench #{inspect(other)}; expected b1, b2, b3 or b4")
+    IO.puts(:stderr, "unknown bench #{inspect(other)}; expected b1, b2 or b3")
     System.halt(2)
 end

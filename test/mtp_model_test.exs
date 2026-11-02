@@ -305,10 +305,18 @@ defmodule LlamaCppEx.MTPSidecarTest do
   end
 
   # A hybrid target (Qwen 3.8: SSM layers beside attention ones) cannot roll back
-  # part of a sequence natively, so the loop snapshots the recurrent state every
-  # iteration. That cost is the difference between speculation paying off and not,
-  # so it gets its own bucket rather than hiding inside :other.
-  test "timing_us reports a ckpt bucket", %{session: session} do
+  # part of a sequence from its KV cache alone. init/2 gives it one recurrent
+  # snapshot per draft position, as upstream's server does, so a rejected draft
+  # rolls back natively. Without them the loop saves the recurrent state every
+  # iteration and re-decodes the accepted prefix on every partial accept, which
+  # measured 21 tok/s against 27 at n_draft 2 on Qwen3.8-27B NVFP4 — the :ckpt
+  # bucket is where that path would show.
+  test "a hybrid target rolls back on recurrent snapshots, not checkpoints", %{
+    session: session
+  } do
+    assert LlamaCppEx.Context.n_rs_seq(session.main_ctx) == session.n_draft
+    assert LlamaCppEx.Context.n_rs_seq(session.mtp_ctx) == 0
+
     assert {:ok, _} = MTP.generate(session, "Count to ten:", max_tokens: 24, temp: 0.0)
 
     timing = MTP.stats(session).timing_us
@@ -317,8 +325,7 @@ defmodule LlamaCppEx.MTPSidecarTest do
       assert Map.has_key?(timing, key), "timing_us is missing #{inspect(key)}"
     end
 
-    assert timing.ckpt > 0,
-           "a hybrid target should have paid for at least one recurrent-state snapshot"
+    assert timing.ckpt == 0, "the loop fell back to recurrent-state checkpoints"
 
     # The named buckets are carved out of total, never billed twice on top of it.
     assert timing.draft + timing.verify + timing.sample + timing.ckpt <= timing.total
@@ -344,6 +351,88 @@ defmodule LlamaCppEx.MTPSidecarTest do
     assert {:ok, plain} = LlamaCppEx.generate(target, prompt, opts ++ [n_ctx: 2048])
 
     assert spec == plain
+  end
+end
+
+defmodule LlamaCppEx.DFlashTest do
+  # DFlash block-diffusion drafting through the same session API, type: :dflash.
+  # The drafter is a separate `dflash`-architecture GGUF trained against one
+  # target: it reads that target's hidden states at fixed layer indices.
+  #
+  #   LLAMA_SMOKE_DFLASH_MODEL=/path/to/Qwen3.8-27B-Q4_K_M.gguf \
+  #   LLAMA_SMOKE_DFLASH_DRAFT_MODEL=/path/to/Qwen3.8-27B-DFlash2-Q4_K_M.gguf \
+  #     mix test --include dflash
+  #
+  # async: false and one session for the module, as for the MTP modules above.
+  use ExUnit.Case, async: false
+
+  alias LlamaCppEx.MTP
+
+  @moduletag :dflash
+  @moduletag timeout: 300_000
+
+  setup_all do
+    :ok = LlamaCppEx.init()
+
+    {:ok, target} =
+      LlamaCppEx.load_model(LlamaCppEx.TestModels.path!(:dflash), n_gpu_layers: -1)
+
+    {:ok, draft} =
+      LlamaCppEx.load_model(LlamaCppEx.TestModels.path!(:dflash_draft), n_gpu_layers: -1)
+
+    # Ask for more than any DFlash block holds, to see it clamped.
+    {:ok, session} = MTP.init(target, type: :dflash, draft_model: draft, n_ctx: 2048, n_draft: 64)
+
+    %{target: target, draft: draft, session: session}
+  end
+
+  test "n_draft is clamped to the drafter's block size", %{session: session} do
+    # The loop sizes its verify batch from this; asking upstream for more than
+    # the block holds would draft nothing past it.
+    assert session.n_draft < 64
+    assert session.n_draft == MTP.stats(session).n_draft
+  end
+
+  test "generate/3 drafts and the target accepts some of it", %{session: session} do
+    before = MTP.stats(session)
+
+    assert {:ok, text} =
+             MTP.generate(session, "List the days of the week, comma separated:",
+               max_tokens: 32,
+               temp: 0.0
+             )
+
+    assert text =~ "Monday"
+
+    now = MTP.stats(session)
+    assert now.drafts_generated > before.drafts_generated
+
+    assert now.drafts_accepted > before.drafts_accepted,
+           "no draft accepted: the drafter is not seeing the target's hidden states"
+  end
+
+  test "greedy output matches plain greedy decode on the target", %{
+    target: target,
+    session: session
+  } do
+    # Short, for the near-tie reason MTPSidecarTest gives.
+    prompt = "The capital of France is"
+    opts = [max_tokens: 8, temp: 0.0]
+
+    assert {:ok, spec} = MTP.generate(session, prompt, opts)
+    assert {:ok, plain} = LlamaCppEx.generate(target, prompt, opts ++ [n_ctx: 2048])
+    assert spec == plain
+  end
+
+  test "a model that is not a DFlash drafter is refused, not aborted", %{target: target} do
+    # Upstream's constructor GGML_ASSERTs on a drafter with no target layers.
+    assert {:error, message} = MTP.init(target, type: :dflash, draft_model: target, n_ctx: 512)
+    assert message =~ "not a DFlash/DSpark drafter"
+  end
+
+  test "the drafter cannot stand in for an MTP head", %{target: target, draft: draft} do
+    assert {:error, message} = MTP.init(target, draft_model: draft, n_ctx: 512)
+    assert message =~ "load_mtp: true"
   end
 end
 
@@ -442,8 +531,8 @@ defmodule LlamaCppEx.MTPE4BSidecarTest do
     assert now.tokens_emitted > before.tokens_emitted
   end
 
-  # E4B is dense, not hybrid — ckpt stays 0. The Qwen sidecar test pins
-  # ckpt > 0 for the hybrid case.
+  # E4B is dense, not hybrid — ckpt stays 0. The Qwen sidecar test pins that a
+  # hybrid target stays off the checkpoint path too.
   test "timing_us reports the expected buckets", %{target: target, session: session} do
     {:ok, prompt} =
       LlamaCppEx.Chat.apply_template(target, [%{role: "user", content: "Count to ten:"}],

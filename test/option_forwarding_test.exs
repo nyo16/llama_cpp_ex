@@ -235,6 +235,29 @@ defmodule LlamaCppEx.OptionForwardingTest do
         assert key in Model.tuning_option_keys()
       end
     end
+
+    test "load-mode flags resolve to llama.cpp's enum, auto when none is given" do
+      # Values from llama.h's llama_load_mode. Unset must stay AUTO: upstream
+      # then skips mmap on an integrated GPU (#26081), and a forced mmap on GB10
+      # left most loads decoding ~15% slower.
+      auto = -1
+      none = 0
+      mmap = 1
+      mlock = 2
+      mmap_mlock = 3
+      dio = 4
+
+      assert Model.resolve_load_mode(nil, false, false) == auto
+      assert Model.resolve_load_mode(true, false, false) == mmap
+      assert Model.resolve_load_mode(false, false, false) == none
+      assert Model.resolve_load_mode(nil, true, false) == mmap_mlock
+      assert Model.resolve_load_mode(true, true, false) == mmap_mlock
+      assert Model.resolve_load_mode(false, true, false) == mlock
+
+      for use_mmap <- [nil, true, false], use_mlock <- [true, false] do
+        assert Model.resolve_load_mode(use_mmap, use_mlock, true) == dio
+      end
+    end
   end
 
   describe "callers do not keep their own copies" do

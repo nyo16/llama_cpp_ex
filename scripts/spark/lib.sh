@@ -18,12 +18,18 @@ SPARK_NODES=(spark-1 spark-2)
 # a GID against the socket's local address, so one peer connection can only ever
 # use one link. Link 0 is the one everything uses; link 1 is listed so the fact
 # sheet can prove both trained.
+#
+# `lan` is the 10 GbE management NIC (enP7s7, MTU 1500, no RDMA-capable HCA on
+# that subnet). It exists only as the slow arm of a transport comparison: a
+# two-node run belongs on the fabric.
 spark_fabric_ip() {
   case "$1:${2:-0}" in
     spark-1:0) printf '10.100.64.1' ;;
     spark-1:1) printf '10.100.65.1' ;;
+    spark-1:lan) printf '10.0.20.26' ;;
     spark-2:0) printf '10.100.64.2' ;;
     spark-2:1) printf '10.100.65.2' ;;
+    spark-2:lan) printf '10.0.20.25' ;;
     *) return 1 ;;
   esac
 }
@@ -55,9 +61,11 @@ SPARK_TOOLCHAIN_DONOR="${SPARK_TOOLCHAIN_DONOR:-spark-1}"
 # --- CPU topology ------------------------------------------------------------
 
 # The clusters are INTERLEAVED. X925 (performance) is 5-9,15-19 and A725
-# (efficiency) is 0-4,10-14, so the obvious `taskset -c 0-9` pins a job entirely
-# to little cores. Measured: 1-byte RDMA ping-pong p50 21.5 us on cpu19 versus
-# 29.1 us on cpu0.
+# (efficiency) is 0-4,10-14, so the obvious `taskset -c 0-9` gets five of each.
+# Measured: 1-byte RDMA ping-pong p50 21.5 us on cpu19 versus 29.1 us on cpu0 --
+# yet a two-node *client* decodes ~25% faster on the A725 cores (gpt-oss-120b,
+# 37-38 -> 47 tok/s through the binding; docs/dgx-spark.md, "Pin the client to
+# the little cores"). remote.sh --little-cores does that.
 SPARK_BIG_CORES="5-9,15-19"
 SPARK_LITTLE_CORES="0-4,10-14"
 SPARK_BIG_CORE_COUNT=10

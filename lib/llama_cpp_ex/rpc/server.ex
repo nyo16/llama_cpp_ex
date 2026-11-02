@@ -30,11 +30,12 @@ defmodule LlamaCppEx.RPC.Server do
 
   ## Which transport did I get?
 
-  Transport selection is silent auto-negotiation. There is no env var, no
-  endpoint scheme and no return value that tells you. The only signal is the
-  worker's own log with `GGML_RPC_DEBUG=1`: the absence of
-  `RDMA activate failed, staying on TCP` means RDMA is live. To force TCP for an
-  A/B, set `GGML_RDMA_DEV` to a device name that does not exist.
+  Transport selection is auto-negotiation in the HELLO, with no endpoint scheme
+  and no return value that tells you. The signal is the worker's own log with
+  `GGML_RPC_DEBUG=1`: `RDMA activated` means RDMA is live, `RDMA activate
+  failed, staying on TCP` means it is not. To force TCP for an A/B, set
+  `GGML_RPC_NO_RDMA=1` in the worker's environment (or the client's): a peer
+  with it set advertises no RDMA capability, so the connection stays on TCP.
 
   ## This process cannot stop the server
 

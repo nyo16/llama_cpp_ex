@@ -5,6 +5,17 @@ across two nodes. Everything here is measured on the hardware rather than
 inferred from spec sheets; where a number differs from the marketing figure, the
 measurement wins and the reason is given.
 
+The work behind this page produced four llama.cpp branches on
+`nyo16/llama.cpp`, each based on `785322d17`, the vendored commit. None of them
+is in the vendored tree. A fifth, `spark-all`, merges all four.
+
+| branch | effect on GB10 | section |
+|---|---|---|
+| `cuda-mmq-src1-reuse` | NVFP4 prefill +19–20% (src1 reuse, weight-scale fold, SWIGLU in MMQ); gpt-oss-120b prefill +8% (expert biases) | Qwen3.8-27B NVFP4, gpt-oss-120b prefill |
+| `rpc-client-spin-wait` | two-node decode +30% unpinned (gpt-oss-120b 44 → 57.6 tok/s, single node 59) | The cause, and a fix |
+| `rpc-add-server-no-abort` | an unreachable worker returns an error instead of aborting | Five things, #1 |
+| `draft-ctx-other-devices` | DFlash with the target split over RPC | Speculative decoding across two nodes |
+
 ## The machine
 
 | | |
@@ -25,9 +36,10 @@ Use `free -h`. `LlamaCppEx.devices/0` reports it correctly (130.7 GB total on
 `:igpu` for the same reason.
 
 **The CPU clusters are interleaved.** The performance cores are **5-9, 15-19**;
-the efficiency cores are **0-4, 10-14**. `taskset -c 0-9` therefore pins a job
-entirely to little cores. Measured on a 1-byte RDMA ping-pong: p50 21.5 µs on
-cpu19 versus 29.1 µs on cpu0.
+the efficiency cores are **0-4, 10-14**. `taskset -c 0-9` therefore gives a job
+five of each, not the X925 cluster. Measured on a 1-byte RDMA ping-pong: p50
+21.5 µs on cpu19 versus 29.1 µs on cpu0. Even so, a two-node *client* decodes
+25% faster on the A725 cores (see "Pin the client to the little cores").
 
 **`ping` lies by three orders of magnitude.** ICMP RTT over the 200 Gb/s direct
 link reads ~1.2 ms. That is cpuidle exit latency (LPI-3 is 433 µs), not the wire
@@ -138,7 +150,7 @@ LLAMA_CUDA_ARCH=121a-real \
 
 `remote.sh` exports all three, so on a Spark this is just `mix compile`.
 
-### Why `LLAMA_CPU_ARM_ARCH` is not optional
+### Why `LLAMA_CPU_ARM_ARCH` matters, and when it does not
 
 ggml probes the host with `-mcpu=native` when `GGML_NATIVE` is on, which is the
 default. On GB10 with GCC 13.3 that probe **fails silently**: the compiler
@@ -153,6 +165,21 @@ Measured on the emitted `libggml-cpu.a`:
 | `-march=armv9.2-a+dotprod+i8mm+fp16+bf16+sve2` | 1134 | 370 | 10678 operands |
 
 Those are the Q4/Q8 quantized matmul kernels.
+
+They run only when the CPU does the math: CPU-only builds, `n_gpu_layers`
+below the layer count, MoE experts kept on the CPU. With every layer on the
+GPU the flag changes nothing measurable. A fresh project depending on the
+published package (no `LLAMA_*` variables, so `-mcpu=native`, CUDA picked up
+as `121a-real` automatically) against this repo's tuned build, Qwen3.6-35B-A3B
+fully offloaded on spark-2, median of 5:
+
+| build | TTFT, ~2k-token prompt | decode |
+|---|---|---|
+| `{:llama_cpp_ex, "0.8.66"}` from Hex, defaults | 698.0 ms | 66.78 tok/s |
+| `LLAMA_CPU_ARM_ARCH` + `LLAMA_CUDA_ARCH` | 702.8 ms | 66.49 tok/s |
+
+So a Hex user on a Spark gets full GPU speed with no flags; set them for
+CPU-side work.
 
 ### Why `LLAMA_CUDA_ARCH` must accompany it
 
@@ -234,19 +261,36 @@ clean A/B for what speculative decoding buys on this hardware. See
 
 ## Running on ONE Spark
 
-Full numbers and methodology in
-`bench/results/v0.8.43-dgx-spark-baseline.md`, and the two-node numbers in
-`bench/results/v0.8.43-dgx-spark-two-node.md`.
-The short version:
+Measured at `785322d17` with every layer on the GPU. Prefill and the
+single-stream decode reference are `llama-bench` (`-fa 1`, median of 3);
+the rest is the binding through `bench/spark_overhead.exs` — `stream` is
+`LlamaCppEx.stream/3`, the others `LlamaCppEx.Server` with that many
+concurrent streams (per-stream decode, then aggregate):
 
-| model | prefill (pp) | decode (tg) |
-|---|---|---|
-| Qwen3-8B Q4_K_M | 3500–4331 t/s | 40.5 t/s |
-| Qwen3-30B-A3B Q4_K_M | 3287 t/s | 90.9 t/s |
+| model | size | pp512 | pp4096 | tg128 (upstream) | `stream` | server ×1 | server ×4 | server ×8 |
+|---|---|---|---|---|---|---|---|---|
+| Qwen3-8B Q4_K_M | 4.7 GiB | 3623 | 3500 | 43.9 | 44.1 | 43.7 | 39.0 / **153** | 36.4 / **284** |
+| Qwen3-30B-A3B Q4_K_M | 17.3 GiB | 3282 | 3198 | 92.7 | 91.4 | 88.6 | 57.8 / **224** | 34.9 / **272** |
+| Qwen3.6-35B-A3B UD-Q4_K_M | 20.6 GiB | 2918 | 2823 | 69.8 | 68.3 | 63.0 | 43.0 / **165** | 31.5 / **245** |
+| Qwen3.8-27B Q4_K_M | 17.7 GiB | 1004 | 1008 | 11.3 | 11.3 | 11.2 | 9.9 / **39** | 8.4 / **66** |
+| Qwen3.8-27B NVFP4 MID-HIGH | 15.7 GiB | 1278 | 1275 | 14.4 | 14.3 | 14.3 | 12.2 / **48** | 10.0 / **78** |
+| gpt-oss-120b MXFP4 | 59.0 GiB | 1923 | 1990 | 49.2–59.0 | 57.0 | 55.9 | 23.8 / **91** | 13.5 / **105** |
 
-Three of the four figures beat the published single-Spark references; the fourth
-is 7% under. **Prefill is this machine's strong suit** and decode is bandwidth-
-bound, so quote them separately or you describe neither.
+**Prefill is this machine's strong suit** and decode is bandwidth-bound, so
+quote them separately or you describe neither. The dense models scale almost
+linearly with concurrency (8 streams of Qwen3-8B cost 17% per stream for 6.4×
+the aggregate); the MoE models scale less, because each additional stream
+activates different experts and the step reads more weight. The binding's
+single-stream decode is within 2% of `llama-bench` everywhere.
+
+> #### Measure decode more than once per load {: .warning}
+>
+> gpt-oss-120b's `llama-bench` tg128 came out at 49.2 in one run of a
+> six-model sweep and 58.8–59.0 in fourteen others; the same ~17% dip
+> appeared per process, with no change in clocks, page cache or memory
+> fragmentation that would explain it. Forcing `mmap` made it the common
+> case (see the load-mode row below). Treat any single decode figure on
+> this machine as one sample.
 
 ### Settings that matter
 
@@ -265,10 +309,11 @@ And the settings that do **not** matter, each of which looks like it should:
 |---|---|
 | `flash_attn` | leave `:auto` — it is already on, and `:disabled` costs 24% of prefill |
 | `type_k` / `type_v` | leave f16. Quantizing the KV cache **loses** 2–7% and buys nothing: there is no separate VRAM to free |
-| `use_mlock`, `use_direct_io` | leave off. Both cost 3–4%; "pinned in RAM" and "resident on the GPU" are the same DRAM here |
+| `use_mmap`, `use_mlock`, `use_direct_io` | **leave all three unset.** Upstream's `auto` then reads the file instead of mapping it on this iGPU. A forced `use_mmap: true` — the binding's default before this run — left most gpt-oss-120b loads decoding at 48.5 tok/s against 57 with `auto`, `use_mmap: false` or `use_direct_io: true`; about one forced-mmap load in five came out fast, so single-load comparisons from before (this row used to say mlock and dio cost 3–4%) are not reliable |
 | `n_batch`, `n_ubatch` | no measurable effect; the default is fine |
+| `GGML_CUDA_GRAPH_OPT=1` (env) | upstream's experimental concurrent-stream graph optimisation: **+2%** decode on gpt-oss-120b (60.1 against 59.0, three runs each), neutral on Qwen3-8B, Qwen3.6-35B-A3B and Qwen3.8-27B NVFP4 |
 | cpuidle / `idle=poll` | **no effect**, single-node or two-node. See below |
-| `taskset -c 5-9,15-19` | hygiene, not speed. But never use `-c 0-9` — those are the little cores |
+| `taskset` | single node: hygiene, not speed. Two nodes: run the **client** on the A725 cores, `taskset -c 0-4,10-14`, for **+25% decode** (see "Pin the client to the little cores"). Note `-c 0-9` is half little cores, not the X925s |
 
 ### The cpuidle story, and why you can ignore it
 
@@ -285,80 +330,197 @@ C-state and there is no exit latency to avoid.
 **So do not go asking for `idle=poll` on the kernel cmdline.** It was the one
 thing this work expected to need root for, and the measurement retired it.
 
-## Qwen3.6 and speculative decoding (MTP)
+## The binding costs nothing measurable
 
-Two shapes of the current generation, each measured with and without the
-Multi-Token Prediction head. The MTP repos are the *same weights* plus the head,
-so this is a clean A/B rather than a comparison across quantizations.
+Same model, same llama.cpp commit (`785322d17`), upstream's own tools against
+`bench/spark_overhead.exs`. Qwen3-8B Q4_K_M, 128 greedy tokens, decode timed
+from the first token to the last:
 
-256-token greedy generations through the chat template, **median of 5** with the
-range alongside. Five samples matter here: MTP is the noisier arm, and a single
-run per setting is not enough to tell a real 1.6× from a lucky draw. The plain
-model is freed before the MTP arm runs — leaving ~20 GB of unrelated weights
-resident cost the MTP arm about 10% on this unified-memory part, which is
-exactly the kind of confound that flips a conclusion.
+| path | streams | upstream | llama_cpp_ex |
+|---|---|---|---|
+| single stream (`llama-bench` tg128 / `LlamaCppEx.stream/3`) | 1 | 44.0 tok/s | 43.5 tok/s |
+| server (`llama-server -np 8` / `Server`, `n_parallel: 8`) | 8 | 286 tok/s aggregate | 286 tok/s aggregate |
 
-### Qwen3.6-27B Q4_K_M — dense
+`llama-batched-bench` reaches 311 tok/s at 8 streams because it never samples:
+every server has to wait for the logits, sample on the CPU and submit the next
+step, and that serial dependency is the 8%. Upstream's `--backend-sampling`
+(sampling on the GPU) measured within 1% of CPU sampling here, so it is not
+exposed. Tuning on this machine is therefore model and drafter choice, not the
+binding.
 
-| config | decode t/s | range | vs baseline | acceptance |
+The same holds for MoE decode. gpt-oss-120b, 256 greedy tokens, five fresh
+processes: `LlamaCppEx.stream/3` gives 57.0–57.3 tok/s with the default load
+mode, `use_mmap: false` or `use_direct_io: true` alike, against 57.8 for
+`llama-bench` tg256. (Under `nsys --cuda-graph-trace=node` the binding drops
+to 55.5–55.9 and its expert matvecs read 123 µs against `llama-bench`'s 118 µs.
+That gap is the profiler's, so do not compare kernel times across processes
+profiled this way.)
+
+## Qwen3.8-27B NVFP4
+
+`esatapedico/Qwen3.8-27B-NVFP4-MTP-GGUF`, `MID-HIGH` tier: every attention and
+FFN weight in native NVFP4 (GGML type 40), Q8_0 heads, the MTP head embedded.
+Against the Q4_K_M build of the same model, `llama-bench`:
+
+| | size | pp512 | pp2048 | tg128 |
 |---|---|---|---|---|
-| no MTP head | 11.59 | 11.5–11.6 | — | — |
-| MTP `n_draft: 1` | 16.88 | 16.9–16.9 | 1.46× | 86.9% |
-| MTP `n_draft: 2` | 18.38 | 18.2–18.4 | 1.59× | 76.4% |
-| **MTP `n_draft: 3`** | **18.65** | 18.4–18.7 | **1.61×** | 68.2% |
-| MTP `n_draft: 4` | 17.42 | 17.3–17.5 | 1.50× | 57.1% |
+| Q4_K_M | 17.7 GiB | 1015 | 1023 | 11.21 |
+| NVFP4 MID-HIGH | 15.7 GiB | 1236 | 1265 | **14.19** |
 
-No range overlaps the baseline: **MTP is worth 1.6× on the dense model**, and
-`n_draft` 2 and 3 are within noise of each other.
+NVFP4 is +22% prefill and +27% decode. Decode reads 15.7 GiB per token at
+14.2 tok/s — 240 GB/s, 88% of GB10's 273 GB/s — so it is bandwidth-bound and
+there is little left to take from the kernels. Prefill runs W4A4 on the
+Blackwell FP4 MMA (`mma.sync ... kind::mxf4nvf4`); an `nsys` profile of pp2048
+puts 53% of GPU time in that matmul, 9% in activation quantization and ~23% in
+element-wise ops (SwiGLU, gating muls, adds, the GDN conv-state concat).
 
-### Qwen3.6-35B-A3B UD-Q4_K_M — MoE
+Part of that 9% is waste: projections that read the same activations (Q/K/V,
+gate/up, the GDN input projections) quantize them once each — 4450
+`quantize_mmq_nvfp4` launches for a 2048-token prefill. Branch
+`cuda-mmq-src1-reuse` on `nyo16/llama.cpp` keeps the last quantized MMQ
+input and reuses it until something overwrites the source: 2540 launches,
+**+2–2.6% prefill** on Qwen3.8-27B NVFP4 (1279 → 1312 tok/s at pp512), +0.5–1%
+on the Q4_K models, perplexity bit-identical.
 
-| config | decode t/s | range | vs baseline | acceptance |
+The per-tensor NVFP4 weight scale is the next cheap win. llama.cpp builds each
+NVFP4 projection as `mul(mul_mat(w, x), w_s)` with a scalar `w_s`. Decode
+(MMVQ) already fuses that multiply, but batched MMQ runs it as a separate
+broadcast kernel over the output: 224 launches and ~14% of pp512 GPU time. The
+second commit on the same branch folds `w_s` into the per-token activation
+scale that the NVFP4 write-back already applies.
+
+The third commit removes the SWIGLU output. An FFN down projection reads
+`swiglu(gate, up)`, the widest activation in the model, which the GLU kernel
+writes and the quantizer then reads twice. The fused quantizer reads `gate` and
+`up` and quantizes `silu(gate) * up` directly. It uses the same expression as
+the GLU kernel, so the quantized blocks are bit-identical. It needs 512 threads
+per row: at the stock 128 the fused kernel is latency-bound and gains nothing.
+
+| `llama-bench -fa 1` | pp512 | pp2048 | pp8192 | tg128 |
 |---|---|---|---|---|
-| no MTP head | 65.36 | 65.1–65.8 | — | — |
-| MTP `n_draft: 1` | 67.56 | 67.0–67.7 | 1.03× | 81.0% |
-| MTP `n_draft: 2` | 62.29 | 61.4–62.3 | 0.95× | 67.2% |
-| MTP `n_draft: 3` | 63.28 | 63.0–63.5 | 0.97× | 64.9% |
-| MTP `n_draft: 4` | 47.66 | 44.8–48.6 | 0.73× | 40.9% |
+| Qwen3.8-27B NVFP4, upstream | 1284 | 1297 | 1250 | 14.35 |
+| + src1 reuse + scale fold | 1411 | 1422 | 1373 | 14.31 |
+| + SWIGLU quantized in MMQ | **1541** | **1552** | **1488** | 14.30 |
+| Qwen3-8B Q4_K_M, upstream | 3577 | 3565 | 3214 | 43.97 |
+| + src1 reuse (no NVFP4 fusions apply) | 3626 | 3611 | 3237 | 44.07 |
 
-Essentially neutral at best, and a loss past `n_draft: 1`.
+Together, the three commits give **+19–20% NVFP4 prefill**, with decode
+unchanged. Only the scale fold changes numerics, because it moves where the
+scale is rounded in. Over 8×512 tokens, its KL divergence against upstream is
+0.051. Upstream's native FP4 path differs from itself by about the same amount
+(0.052) when only `-ub 256` changes. With Q8 activations
+(`GGML_CUDA_MMQ_PREC=q8`), the divergence is 0.0007. The SWIGLU fusion leaves
+it at exactly 0.050913. The new `test-backend-ops` case, `MUL_MAT_SCALE`,
+compares the fused graphs against the CPU backend. It fails when the fold is
+deliberately off by 2× or the silu is dropped. None of these patches are in
+the vendored llama.cpp; all three are upstream candidates.
 
-> The README reports **+16%** at `n_draft: 2` for Qwen3.6-35B-A3B on GB10, from
-> an interleaved n=11 run on **UD-Q4_K_XL**. This measurement is UD-Q4_K_**M**,
-> and the draft acceptance rates agree closely (67.2% here versus 68.5% there at
-> `n_draft: 2`) while the throughput economics do not. Take the quantization as
-> the likely difference and measure your own before relying on either number.
+## gpt-oss-120b prefill: the expert biases
 
-### The rule this gives you
+gpt-oss adds a per-expert bias after every expert projection: an `ADD_ID` after
+the up, gate and down `MUL_MAT_ID`s. Decode fuses these into MMVQ, but prefill
+made three passes over the `[n_ff, n_expert_used, n_tokens]` projections. That
+was 7% of pp2048 GPU time. A fourth commit on the same branch moves the
+up and gate biases into the GLU kernel and the down bias into the
+weighted expert reduction. It keeps the unfused order of float operations,
+so the KL divergence against upstream is 0.000000 with 100% same top token:
 
-**MTP pays on dense models and roughly breaks even on sparse MoE.** The mechanism
-is the one that makes this chip interesting: speculative decoding spends compute
-(a batched verification pass) to save memory bandwidth (sequential decode steps).
-On the dense 27B every token reads all 27B of weights, so that trade is strongly
-favourable — 1.6×. On the 35B-A3B only ~3B parameters move per token, decode is
-already cheap, and the draft-and-verify overhead eats the gain.
+| gpt-oss-120b, `llama-bench -fa 1 -r 5` | pp512 | pp2048 | pp8192 | tg128 |
+|---|---|---|---|---|
+| upstream | 2037 | 2080 | 1993 | 58.07 |
+| branch (src1 reuse + bias fusions) | **2209** | **2244** | **2147** | 58.02 |
 
-Two more things the numbers say:
+That is +8% prefill with decode unchanged. The full CUDA `test-backend-ops`
+suite passes on the branch (19246/19246). Models with nothing to fuse stay
+level. On Qwen3.6-35B-A3B and Qwen3-30B-A3B (Q4_K_M), pp512 / pp2048 / tg128
+read 2956 / 2896 / 69.9 → 2940 / 2918 / 69.8 and 3288 / 3309 / 92.6 → 3302 /
+3353 / 92.6.
 
-- **The best `n_draft` is model-shaped, so measure it.** On the dense model 3 is
-  best and 2 is within noise; on the MoE anything above 1 loses. There is no
-  single default that transfers, which is also the README's conclusion for
-  Metal.
-- **Acceptance decays fast with draft depth** — 87% → 76% → 68% → 57% on the
-  dense model — so past the sweet spot you pay twice: wasted draft compute and a
-  longer verification batch.
+### Through the binding
 
-```elixir
-{:ok, model} = LlamaCppEx.Model.load(mtp_path, n_gpu_layers: 99, load_mtp: true)
-{:ok, session} = LlamaCppEx.MTP.init(model, n_draft: 3, n_ctx: 4096)
-{:ok, text} = LlamaCppEx.MTP.generate(session, prompt, max_tokens: 256)
-```
+`nyo16/llama.cpp` branch `spark-all` is `785322d17`, the vendored commit, plus
+these four CUDA commits, the `draft-ctx-other-devices` and
+`rpc-add-server-no-abort` fixes, and the RPC client spin
+(`rpc-client-spin-wait`, see the two-node section). The prefill numbers below
+predate the RPC commit, which does not touch single-node runs. To test it,
+copy the checkout on spark-1 and replace `vendor/llama.cpp` with the branch
+tree. Then remove the
+`_build/*/lib/llama_cpp_ex/obj/llama_build-*` directories and run
+`mix compile`. In that build, `Context.decode/2` of a 2048-token prompt
+(`n_ubatch: 512`, flash attention, median of 5) gives:
 
-Reproduce:
+| | vendored | `spark-all` |
+|---|---|---|
+| Qwen3.8-27B NVFP4 | 1304 tok/s | **1560 tok/s** (+20%) |
+| gpt-oss-120b MXFP4 | 2352 tok/s | **2583 tok/s** (+10%) |
+
+`scripts/spark/e2e.exs` passes 12/12 on that build, both `single` and `two-node`. So do the test
+suite's `smoke`, `embeddings`, `tools` and `decision` tags (602 tests), `mtp` and
+`dflash` (458), `rpc_live` against a worker, `vm_exit_test.exs`, and
+`rpc_check.exs` over the fabric (VM exit 0). `embed_batch matches per-text
+embed` used to fail on CUDA with bge-small-en-v1.5 Q8_0, on the vendored tree
+as well: batched and per-text embeddings differed by up to 0.0027 per element
+against a 0.001 bound tuned on CPU, because a batch runs different kernels.
+The test now compares cosine similarity (> 0.999; CUDA gives 0.99988, swapped
+rows 0.41–0.70, the wrong pooling ≤ 0.93) and passes on CUDA with bge-small,
+embeddinggemma and Qwen3-Embedding, and on CPU. Speculative
+decoding on Qwen3.8-27B NVFP4 (`bench/spark_spec.exs`) runs at plain 14.3, MTP
+`n_draft: 2` 26.5 and DFlash 2 `n_draft: 7` 45.9 tok/s, against 14.3 / 26.8 /
+44.2 vendored. No source change in the binding is needed for the swap, but a
+release would have to vendor the branch or wait for upstream.
+
+## Speculative decoding: MTP, DFlash 2, DSpark
+
+256-token greedy chat completions (thinking off), four prompts run twice,
+median decode rate. Upstream is `llama-server` with `--spec-type`; the binding
+is `LlamaCppEx.MTP` (`bench/spark_spec.exs`):
+
+| Qwen3.8-27B NVFP4 | upstream | llama_cpp_ex | acceptance |
+|---|---|---|---|
+| plain | 14.17 | 14.28 | — |
+| MTP `n_draft: 1` | 21.22 | — | 83% |
+| MTP `n_draft: 2` | 27.27 | 26.76 | 76% |
+| MTP `n_draft: 3` | 29.16 | 28.63 | 65% |
+| MTP `n_draft: 4` | 29.71 | — | 56% |
+| DSpark `n_draft: 7` | 25.74 | — | 22% |
+| **DFlash 2 `n_draft: 7`** | **46.60** | **44.22** | 42% |
+
+DFlash 2 (`z-lab/Qwen3.8-27B-DFlash2-GGUF`, a 1.1 GB drafter) is **3.1×**
+plain, against 2.0× for the checkpoint's own MTP head. Its `n_draft` is capped
+at the drafter's block size minus one; asking for 10 measured the same as 7.
+DSpark (`magnitudedev/Qwen3.8-27B-DSpark-GGUF`) lost to MTP here.
+
+| Qwen3.6-35B-A3B UD-Q4_K_M (MoE) | llama_cpp_ex | vs plain | acceptance |
+|---|---|---|---|
+| plain | 68.27 | — | — |
+| MTP `n_draft: 1` | 86.86 | 1.27× | 86% |
+| MTP `n_draft: 2` | **96.69** | **1.42×** | 77% |
+| MTP `n_draft: 3` | 91.58 | 1.34× | 66% |
+
+Speculation spends compute (a wider verify) to save bandwidth (fewer
+sequential decodes), and this chip has compute to spare: it pays on the dense
+model and still pays on the MoE, where only ~3B parameters move per token, but
+the MoE's optimum is narrower.
+
+> #### Earlier numbers on this page were held down by the binding {: .info}
+>
+> Before this run the MoE measured *neutral* (0.95–1.03×) and the dense 27B
+> 1.6×. Both models are hybrid (GDN layers beside attention), and the binding
+> rolled a rejected draft back by saving the whole recurrent state every
+> iteration, then restoring it and re-decoding the accepted prefix on every
+> partial accept. Upstream's server instead gives the target context one
+> recurrent snapshot per draft position (`n_rs_seq`) and rolls back natively;
+> `LlamaCppEx.MTP.init/2` now does the same. Qwen3.8-27B NVFP4 at
+> `n_draft: 2` went from 21.1 to 26.8 tok/s.
+
+Greedy speculative output is not byte-identical to plain greedy decode over 256
+tokens, and that holds for upstream too: `llama-server` with DFlash 2 or MTP
+diverges from its own plain run on two of the four prompts, where the verify
+batch's wider matmul rounds a near-tie the other way.
 
 ```bash
 scripts/spark/remote.sh --env MIX_ENV=bench --big-cores spark-1 \
-  mix run bench/spark_mtp.exs <plain.gguf> <mtp.gguf>
+  mix run bench/spark_spec.exs <target.gguf> plain mtp:2 dflash:7:<drafter.gguf>
 ```
 
 > #### Qwen3.6 instruct checkpoints need the chat template {: .warning}
@@ -382,13 +544,18 @@ than the marketing:
 
 - **Capacity: yes.** A model that does not fit in 130 GB runs. Nothing else on
   this pair will run it at all.
-- **Speed: no, but also not the loss you would expect.** Pipeline parallelism is
-  *disabled* whenever an RPC device participates — the RPC backend reports
-  `async = false, events = false` and llama.cpp checks that before enabling
-  pipelining — so the two nodes execute **sequentially**. For a model that fits
-  on one node, the second node measured within a few percent either way
-  (see B1 below), because the sequential penalty and the halved per-node
-  bandwidth pressure roughly cancel.
+- **Speed: prefill yes, decode roughly even.** Since llama.cpp #18626, the RPC
+  backend implements async compute and events, so llama.cpp enables
+  **pipeline parallelism** across an RPC split. It used to refuse, and the
+  nodes ran one after the other. A prompt's micro-batches now overlap across
+  the two nodes: prefill measured **+18–26%** for gpt-oss-120b and +22% for
+  Qwen3.8-27B NVFP4 against one node. A single decode stream has nothing to
+  overlap. On the vendored llama.cpp, it pays thread wake-ups in the RPC
+  client on every command. For gpt-oss-120b, that costs 8% through
+  `llama-bench` and ~15% through the binding with the client on the A725
+  cores, and 25–30% left unpinned. With the RPC client fix on `spark-all`, it
+  costs 2–3%, and the dense NVFP4 model decodes faster on two nodes than on
+  one (see the control below).
 - **Tensor parallelism ("tp=2"): technically yes, practically no.** It runs and
   it is correct, and it is 2.7× slower on decode. See the verdict section.
 
@@ -485,6 +652,14 @@ wrong devices" into `{:error, :unreachable}`. After the load, treat the VM as th
 unit of restart. Real fault isolation means putting the RPC client in a separate
 OS process, which is a different architecture.
 
+Upstream's registration aborts too since #18626 — an unreachable endpoint, a
+listener that is not an RPC worker, a version mismatch and a malformed
+`host:port` all reach `GGML_ABORT` in `rpc_dispatcher::start`. So the NIF
+connects and exchanges the protocol HELLO itself before registering, with a
+5-second timeout. That is what keeps `ping/1` a check rather than a crash on
+this llama.cpp; the matching upstream fix is branch `rpc-add-server-no-abort`
+on `nyo16/llama.cpp`.
+
 ### 2. `devices/0` order is NOT `tensor_split` order
 
 Two device lists exist and they disagree:
@@ -554,17 +729,23 @@ This is load-bearing, not hygiene.
 ### The headline: a model that does not fit on one node
 
 Qwen3-235B-A22B Q4_K_M, **142.1 GB** of weights against 130.0 GB of unified
-memory per node. 512-token prompt, 32 decode steps.
+memory per node. 32 decode steps.
 
-| run | load s | TTFT ms | prefill t/s | decode t/s | worker RSS |
-|---|---|---|---|---|---|
-| single-node, mmap overflow | — | — | — | — | **global OOM, killed `avahi-daemon`** |
-| two-node 50/50, RDMA | 538.4 | 1281.9 | 423.5 | **13.69** | 344 → 580 MiB |
+| run | prompt | load s | TTFT ms | prefill t/s | decode t/s | worker RSS |
+|---|---|---|---|---|---|---|
+| single-node, mmap overflow | — | — | — | — | — | **global OOM, killed `avahi-daemon`** |
+| two-node 50/50, RDMA, b10362 (sequential) | 512 | 538.4 | 1281.9 | 423.5 | 13.69 | 344 → 580 MiB |
+| two-node 50/50, RDMA, `785322d17` (pipelined) | 1024 | 575.2 | 1432.5 | **760.3** | 11.67 | 348 → 628 MiB |
 
 There is no percentage to quote here, and that is the point: on one Spark this
 model does not run slowly, it takes the machine's memory out from under the OOM
-killer. On two it runs at **13.7 tokens/s**, which is a usable interactive speed
-for a 235B model.
+killer. On two it runs at **12–14 tokens/s**, which is a usable interactive speed
+for a 235B model, and with pipelining its prefill is 1.8× what it was. (The
+decode gap between the two rows is the client wake-up band described under
+the control below.) Through `llama-bench` (`-p 512 -n 64`, upstream worker
+restarted per run), the vendored client decodes at 13.35 tok/s and the
+`spark-all` client with the RPC fix at **14.27**, with the same pp512 (475,
+479).
 
 The cold load is nine minutes, because ~71 GB of weights cross the fabric. Budget
 for it, keep the worker's tensor cache on, and do not restart casually.
@@ -575,43 +756,176 @@ for it, keep the worker's tensor cache on, and do not restart casually.
 ### The control: a model that does fit
 
 gpt-oss-120b MXFP4 (63.4 GB — fits one node, so this isolates RPC cost from
-memory benefit), 1024-token prompt, 64 decode steps.
+memory benefit) at `785322d17`, after the load-mode fix. Binding rows:
+`bench/spark_two_node.exs`, 1024-token prompt, 128 decode steps, median of 7,
+two sessions each. Upstream rows: `llama-bench --rpc ... -dev CUDA0/RPC0`
+against the same worker.
 
 | run | load s | TTFT ms | prefill t/s | decode t/s |
 |---|---|---|---|---|
-| single-node | 64.8 | 563.6 | 1889.0 | 46.50 |
-| two-node 50/50, RDMA | 151.3 | 590.4 | 1797.6 | **48.14** |
+| single node | 30–52 | 491–495 | 2151–2168 | 53.3–53.8 |
+| two nodes 50/50, RDMA | 105–112 | 418–429 | 2552–2614 | 36.2–37.6 |
+| `llama-bench`, single node | — | — | 2046 (pp1024) | 58.8–59.0 |
+| `llama-bench`, two nodes, fresh worker | — | — | 2460 (pp1024) | 50.4, 41.5, 50.5 (three clients in a row) |
 
-Decode came out **+3.5% on two nodes** for a model that fits on one. That is not
-what "the nodes run sequentially" predicts, and it is worth understanding before
-reading too much into it: splitting halves each node's per-token weight traffic,
-and on a bandwidth-bound part that relief roughly cancels the sequential
-penalty. Repeat runs put both configurations in the 45–49 t/s band, so the
-honest summary is **"no material difference"**, not "two nodes are faster".
+**Prefill is 18–26% faster on two nodes** and TTFT ~14% lower: with the RPC
+backend async (#18626), llama.cpp pipelines the prompt's micro-batches across
+the nodes, where it used to run them one node after the other. **Decode is
+slower** — a single stream has nothing to overlap and pays a network round
+trip per token on top of the same total compute: 14% at best through
+`llama-bench`, ~30% through the binding's server, with the client unpinned.
+The spread on the two-node rows (one worker served three `llama-bench` clients
+in a row at 50.4, 41.5 and 50.5 tok/s) was not the worker's, as this page used
+to say. It comes from which cluster the *client* runs on, and pinning it
+removes most of the decode cost; see the next section.
 
-Load time is the real cost: **2.3× worse cold**, because ~30 GB of weights cross
-the network. The worker's content-addressed tensor cache (`-c`, on by default in
-`rpc-worker.sh`) took a warm load from 151 s to 139 s — much less than hoped,
-because the client still reads and hashes every tensor locally to check the
-cache; only the transfer is skipped.
+The worker binary matters less than that. `LlamaCppEx.stream/3` over
+two nodes, three fresh contexts per session, worker restarted between
+sessions: this library's `LlamaCppEx.RPC.Server` decoded at 38–48 tok/s
+(sessions at ~38 and ~38/47), upstream's `ggml-rpc-server`
+(`rpc-worker.sh --upstream`) at 40–51 (~50 and ~40). Both fall into the same
+two bands.
 
-### RDMA versus TCP
+Load time is still the cost — 2–3× one node — because ~30 GB of weights
+cross the network and the client still reads and hashes every tensor to check
+the worker's cache.
 
-There is no runtime switch. Transport selection is silent auto-negotiation with
-no env var and no endpoint scheme; the only levers are `GGML_RDMA_DEV` pointing
-at a device that does not exist, or a `LLAMA_RPC_RDMA=0` build.
+### Pin the client to the little cores
 
-| transport | TTFT ms | prefill t/s | decode t/s |
+Two-node decode lands in one of two bands, ~44 or ~53 tok/s through
+`llama-bench`, and the client's CPU cluster picks the band. The setup was
+gpt-oss-120b over RDMA, upstream's worker restarted before every run, and
+`llama-bench -dev CUDA0/RPC0 -n 128 -r 3`. Single-node is 59:
+
+| worker on | client on | decode t/s |
+|---|---|---|
+| X925 `5-9,15-19` | X925 `5-9,15-19` | 44.2, 44.5, 44.6, 44.1 |
+| X925 | unpinned | 44.3, 53.2 (and ~44 in five more unpinned runs) |
+| A725 `0-4,10-14` | unpinned | 44.0, 44.5 |
+| X925 | **A725 `0-4,10-14`** | **54.0, 54.0, 53.9** |
+| A725 | **A725** | **53.5** |
+| A725 | X925 | 53.1 |
+
+The client's cluster decides the band. With the client on the A725 cores,
+every run lands in the fast band. Unpinned, 14 of 18 `llama-bench` runs landed
+in the slow band, the same band as X925 pinning. llama-bench's own CPU
+threads do not explain it: `--poll 0` and `-t 1` change nothing. On the
+worker, kernel times are identical in fast and slow sessions (`nsys`: 118 µs
+per expert matvec, 2.7 ms for the LM head), and the client's slow-band expert
+matvecs run at the same 118 µs. The extra ~4 ms per token is spent on the CPU
+and in the network wait; the next section has the cause.
+
+The binding follows the same rule. `bench/spark_two_node.exs b1` with the
+BEAM under `taskset -c 0-4,10-14` (`scripts/spark/remote.sh --little-cores`),
+binding worker on its default cores, two sessions each:
+
+| client BEAM | single-node decode | two-node prefill | two-node decode |
 |---|---|---|---|
-| RDMA | 595.7 | 1784.0 | 46.05 |
-| TCP (forced) | 805.8 | 1310.5 | 40.90 |
-| | **+35%** | **−27%** | **−11%** |
+| unpinned | 54.1, 55.0 | 2597, 2599 | 37.4, 38.5 |
+| **A725 cores** | 55.0, 55.1 | 2587, 2593 | **47.1, 46.6** |
 
-So RDMA is worth real tokens, and if RDMA ever wedges (upstream issue #24813,
-closed as stale one week before our pinned commit), TCP is a working fallback
-that costs about a tenth of decode.
+That is **+25% two-node decode** at no cost to prefill or single-node decode.
+On the vendored llama.cpp, **run the client of a two-node setup on the A725
+cores.**
 
-To confirm which one you got, there is exactly one signal — the worker's log with
+### The cause, and a fix that makes pinning unnecessary
+
+Every RPC command the client sends is two thread handoffs. The calling thread
+queues it and blocks on a future. The RPC dispatcher thread wakes from its
+queue, does the network round trip, then wakes the caller. The dispatcher
+already busy-spins on its queue, but only while a `-sm tensor` communicator
+holds it. For a layer split, each handoff is a futex wake of an idle core,
+and a token takes several commands. On the X925 cores those wakes add up to
+the ~4 ms per token: removing them, below, recovers it. Why the A725 cores
+wake faster is not established.
+
+Branch `rpc-client-spin-wait` on `nyo16/llama.cpp` (also merged into
+`spark-all`) spins both sides whenever a command arrived in the last 100 ms:
+the dispatcher on its queue, and the caller on its future, up to 100 ms
+before blocking. An idle client still sleeps. A `llama-server` holding an
+RPC-split model used 0 CPU ticks in the 10 s after a request, against 2
+unpatched. The cost is paid while generating. On a 512-token gpt-oss-120b
+completion over two nodes, `llama-server` used 1.99 cores on average against
+0.89 unpatched, and decoded at 55.7 tok/s against 48.4. That is one extra core
+for +15%. Both spins are needed. With an X925 client, `llama-bench` decodes at
+44.2 with neither, 52.4 with the dispatcher spin only, 54.1 with the caller
+spin only and 57.5 with both. A 30-minute soak of `llama-server` on that
+client (`-np 4`, six concurrent clients, random 16/64/256-token completions,
+gpt-oss-120b over RDMA) served 1419 completions and 146k tokens with no
+errors, and exited 0. Upstream's worker grew from 332 to 1565 MiB RSS over it.
+The same through the binding (`spark-all` vendored, `LlamaCppEx.Server` with
+`n_parallel: 4`, six concurrent callers, 20 minutes) served 892 completions
+with no errors, and the VM exited 0.
+With that client and the same unpatched worker:
+
+| client | `llama-bench` decode, before | after |
+|---|---|---|
+| X925 cores | 44.2–44.6 | **57.6** |
+| unpinned | 42.3–44.5 (4 of 18 runs at 52–53) | **57.4, 57.6** |
+| A725 cores | 53.5–54.0 | **57.3** |
+| single node | 59.0 | — |
+
+Prefill is unchanged (pp1024 2487–2513). Two-node decode now costs 2–3% against
+one node, wherever the client runs. Through the binding (`spark-all` vendored,
+BEAM unpinned, `b1`, two sessions), two-node decode is **50.6 and 50.8 tok/s**
+against 54.7 and 55.2 single-node, where the vendored build gives 37.4–38.5
+unpinned. Two-node prefill rises to 2731–2750 with the CUDA commits.
+
+On the dense model, a two-node split no longer costs any decode. For
+Qwen3.8-27B NVFP4 (`llama-bench -p 512 -n 128`, RDMA, fresh upstream worker),
+the unpatched client decodes at 13.86 tok/s over two nodes. `spark-all`
+decodes at **14.85**, against 14.35 on one node. pp512 is a single
+micro-batch, so it does not pipeline, and it stays below one node: 1370
+against 1539.
+
+With the wake-ups gone, the transport becomes visible again. With the
+`spark-all` client and gpt-oss-120b, decode is **57.6 tok/s over RDMA, 53.0 over
+TCP on the same 200 GbE link, and 51.8 over the 10 GbE LAN**. The next
+section's "no measurable difference" result was measured under the ~4 ms
+wake-up cost, which hid the transport.
+
+With the client fixed, the worker binary shows up. Against the same patched
+`llama-bench` client, this library's `LlamaCppEx.RPC.Server` decodes at
+53.8–54.0 and upstream's `ggml-rpc-server` at 57.6, four restarts each. The
+binding client gives the same split: 50.6–50.8 against 53.9. Both workers run
+the same server code from the same tree and build flags. Several things change
+nothing: BEAM scheduler flags (`+sbwt none`, `+S 1:1`), no super carriers
+(`+MMscs 0 +MMmcs 0`), running the worker on the A725 cores instead of the
+X925s, and an explicit `-ts 1/1` split (53.7 against 57.4), which rules out the
+layers moving with a different free-memory report. The server thread's context
+switches and CPU time match the upstream worker's (1032 / 199 / 25.9 s against
+1036 / 190 / 25.2 s over a 256-token run). GPU clocks are the same in both,
+2411 MHz. Kernel times under `nsys` do
+not settle it, because profiling slows the BEAM process more than a bare
+binary (one-node section). The cause is not established. For the last 7% of
+two-node decode, run `rpc-worker.sh --upstream`.
+
+### RDMA versus TCP, and the 10 GbE LAN
+
+`GGML_RPC_NO_RDMA=1` on either peer keeps the connection on TCP
+(`rpc-worker.sh start spark-2 --tcp`); `--link lan` binds the worker to the
+10 GbE management NIC instead of the fabric. Same 120b model and harness,
+worker restarted with its tensor cache off for every run so every byte crosses
+the link, two sessions per transport:
+
+| transport | load s | TTFT ms | prefill t/s | decode t/s |
+|---|---|---|---|---|
+| RDMA, 200 GbE fabric | 105–112 | 418–429 | 2552–2614 | 36.2–37.6 |
+| TCP, 200 GbE fabric | 89–91 | 419–422 | 2593–2615 | 36.9–37.6 |
+| TCP, 10 GbE LAN | 76–77 | 422–429 | 2540–2585 | 38.8–39.1 |
+
+**On the vendored llama.cpp, you lose nothing measurable without RDMA**, and
+nothing on the 10 GbE LAN either. TTFT, prefill and decode overlap across the
+three transports. Load time did not favour RDMA either: the LAN was quickest in
+this session, and RDMA loaded in 54 s in an earlier one. So load time is
+dominated by the client reading and hashing the file, not by the wire.
+Per-token traffic across a layer split is one activation row. The −27%
+prefill / −11% decode TCP penalty measured at b10362 is gone. **That changes
+once the RPC client's wake-ups are fixed** (previous section): decode then
+reads 57.6 over RDMA, 53.0 over TCP on the fabric and 51.8 on the LAN. Leave
+RDMA on. A TCP fallback, even over the LAN, is still not a cliff.
+
+To confirm which one you got, look at the worker's log with
 `GGML_RPC_DEBUG=1`:
 
 ```bash
@@ -621,19 +935,58 @@ scripts/spark/rpc-worker.sh logs spark-2 200 | grep -E 'RDMA|transport'
 # RDMA activated: qpn=33437->33437 mtu=4096 rx_depth=24
 ```
 
-`RDMA activate failed, staying on TCP` is the line that means you are measuring
-the slow path.
+`RDMA activate failed, staying on TCP`, or no `RDMA activated` line at all, is
+TCP.
+
+### Speculative decoding across two nodes
+
+Qwen3.8-27B NVFP4 split 50/50 over the fabric, one 256-token greedy chat
+completion, three runs each through `LlamaCppEx.MTP` (not the four-prompt
+harness above, so acceptance is not comparable with the one-node table):
+
+| config | decode t/s | acceptance | `spark-all` client, upstream worker |
+|---|---|---|---|
+| plain | 14.02–14.03 | — | **14.79–14.81** |
+| MTP `n_draft: 3` | 17.7–19.7 | 50% | **24.8** (53%) |
+| DFlash 2 `n_draft: 7` | **22.2–22.4** | 27% | **27.8–27.9** (29%) |
+
+DFlash still pays 1.6× across two nodes, and 1.9× with the RPC client fix. With
+the fix, plain decode over two nodes beats one node's 14.3. The drafter must be
+loaded on every device the target uses, because it computes with the target's
+embeddings and LM head: with the target on `["CUDA0", "RPC0"]` and the drafter on `CUDA0`
+alone, upstream aborts the process ("pre-allocated tensor (output.weight) in
+a buffer (RPC0) that cannot run the operation") — `llama-server
+--spec-draft-device CUDA0` does it too. `MTP.init/2` refuses that pairing;
+load the drafter with the target's `:devices` and `tensor_split: [1.0, 0.0]`
+to keep its own layers local.
+
+The upstream fix is branch `draft-ctx-other-devices` on `nyo16/llama.cpp`: a
+context with `ctx_other` gets a backend for each of the other model's devices.
+With it, that same `llama-server` command runs, at 26.4 tok/s (566 drafted,
+173 accepted) on one 256-token completion.
 
 ### Concurrency across two nodes
 
-| `n_parallel` | decode t/s per request |
-|---|---|
-| 1 | 49.48 |
-| 4 | 44.71 |
-| 8 | 44.25 |
+gpt-oss-120b through `bench/spark_overhead.exs` with `SPARK_RPC_ENDPOINT`
+set (every load split 50/50 over the fabric), against the same bench on one
+node; per-stream decode, then aggregate:
 
-Per-token RTT is fixed per *graph*, not per token, so batching amortises it
-well: 8 concurrent requests cost 11% of per-request decode for 8× the aggregate.
+| streams | one node | two nodes | two nodes, `spark-all` client |
+|---|---|---|---|
+| 1 (`stream/3`) | 57.0 | 47.8 | **56.1** |
+| 1 (server) | 55.9 | 45.7 | **55.2** |
+| 4 | 23.8 / **91** | 18.2 / **70** | 23.9 / **93** |
+| 8 | 13.5 / **105** | 11.8 / **92** | 12.8 / **99** |
+
+On the vendored client, two nodes keep 77–88% of one node's throughput at
+every concurrency, so the per-token round trip does not grow with the batch.
+The last column is the `spark-all` build, with the RPC client fix, against
+upstream's worker, the BEAM on the X925 cores (`--big-cores`). It keeps
+95–102%. (This section used to quote 49.5 / 44.7 / 44.3 for `n_parallel`
+1 / 4 / 8 from `spark_two_node.exs b4`, which allocates that many slots but
+sends one request. So it measured load-to-load variation rather than
+concurrency.) A MoE does not batch well on either: each extra stream routes
+to different experts.
 
 ### The decode fast path is holding
 
@@ -689,6 +1042,15 @@ Essentially free. So the Meta device is not the problem. Now two nodes:
 It runs, and the output is byte-identical to the layer-split reference. It is
 **2.7× slower on decode and 23× slower on prefill**.
 
+At `785322d17` the RPC backend has its own pairwise communicator for this
+(#26610, `ggml_backend_rpc_comm_init`), so the next section describes the older
+commit. Re-measured on gpt-oss-120b (`llama-bench -sm tensor -p 512 -n 64`,
+fresh upstream worker), the vendored client decodes at 8.9 tok/s with pp512
+1135. The `spark-all` client, whose RPC fix also spins the callers that the
+communicator's own spin left blocking, decodes at **24.1** with pp512 1553.
+That is 2.7× better, and still less than half of a layer split's 57.6. The
+verdict below stands.
+
 ## Why, and why the comm-mode knob cannot help
 
 `ggml_backend_cuda_comm_init` returns `nullptr` the moment **any** member backend
@@ -717,8 +1079,11 @@ only cross-host mode that is both correct and fast, and it buys capacity.
   cannot span hosts as designed. Across hosts it silently falls back to a generic
   path that is 2.7× slower. It is the right tool for several GPUs in **one** box,
   which a Spark does not have.
-- Layer split over RPC buys **capacity, not speed**. If your model fits in
-  130 GB, one Spark is the answer.
+- Layer split over RPC buys **capacity** first. On the vendored llama.cpp it
+  also buys +18–26% prefill and costs 9–30% decode, depending on where the
+  client runs. With the `rpc-client-spin-wait` fix, decode costs 2–3% on
+  gpt-oss-120b and nothing on the dense NVFP4 model. For a model that fits in
+  130 GB, a second Spark is a prefill and throughput option, not a requirement.
 
 Re-check these claims against a future llama.cpp bump using upstream commits
 `d6f303004` (`-sm tensor`), `adb541a6a` and `91fef9536`.

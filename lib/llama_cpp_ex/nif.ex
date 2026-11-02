@@ -39,12 +39,10 @@ defmodule LlamaCppEx.NIF do
   def model_load(
         _path,
         _n_gpu_layers,
-        _use_mmap,
+        _load_mode,
         _main_gpu,
         _split_mode,
         _tensor_split,
-        _use_mlock,
-        _use_direct_io,
         _vocab_only,
         _check_tensors,
         _load_mtp,
@@ -58,6 +56,7 @@ defmodule LlamaCppEx.NIF do
   def model_n_layer_nextn(_model), do: :erlang.nif_error(:not_loaded)
   def model_desc(_model), do: :erlang.nif_error(:not_loaded)
   def model_size(_model), do: :erlang.nif_error(:not_loaded)
+  def model_devices(_model), do: :erlang.nif_error(:not_loaded)
   def model_n_params(_model), do: :erlang.nif_error(:not_loaded)
   def model_chat_template(_model), do: :erlang.nif_error(:not_loaded)
 
@@ -177,7 +176,7 @@ defmodule LlamaCppEx.NIF do
     do: :erlang.nif_error(:not_loaded)
 
   # Speculative decoding (MTP)
-  def speculative_init(_ctx_tgt, _ctx_dft, _n_draft), do: :erlang.nif_error(:not_loaded)
+  def speculative_init(_ctx_tgt, _ctx_dft, _n_draft, _type), do: :erlang.nif_error(:not_loaded)
   def speculative_stats(_spec), do: :erlang.nif_error(:not_loaded)
   def speculative_print_stats(_spec), do: :erlang.nif_error(:not_loaded)
 
