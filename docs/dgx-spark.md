@@ -348,15 +348,13 @@ step, and that serial dependency is the 8%. Upstream's `--backend-sampling`
 exposed. Tuning on this machine is therefore model and drafter choice, not the
 binding.
 
-The one gap that remains is on MoE decode, and it is inside the GPU kernels.
-gpt-oss-120b, 256 greedy tokens: `LlamaCppEx.stream/3` gives 55.5–55.9 tok/s
-and `llama-bench` tg256 gives 57.8. Under `nsys`, the expert matvec (MXFP4
-`mul_mat_vec_q`, 55k calls) averages **123.0 µs in the BEAM against 118.1 µs**
-in `llama-bench`, while the dense LM head is equal (2.75 against 2.74 ms). The
-RPC worker shows the same split, 123.7 against 117–118 µs (two-node section).
-Same kernels, same clocks, and only the scattered expert reads slow down. That
-points at how the weight memory is mapped inside a BEAM process; the cause is
-not established.
+The same holds for MoE decode. gpt-oss-120b, 256 greedy tokens, five fresh
+processes: `LlamaCppEx.stream/3` gives 57.0–57.3 tok/s with the default load
+mode, `use_mmap: false` or `use_direct_io: true` alike, against 57.8 for
+`llama-bench` tg256. (Under `nsys --cuda-graph-trace=node` the binding drops
+to 55.5–55.9 and its expert matvecs read 123 µs against `llama-bench`'s 118 µs.
+That gap is the profiler's, so do not compare kernel times across processes
+profiled this way.)
 
 ## Qwen3.8-27B NVFP4
 
@@ -873,13 +871,13 @@ With the client fixed, the worker binary shows up. Against the same patched
 `llama-bench` client, this library's `LlamaCppEx.RPC.Server` decodes at
 53.8–54.0 and upstream's `ggml-rpc-server` at 57.6, four restarts each. The
 binding client gives the same split: 50.6–50.8 against 53.9. Both workers run
-the same server code from the same tree. BEAM scheduler flags (`+sbwt none`,
-`+S 1:1`) change nothing, and the GPU clocks the same in both, 2411 MHz. Yet
-the worker's memory-bound kernels run ~5% slower inside the BEAM (`nsys`: 123.7
-against 117–118 µs per expert matvec, 2.84 against 2.71–2.76 ms for the LM
-head). That points at where the weights land in memory, the same family as
-the per-load decode spread on one node, but the cause is not established. For
-the last 7% of two-node decode, run `rpc-worker.sh --upstream`.
+the same server code from the same tree and build flags. Several things change
+nothing: BEAM scheduler flags (`+sbwt none`, `+S 1:1`), no super carriers
+(`+MMscs 0 +MMmcs 0`), and running the worker on the A725 cores instead of the
+X925s. GPU clocks are the same in both, 2411 MHz. Kernel times under `nsys` do
+not settle it, because profiling slows the BEAM process more than a bare
+binary (one-node section). The cause is not established. For the last 7% of
+two-node decode, run `rpc-worker.sh --upstream`.
 
 ### RDMA versus TCP, and the 10 GbE LAN
 
