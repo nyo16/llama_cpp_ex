@@ -820,6 +820,19 @@ BEAM unpinned, `b1`, two sessions), two-node decode is **50.6 and 50.8 tok/s**
 against 54.7 and 55.2 single-node, where the vendored build gives 37.4–38.5
 unpinned. Two-node prefill rises to 2731–2750 with the CUDA commits.
 
+On the dense model, a two-node split no longer costs any decode. For
+Qwen3.8-27B NVFP4 (`llama-bench -p 512 -n 128`, RDMA, fresh upstream worker),
+the unpatched client decodes at 13.86 tok/s over two nodes. `spark-all`
+decodes at **14.85**, against 14.35 on one node. pp512 is a single
+micro-batch, so it does not pipeline, and it stays below one node: 1370
+against 1539.
+
+With the wake-ups gone, the transport becomes visible again. With the
+`spark-all` client and gpt-oss-120b, decode is **57.6 tok/s over RDMA, 53.0 over
+TCP on the same 200 GbE link, and 51.8 over the 10 GbE LAN**. The next
+section's "no measurable difference" result was measured under the ~4 ms
+wake-up cost, which hid the transport.
+
 With the client fixed, the worker binary shows up. Against the same patched
 `llama-bench` client, this library's `LlamaCppEx.RPC.Server` decodes at
 53.8–54.0 and upstream's `ggml-rpc-server` at 57.6, four restarts each. The
@@ -846,16 +859,16 @@ the link, two sessions per transport:
 | TCP, 200 GbE fabric | 89–91 | 419–422 | 2593–2615 | 36.9–37.6 |
 | TCP, 10 GbE LAN | 76–77 | 422–429 | 2540–2585 | 38.8–39.1 |
 
-**On this llama.cpp you lose nothing measurable without RDMA**, and nothing
-on the 10 GbE LAN either: TTFT, prefill and decode overlap across the three
-transports, and load time did not favour RDMA (the LAN was quickest in this
-session; RDMA loaded in 54 s in an earlier one), so it is dominated by the
-client reading and hashing the file, not by the wire.
-Per-token traffic
-across a layer split is one activation row, and the async dispatcher hides the
-round trip; the −27% prefill / −11% decode TCP penalty measured at b10362 is
-gone. RDMA still activates by default on the fabric and costs nothing, so
-leave it on — but a TCP fallback, even over the LAN, is not a cliff.
+**On the vendored llama.cpp, you lose nothing measurable without RDMA**, and
+nothing on the 10 GbE LAN either. TTFT, prefill and decode overlap across the
+three transports. Load time did not favour RDMA either: the LAN was quickest in
+this session, and RDMA loaded in 54 s in an earlier one. So load time is
+dominated by the client reading and hashing the file, not by the wire.
+Per-token traffic across a layer split is one activation row. The −27%
+prefill / −11% decode TCP penalty measured at b10362 is gone. **That changes
+once the RPC client's wake-ups are fixed** (previous section): decode then
+reads 57.6 over RDMA, 53.0 over TCP on the fabric and 51.8 on the LAN. Leave
+RDMA on. A TCP fallback, even over the LAN, is still not a cliff.
 
 To confirm which one you got, look at the worker's log with
 `GGML_RPC_DEBUG=1`:
