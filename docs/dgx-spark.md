@@ -655,6 +655,14 @@ two-node rows is the worker's: the same worker served three `llama-bench`
 clients in a row at 50.4, 41.5 and 50.5 tok/s, so restart it and re-measure
 before believing any one two-node decode figure.
 
+The worker binary matters less than that spread. `LlamaCppEx.stream/3` over
+two nodes, three fresh contexts per session, worker restarted between
+sessions: this library's `LlamaCppEx.RPC.Server` decoded at 38–48 tok/s
+(sessions at ~38 and ~38/47), upstream's `ggml-rpc-server`
+(`rpc-worker.sh --upstream`) at 40–51 (~50 and ~40). Both land in one of two
+bands per session; upstream's sat in the faster one more often over four
+sessions, which is too few to call.
+
 Load time is still the cost — 2–3× one node — because ~30 GB of weights
 cross the network and the client still reads and hashes every tensor to check
 the worker's cache.
