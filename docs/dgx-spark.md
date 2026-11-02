@@ -454,7 +454,7 @@ tree. Then remove the
 | Qwen3.8-27B NVFP4 | 1304 tok/s | **1560 tok/s** (+20%) |
 | gpt-oss-120b MXFP4 | 2352 tok/s | **2583 tok/s** (+10%) |
 
-`scripts/spark/e2e.exs single` passes 12/12 on that build. So do the test
+`scripts/spark/e2e.exs` passes 12/12 on that build, both `single` and `two-node`. So do the test
 suite's `smoke`, `embeddings`, `tools` and `decision` tags (602 tests), `mtp` and
 `dflash` (458), `rpc_live` against a worker, `vm_exit_test.exs`, and
 `rpc_check.exs` over the fabric (VM exit 0). The embeddings run used
