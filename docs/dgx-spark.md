@@ -932,19 +932,22 @@ gpt-oss-120b through `bench/spark_overhead.exs` with `SPARK_RPC_ENDPOINT`
 set (every load split 50/50 over the fabric), against the same bench on one
 node; per-stream decode, then aggregate:
 
-| streams | one node | two nodes |
-|---|---|---|
-| 1 (`stream/3`) | 57.0 | 47.8 |
-| 1 (server) | 55.9 | 45.7 |
-| 4 | 23.8 / **91** | 18.2 / **70** |
-| 8 | 13.5 / **105** | 11.8 / **92** |
+| streams | one node | two nodes | two nodes, `spark-all` client |
+|---|---|---|---|
+| 1 (`stream/3`) | 57.0 | 47.8 | **56.1** |
+| 1 (server) | 55.9 | 45.7 | **55.2** |
+| 4 | 23.8 / **91** | 18.2 / **70** | 23.9 / **93** |
+| 8 | 13.5 / **105** | 11.8 / **92** | 12.8 / **99** |
 
-Two nodes keep 77–88% of one node's throughput at every concurrency, so the
-per-token round trip does not grow with the batch. (This section used to
-quote 49.5 / 44.7 / 44.3 for `n_parallel` 1 / 4 / 8 from `spark_two_node.exs
-b4`, which allocates that many slots but sends one request, so it measured
-load-to-load variation rather than concurrency.) A MoE does not batch well on
-either: each extra stream routes to different experts.
+On the vendored client, two nodes keep 77–88% of one node's throughput at
+every concurrency, so the per-token round trip does not grow with the batch.
+The last column is the `spark-all` build, with the RPC client fix, against
+upstream's worker, the BEAM on the X925 cores (`--big-cores`). It keeps
+95–102%. (This section used to quote 49.5 / 44.7 / 44.3 for `n_parallel`
+1 / 4 / 8 from `spark_two_node.exs b4`, which allocates that many slots but
+sends one request. So it measured load-to-load variation rather than
+concurrency.) A MoE does not batch well on either: each extra stream routes
+to different experts.
 
 ### The decode fast path is holding
 
