@@ -705,6 +705,26 @@ scripts/spark/rpc-worker.sh logs spark-2 200 | grep -E 'RDMA|transport'
 `RDMA activate failed, staying on TCP`, or no `RDMA activated` line at all, is
 TCP.
 
+### Speculative decoding across two nodes
+
+Qwen3.8-27B NVFP4 split 50/50 over the fabric, one 256-token greedy chat
+completion, three runs each through `LlamaCppEx.MTP` (not the four-prompt
+harness above, so acceptance is not comparable with the one-node table):
+
+| config | decode t/s | acceptance |
+|---|---|---|
+| plain | 14.02–14.03 | — |
+| MTP `n_draft: 3` | 17.7–19.7 | 50% |
+| DFlash 2 `n_draft: 7` | **22.2–22.4** | 27% |
+
+DFlash still pays 1.6× across two nodes. The drafter must be loaded on every
+device the target uses, because it computes with the target's embeddings and
+LM head: with the target on `["CUDA0", "RPC0"]` and the drafter on `CUDA0`
+alone, upstream aborts the process ("pre-allocated tensor (output.weight) in
+a buffer (RPC0) that cannot run the operation"). `MTP.init/2` refuses that
+pairing; load the drafter with the target's `:devices` and
+`tensor_split: [1.0, 0.0]` to keep its own layers local.
+
 ### Concurrency across two nodes
 
 | `n_parallel` | decode t/s per request |
