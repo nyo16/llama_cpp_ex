@@ -853,6 +853,9 @@ spin only and 57.5 with both. A 30-minute soak of `llama-server` on that
 client (`-np 4`, six concurrent clients, random 16/64/256-token completions,
 gpt-oss-120b over RDMA) served 1419 completions and 146k tokens with no
 errors, and exited 0. Upstream's worker grew from 332 to 1565 MiB RSS over it.
+The same through the binding (`spark-all` vendored, `LlamaCppEx.Server` with
+`n_parallel: 4`, six concurrent callers, 20 minutes) served 892 completions
+with no errors, and the VM exited 0.
 With that client and the same unpatched worker:
 
 | client | `llama-bench` decode, before | after |
