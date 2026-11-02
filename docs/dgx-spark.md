@@ -413,6 +413,25 @@ so the KL divergence against upstream is 0.000000 with 100% same top token:
 That is +8% prefill with decode unchanged. The full CUDA `test-backend-ops`
 suite passes on the branch (19246/19246).
 
+### Through the binding
+
+`nyo16/llama.cpp` branch `spark-all` is `785322d17`, the vendored commit, plus
+these four CUDA commits, the `draft-ctx-other-devices` fix and the
+`rpc-add-server-no-abort` fix. To test it, copy the checkout on spark-1 and
+replace `vendor/llama.cpp` with the branch tree. Then remove the
+`_build/*/lib/llama_cpp_ex/obj/llama_build-*` directories and run
+`mix compile`. In that build, `Context.decode/2` of a 2048-token prompt
+(`n_ubatch: 512`, flash attention, median of 5) gives:
+
+| | vendored | `spark-all` |
+|---|---|---|
+| Qwen3.8-27B NVFP4 | 1304 tok/s | **1560 tok/s** (+20%) |
+| gpt-oss-120b MXFP4 | 2352 tok/s | **2583 tok/s** (+10%) |
+
+`scripts/spark/e2e.exs single` passes 12/12 on that build. The binding is
+unaffected by the swap, but a release would have to vendor the branch or wait
+for upstream.
+
 ## Speculative decoding: MTP, DFlash 2, DSpark
 
 256-token greedy chat completions (thinking off), four prompts run twice,
