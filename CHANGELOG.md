@@ -55,6 +55,11 @@ Qwen3.8-27B NVFP4 is unchanged (`bench/spark_spec.exs`: plain 14.21, MTP
   branches, `draft-ctx-other-devices` is upstream; `rpc-add-server-no-abort`
   and `rpc-client-spin-wait` are not and still apply; `cuda-mmq-src1-reuse`
   conflicts with #31296 and #31047.
+- Release workflow: `HEX_API_KEY` moves from repository secrets to a `hex`
+  GitHub environment that only the `publish` job declares. The environment
+  accepts `v*` tags only and needs a reviewer's approval before anything
+  reaches Hex. The `precompile` and `publish` checkouts no longer leave a git
+  token in `.git`, and the workflow defaults to `contents: read`.
 
 ### Fixed
 

@@ -4,12 +4,21 @@ on:
     tags: ['v*']
 
 # Every `uses:` below is pinned to a full commit SHA rather than a moving tag.
-# This is the workflow that holds HEX_API_KEY, so a retagged action would be a
-# supply-chain takeover of the published package. Pinned releases:
+# This workflow publishes the package, so a retagged action would be a
+# supply-chain takeover of it. Pinned releases:
 #   actions/checkout   v6.1.0  -> d23441a48e516b6c34aea4fa41551a30e30af803
 #   erlef/setup-beam   v1.24.1 -> 54075bcc5e249e4758d363f27d099f55d843f124
 # Re-resolve with `git ls-remote https://github.com/<owner>/<repo> 'refs/tags/v*'`
 # and take the dereferenced (`^{}`) line when the tag is annotated.
+#
+# HEX_API_KEY lives in the `hex` environment, not in repository secrets, so
+# only the `publish` job can read it. The environment admits `v*` tags only
+# and waits for a required reviewer, so nothing reaches Hex without an approval
+# after the artifacts and checksums are in place.
+
+# Jobs that need more ask for it themselves.
+permissions:
+  contents: read
 
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
@@ -129,6 +138,9 @@ jobs:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           submodules: recursive
+          # This job builds llama.cpp with contents: write; keep the token out
+          # of .git. The upload step gets its own GH_TOKEN.
+          persist-credentials: false
       # Before setup-beam, which installs into the tool cache this would remove.
       - name: Free disk space for the CUDA toolkit
         if: matrix.toolkit != ''
@@ -382,6 +394,8 @@ jobs:
     name: Publish to Hex
     runs-on: ubuntu-22.04
     needs: [checksum]
+    # The only job that can read HEX_API_KEY (see the header).
+    environment: hex
     permissions:
       contents: read
     steps:
@@ -392,6 +406,9 @@ jobs:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           ref: ${{ github.ref }}
+          # No git token beside the Hex key. The fetch below is anonymous; the
+          # repository is public.
+          persist-credentials: false
 
       - name: Take the generated checksum.exs from master
         run: |
