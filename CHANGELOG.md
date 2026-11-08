@@ -1,5 +1,123 @@
 # Changelog
 
+## v0.8.68
+
+llama.cpp bumped to `a691b2345`
+([`b12205`](https://github.com/ggml-org/llama.cpp/releases/tag/b12205)),
+172 commits from `785322d17` (b12032+1). Upstream versions: llama.cpp 0.9.0,
+ggml 0.29.0. The bump needed no NIF change. Of the headers the NIF includes:
+`llama.h` adds `moe_cache_cpu_share` to `llama_context_params` (default `0`,
+which keeps the old behaviour; the binding does not set the MoE cache);
+`common.h` drops `common_get_path_from_env` and the Windows `utf8_to_wstring`,
+neither called, and changes `common_prompt_checkpoint`'s buffers, which the
+NIF does not use; `ggml.h` drops `ggml_rope_yarn_corr_dims` (not called);
+`ggml-backend.h` and `src/llama-ext.h` only add. `llama_model_default_params`
+is unchanged. `src/llama-vocab.cpp` and `tools/server/server-decision.*` are
+untouched, so `input_tokenize.cpp` and the decision port need no change.
+
+Checked on an M1 Max (Metal): the default suite on a default build and on an
+`LLAMA_RPC=1` build; `:smoke`, `:embeddings` (Qwen3-Embedding and
+embeddinggemma-2), `:slow`, `:mtp`, `:tools`, `:decision`, `:decision_clef`,
+`:mtp_sidecar` (Qwen3.8-27B) and `test/vm_exit_test.exs`; and
+`scripts/decision_compare.exs` — ALL MATCH on 9 models against llama-server at
+the same commit, bit-identical on every request the script checks. On two DGX
+Sparks (GB10, CUDA 13.0, `LLAMA_RPC=1` build, `verify-build-flags.sh` clean):
+the default suite, the same model tags plus `:dflash` and bge-small
+embeddings, `vm_exit_test.exs`, `:rpc_live` against the other node, and
+`scripts/spark/e2e.exs two-node` (12/12). Single-node speculative decode on
+Qwen3.8-27B NVFP4 is unchanged (`bench/spark_spec.exs`: plain 14.21, MTP
+`n_draft: 2` 26.55, DFlash 2 `n_draft: 7` 44.24 tok/s, against 14.28 / 26.76 /
+44.22 at v0.8.67).
+
+### Changed
+
+- `LlamaCppEx.MTP.init/2` no longer refuses a DFlash/DSpark drafter that is
+  not loaded on every device the target uses. Upstream #31635 (the same change
+  as the `draft-ctx-other-devices` branch of `nyo16/llama.cpp`) gives the
+  draft context a backend for each of the target's devices. On two Sparks a
+  drafter on `CUDA0` alone beside a target on `CUDA0` + `RPC0` decodes the
+  same text at the same rate as one loaded on both.
+- `LlamaCppEx.MTP.init/2` logs a warning when a DFlash/DSpark target's last
+  device is an RPC device. Upstream now keeps the target features a DFlash
+  drafter reads in a buffer on the target's output device (#31506), so with
+  the output layer on the worker every verify ships them over the network.
+  Qwen3.8-27B NVFP4 split 50/50 over two Sparks, DFlash 2 `n_draft: 7`:
+  7.9 tok/s with `devices: ["CUDA0", "RPC0"]` (28.1 at v0.8.67, plain 13.7),
+  **32.5–33.0** with `["RPC0", "CUDA0"]`, which also lifts plain decode to
+  14.3. `LLAMA_DFLASH_DEV=0` restores host copies (28.2–28.7). The `MTP`
+  docs, `docs/dgx-spark.md` and `scripts/spark/e2e.exs` now list the local
+  device last.
+- `decision.cpp` is now "Ported at" `a691b2345`; no hunk needed porting.
+- `test/mtp_model_test.exs` records `:mtp_cancel` at this commit: 2 of 4 runs
+  abort (exit 134, `GGML_ASSERT` in `common_batch` and in `ggml-backend.cpp`),
+  the other two pass. The race it documents is unchanged.
+- `docs/dgx-spark.md` and `docs/release-guide.md`: of the `nyo16/llama.cpp`
+  branches, `draft-ctx-other-devices` is upstream; `rpc-add-server-no-abort`
+  and `rpc-client-spin-wait` are not and still apply; `cuda-mmq-src1-reuse`
+  conflicts with #31296 and #31047.
+
+### Fixed
+
+- An `LLAMA_RPC=1` build failed to compile on macOS since v0.8.67:
+  `rpc_probe_hello` opened its socket with `SOCK_CLOEXEC`, which macOS does
+  not have. It sets `FD_CLOEXEC` with `fcntl` instead.
+
+### Known issue
+
+- `split_mode: :tensor` with an RPC device in `:devices` segfaults the VM on
+  the first decode at this llama.cpp commit: the RPC client serializes the
+  meta backend's graph with a recursive walk that overflows a dirty CPU
+  scheduler's default 320 KB stack (Qwen3-8B over two Sparks; upstream's
+  `llama-bench` runs on an 8 MB main thread and is not affected). Start the
+  VM with `+sssdcpu 256` if you use it. `:layer`, the mode the docs recommend
+  across hosts, is not affected. Measured with `llama-bench` from the
+  submodule (gpt-oss-120b, two Sparks), `-sm tensor` decodes at 15.2 tok/s
+  against 50.4 for `-sm layer` (tensor was 8.9 at `785322d17`).
+
+### Upstream
+
+- From the 172 commits:
+  - Flash attention over a unified KV cache attends to each sequence's own
+    cells (`ggml_flash_attn_ext_rows`, #29510) instead of the whole cache with
+    a dense mask. `LlamaCppEx.Server` uses a unified cache by default, and
+    `LlamaCppEx.Decision` shares a prompt through one. `LLAMA_KV_ROWS_DISABLE`
+    turns it off. RPC: the op travels as `GGML_OP_FLASH_ATTN_EXT` with an
+    extra source and the protocol version did not change, so run workers and
+    clients from the same release.
+  - On-device sequence state copies of a quantized KV cache copied only part
+    of each range (#30541). The MTP loop's checkpoint rollback saves state
+    with `LLAMA_STATE_SEQ_FLAGS_ON_DEVICE`, so it was affected with `:type_k`
+    / `:type_v` set to a quantized type.
+  - A context with `ctx_other` gets backends for the other model's devices,
+    and the Gemma 4 assistant follows its target's flash-attention setting
+    (#31635). DFlash copies hidden features on the device (#31506). MTP saves
+    and restores its hidden state with a checkpoint (#30141).
+  - KV shifting fix and per-model RoPE (#31683); a cache that shares another's
+    cells no longer reports 0 KV rows before its sequences have any (#31570).
+  - The CPU backend computes F16 matmuls with F32 activations (#31854), so CPU
+    results move slightly; Metal follows the reference precision of
+    `ggml_prec_set_acc` (#31851).
+  - Gemma 4 E2B/E4B prompt processing prunes rows that need no logits
+    (#31356).
+  - Chat: invalid UTF-8 in PEG-parsed tool call arguments is sanitized
+    (#31861); a constraint type is allowed after gpt-oss's final channel
+    (#31556); jinja implements `map('filter')` (#24033), and `upper`, `lower`,
+    `strip`, `title`, `capitalize` and `join` now reject unexpected arguments.
+  - New architectures: Kimi-K3.1-Pro (#31779), Ripple (#31692), xing4_0
+    (#31589), Metis-1.6 (#31134), Clover (#31306); NVFP4 LFM3 (#31608) and
+    NVFP4 scales in qwen2's FFN (#31657).
+  - Metal: GROUP_NORM fix (#31852), non-contiguous copy fix (#31581),
+    `mul_mm` for 32 ≤ K < 64 (#30982), fusable node groups kept in one command
+    buffer (#31688), DeepSeek-V4 and GLM MoE routing fused (#31615).
+  - CUDA: NVFP4 gate/up/GLU fused in MMQ (#31296), linearized MoE layout for
+    MMQ/MMF (#31047), a Q8_1 correction-sum fix (#31247), NaN sanitizing in MoE
+    selection (#31005), graphs no longer evicted just before use (#30662).
+  - RPC: NCCL for multi-node tensor parallelism (#28967) — the RPC server's
+    communicator uses `ggml_backend_comm_init_rank` when its backend has it.
+    Not measured on two Sparks for this release.
+  - Apple host buffers use `vm_allocate` (#31437). Vulkan, SYCL, OpenCL,
+    Hexagon, WebGPU and zDNN work.
+
 ## v0.8.67
 
 llama.cpp stays at `785322d17`. **Behaviour change:** `LlamaCppEx.Model.load/2`

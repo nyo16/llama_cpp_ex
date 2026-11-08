@@ -338,6 +338,41 @@ Re-checked at `785322d17` (b12032+1), covering the 31 commits from
 RPC protocol and op ids are unchanged (#31424 removes `fs_path_to_utf8` from
 `tools/rpc`, not from the backend).
 
+Re-checked at `a691b2345` (b12205), covering the 172 commits from
+`785322d17`: #1 and #3 are as above — `ggml-cpu/CMakeLists.txt` was not
+touched and `ggml_backend_rpc_start_server` keeps its `void` signature. #2
+stands: #28967 adds `ggml_backend_comm_init_rank` (NCCL in the CUDA backend)
+and the RPC server's pairwise communicator uses it when the worker's backend
+has it, but `ggml_backend_cuda_comm_init` still returns `nullptr` on a
+non-CUDA member. Measured with upstream's `llama-bench` built from the
+submodule (gpt-oss-120b, `-fa 1 -p 512 -n 64 -r 3`, client on the A725
+cores): `-sm layer` pp512 1737, tg64 50.4; `-sm tensor` pp512 850, tg64 15.2,
+against 1135 / 8.9 at `785322d17`. Better, still 30% of a layer split.
+
+Through the binding, `:tensor` with an RPC device in the set segfaults the VM
+at this commit: the RPC client's `serialize_graph` walks the meta backend's
+graph with the recursive `add_tensor`, which overflows a dirty CPU
+scheduler's default 320 KB stack (40 kilowords) on Qwen3-8B. `llama-bench`
+runs it on an 8 MB main thread and does not notice. `+sssdcpu 256` (2 MB) is
+enough; `bench/spark_tensor_split.exs remote` needs
+`ELIXIR_ERL_OPTIONS="+sssdcpu 256"`. A layer split is unaffected. Re-check
+on a bump by running that bench without the flag.
+
+The RPC protocol stays 8.0.1 and `GGML_OP_COUNT` 102, yet two graph changes
+ride on existing ops: `ggml_flash_attn_ext_rows` (#29510) is
+`GGML_OP_FLASH_ATTN_EXT` with K/V row indices in `src[5]`, used when the KV
+cache is unified, flash attention is on and the device passes the op probe
+(`LLAMA_KV_ROWS_DISABLE` turns it off), and RoPE gains a `truncate`
+op param (#30206). The RPC client's `supports_op` refuses only
+`truncate=false` RoPE, so a worker from v0.8.67 or older is offered
+`kv_rows` attention it does not know to read. Run worker and client from the
+same release.
+
+Of the `nyo16/llama.cpp` branches, `draft-ctx-other-devices` is upstream as
+#31635 (`e853ec9a8`, the same change), `rpc-add-server-no-abort` and
+`rpc-client-spin-wait` still apply unchanged, and `cuda-mmq-src1-reuse`
+conflicts with #31296 and #31047.
+
 | # | Upstream defect | Our workaround | Still needed? |
 |---|---|---|---|
 | 1 | `GGML_NATIVE=ON` makes ggml's `-mcpu=native` probe resolve to **base ARMv8-A** on Cortex-X925/A725 with GCC 13.3 — silently, with a soft CMake warning and exit 0. Costs every `sdot`/`smmla`/SVE kernel. | `LLAMA_CPU_ARM_ARCH` + `LLAMA_CUDA_ARCH` in the `Makefile`, which must be set together. See [DGX Spark](dgx-spark.md) and [Cross-Platform Builds](cross-platform-builds.md). | `scripts/spark/verify-build-flags.sh` on an aarch64 host. If a default build (no `LLAMA_CPU_ARM_ARCH`) now reports non-zero `sdot`/`smmla`, upstream fixed the probe. |

@@ -6,9 +6,12 @@ Code.require_file("helpers.exs", __DIR__)
 #   scripts/spark/remote.sh --env MIX_ENV=bench spark-1 \
 #     mix run bench/spark_tensor_split.exs local
 #
-#   # 6.2 — two nodes, Meta device over [CUDA0, RPC0]
+#   # 6.2 — two nodes, Meta device over [CUDA0, RPC0]. Since a691b2345 the RPC
+#   # client's recursive graph serialization overflows a dirty scheduler's
+#   # default stack on the tensor leg (VM segfault), hence +sssdcpu.
 #   scripts/spark/rpc-worker.sh start spark-2
-#   scripts/spark/remote.sh --env MIX_ENV=bench --env LLAMA_RPC=1 spark-1 \
+#   scripts/spark/remote.sh --env MIX_ENV=bench --env LLAMA_RPC=1 \
+#     --env ELIXIR_ERL_OPTIONS="+sssdcpu 256" spark-1 \
 #     mix run bench/spark_tensor_split.exs remote
 #
 # "tp=2" is vLLM vocabulary. In llama.cpp at b10362 it means

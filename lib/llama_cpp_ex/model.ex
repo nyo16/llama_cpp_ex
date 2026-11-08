@@ -98,6 +98,11 @@ defmodule LlamaCppEx.Model do
   > disables backend sampling, and its CUDA all-reduce is `ncclCommInitAll` —
   > a single-process, all-local-GPUs API. **It cannot span hosts**, so it is not
   > "tp=2 across two machines". See `docs/dgx-spark.md` for the measurements.
+  > With an RPC device in the set it runs, far slower than `:layer`, and at
+  > llama.cpp `a691b2345` its first decode overflows a dirty scheduler's
+  > default stack (320 KB) while the RPC backend serializes the graph, which
+  > kills the VM with a segfault. Start the VM with `+sssdcpu 256` (2 MB,
+  > e.g. `ELIXIR_ERL_OPTIONS="+sssdcpu 256"`) if you run it anyway.
 
   > #### Load mode {: .info}
   >
