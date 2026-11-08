@@ -519,12 +519,16 @@ publish. The jobs run in this order:
    release out of draft, runs `mix elixir_make.checksum --all`, verifies the
    resulting `checksum.exs` has an entry for each of them, and commits it to
    `master`.
-4. **`publish`** checks out the **tag** (not `master`), takes only `checksum.exs`
-   from `master`, compiles once to verify the published artifact against those
-   checksums, and runs `mix hex.publish --yes`.
+4. **`publish`** runs in the `hex` GitHub environment, the only place
+   `HEX_API_KEY` lives. The environment accepts `v*` tags only and has a
+   required reviewer, so the job **waits for approval** (Actions → the run →
+   *Review deployments*). Approve once the release and `checksum.exs` look
+   right. It checks out the **tag** (not `master`), takes only `checksum.exs`
+   from `master`, verifies every published artifact against those checksums,
+   compiles once, and runs `mix hex.publish --yes`.
 
-So there is nothing to do by hand after the tag push. Watch the run; if a leg
-fails, the release stays a draft and nothing reaches Hex.
+The only manual step after the tag push is that approval. Watch the run; if a
+leg fails, the release stays a draft and nothing reaches Hex.
 
 If you ever need to publish manually — a workflow outage, say — reproduce what
 `publish` does rather than publishing from `master`:
