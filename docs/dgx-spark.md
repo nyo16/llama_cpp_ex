@@ -6,15 +6,19 @@ inferred from spec sheets; where a number differs from the marketing figure, the
 measurement wins and the reason is given.
 
 The work behind this page produced four llama.cpp branches on
-`nyo16/llama.cpp`, each based on `785322d17`, the vendored commit. None of them
-is in the vendored tree. A fifth, `spark-all`, merges all four.
+`nyo16/llama.cpp`, each based on `785322d17`, the commit vendored through
+v0.8.67. A fifth, `spark-all`, merges all four. v0.8.68 vendors `a691b2345`,
+which carries `draft-ctx-other-devices` as upstream #31635 (`e853ec9a8`, the
+same change). The two RPC branches still apply to it unchanged;
+`cuda-mmq-src1-reuse` conflicts with upstream's NVFP4 gate/up/GLU MMQ fusion
+(#31296) and MoE layout change (#31047) and needs a rebase.
 
 | branch | effect on GB10 | section |
 |---|---|---|
 | `cuda-mmq-src1-reuse` | NVFP4 prefill +19–20% (src1 reuse, weight-scale fold, SWIGLU in MMQ); gpt-oss-120b prefill +8% (expert biases) | Qwen3.8-27B NVFP4, gpt-oss-120b prefill |
 | `rpc-client-spin-wait` | two-node decode +30% unpinned (gpt-oss-120b 44 → 57.6 tok/s, single node 59) | The cause, and a fix |
 | `rpc-add-server-no-abort` | an unreachable worker returns an error instead of aborting | Five things, #1 |
-| `draft-ctx-other-devices` | DFlash with the target split over RPC | Speculative decoding across two nodes |
+| `draft-ctx-other-devices` | DFlash with the target split over RPC (upstream as #31635 since `a691b2345`) | Speculative decoding across two nodes |
 
 ## The machine
 
@@ -951,19 +955,39 @@ harness above, so acceptance is not comparable with the one-node table):
 | DFlash 2 `n_draft: 7` | **22.2–22.4** | 27% | **27.8–27.9** (29%) |
 
 DFlash still pays 1.6× across two nodes, and 1.9× with the RPC client fix. With
-the fix, plain decode over two nodes beats one node's 14.3. The drafter must be
-loaded on every device the target uses, because it computes with the target's
-embeddings and LM head: with the target on `["CUDA0", "RPC0"]` and the drafter on `CUDA0`
-alone, upstream aborts the process ("pre-allocated tensor (output.weight) in
-a buffer (RPC0) that cannot run the operation") — `llama-server
---spec-draft-device CUDA0` does it too. `MTP.init/2` refuses that pairing;
-load the drafter with the target's `:devices` and `tensor_split: [1.0, 0.0]`
-to keep its own layers local.
-
-The upstream fix is branch `draft-ctx-other-devices` on `nyo16/llama.cpp`: a
+the fix, plain decode over two nodes beats one node's 14.3. Up to v0.8.67 the
+drafter had to be loaded on every device the target uses, because it computes
+with the target's embeddings and LM head: with the target on `["CUDA0", "RPC0"]`
+and the drafter on `CUDA0` alone, upstream aborted the process ("pre-allocated
+tensor (output.weight) in a buffer (RPC0) that cannot run the operation"), and
+`MTP.init/2` refused that pairing. The fix, first on branch
+`draft-ctx-other-devices` of `nyo16/llama.cpp`, is upstream as #31635: a
 context with `ctx_other` gets a backend for each of the other model's devices.
-With it, that same `llama-server` command runs, at 26.4 tok/s (566 drafted,
-173 accepted) on one 256-token completion.
+Since v0.8.68 the drafter can sit on `CUDA0` alone, and decodes the same text
+at the same rate as one loaded on both devices.
+
+#### Put the local device last
+
+At `a691b2345` DFlash reads the target's layer features from a device buffer
+(#31506) instead of host copies, and that buffer lives on the target's
+*output* device. Listed `["CUDA0", "RPC0"]`, the output layer is on the worker,
+so every verify ships the features over the fabric. Same Qwen3.8-27B NVFP4
+50/50 split, one 256-token greedy chat completion ("Explain how a hash map
+handles collisions…"), three runs, client on the A725 cores, decode rate from
+first to last token:
+
+| target `:devices` | build | plain | DFlash 2 `n_draft: 7` | verify ms/iter |
+|---|---|---|---|---|
+| `["CUDA0", "RPC0"]` | v0.8.67 (`785322d17`) | 13.75 | 27.4–28.1 | 94–96 |
+| `["CUDA0", "RPC0"]` | v0.8.68 (`a691b2345`) | 13.7 | **7.8–7.9** | 395–400 |
+| `["CUDA0", "RPC0"]`, `LLAMA_DFLASH_DEV=0` | v0.8.68 | 13.75 | 28.2–28.7 | 93–95 |
+| **`["RPC0", "CUDA0"]`** | v0.8.68 | **14.3** | **32.5–33.0** | 86–88 |
+
+With the local device last the buffer stays on `CUDA0` and DFlash is faster
+than before the change; plain decode gains 4% too, since the logits no longer
+cross the fabric. `MTP.init/2` logs a warning for a DFlash/DSpark target whose
+last device is an RPC device. `LLAMA_DFLASH_DEV=0` is upstream's switch back
+to host copies. Acceptance is 34.5% in every row.
 
 ### Concurrency across two nodes
 
@@ -1050,6 +1074,14 @@ fresh upstream worker), the vendored client decodes at 8.9 tok/s with pp512
 communicator's own spin left blocking, decodes at **24.1** with pp512 1553.
 That is 2.7× better, and still less than half of a layer split's 57.6. The
 verdict below stands.
+
+At `a691b2345` (v0.8.68), same `llama-bench` run from the submodule, client on
+the A725 cores against a worker from the same commit: `-sm tensor` decodes at
+15.2 tok/s with pp512 850, `-sm layer` at 50.4 with pp512 1737. #28967 lets an
+RPC worker's pairwise communicator use NCCL through
+`ggml_backend_comm_init_rank`, but the client's `CUDA0` beside `RPC0` still
+cannot. Through the binding, `:tensor` over RPC also needs a larger dirty
+scheduler stack at this commit (`+sssdcpu 256`); see `LlamaCppEx.Model`.
 
 ## Why, and why the comm-mode knob cannot help
 

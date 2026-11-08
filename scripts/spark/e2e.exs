@@ -357,41 +357,26 @@ case System.argv() do
           "models/z-lab/Qwen3.8-27B-DFlash2-GGUF/main/Qwen3.8-27B-DFlash2-Q4_K_M.gguf"
         )
 
+    # Local device last, so the output layer and the DFlash feature buffer
+    # stay on CUDA0 (see LlamaCppEx.MTP's :draft_model docs).
     {:ok, target} =
       LlamaCppEx.Model.load(big,
-        devices: ["CUDA0", "RPC0"],
+        devices: ["RPC0", "CUDA0"],
         split_mode: :layer,
         tensor_split: [0.5, 0.5],
         n_gpu_layers: -1
       )
 
-    E2E.step("DFlash drafter on CUDA0 alone is refused, not aborted", fn ->
-      {:ok, local_only} = LlamaCppEx.Model.load(drafter, devices: ["CUDA0"], n_gpu_layers: -1)
+    {:ok, prompt} =
+      LlamaCppEx.Chat.apply_template(
+        target,
+        [%{role: "user", content: "What is the capital of France? One word."}],
+        enable_thinking: false
+      )
 
-      case LlamaCppEx.MTP.init(target, type: :dflash, draft_model: local_only, n_ctx: 2048) do
-        {:error, msg} -> if msg =~ "RPC0", do: {:ok, "names RPC0"}, else: {:error, msg}
-        other -> {:error, inspect(other)}
-      end
-    end)
-
-    E2E.step("DFlash over the split target", fn ->
-      {:ok, d} =
-        LlamaCppEx.Model.load(drafter,
-          devices: ["CUDA0", "RPC0"],
-          split_mode: :layer,
-          tensor_split: [1.0, 0.0],
-          n_gpu_layers: -1
-        )
-
+    dflash = fn d ->
       {:ok, spec} =
         LlamaCppEx.MTP.init(target, type: :dflash, draft_model: d, n_draft: 7, n_ctx: 2048)
-
-      {:ok, prompt} =
-        LlamaCppEx.Chat.apply_template(
-          target,
-          [%{role: "user", content: "What is the capital of France? One word."}],
-          enable_thinking: false
-        )
 
       {:ok, text} = LlamaCppEx.MTP.generate(spec, prompt, max_tokens: 8, temp: 0.0)
       stats = LlamaCppEx.MTP.stats(spec)
@@ -401,6 +386,25 @@ case System.argv() do
           {:ok,
            "#{inspect(String.trim(text))}, #{stats.drafts_accepted}/#{stats.drafts_generated} drafts"},
         else: {:error, inspect(text)}
+    end
+
+    # Upstream #31635: the draft context gets a backend for every device of the
+    # target, so a drafter on CUDA0 alone no longer aborts the VM.
+    E2E.step("DFlash, drafter on CUDA0 alone", fn ->
+      {:ok, local_only} = LlamaCppEx.Model.load(drafter, devices: ["CUDA0"], n_gpu_layers: -1)
+      dflash.(local_only)
+    end)
+
+    E2E.step("DFlash, drafter on the target's devices", fn ->
+      {:ok, d} =
+        LlamaCppEx.Model.load(drafter,
+          devices: ["CUDA0", "RPC0"],
+          split_mode: :layer,
+          tensor_split: [1.0, 0.0],
+          n_gpu_layers: -1
+        )
+
+      dflash.(d)
     end)
 
     GenServer.stop(local)

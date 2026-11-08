@@ -92,6 +92,7 @@ defmodule LlamaCppEx.MTP do
   """
 
   alias LlamaCppEx.{Context, Model, Sampler, Tokenizer}
+  require Logger
 
   @enforce_keys [:main_ctx, :mtp_ctx, :spec_ref, :n_draft]
   defstruct [:main_ctx, :mtp_ctx, :spec_ref, :n_draft]
@@ -129,12 +130,16 @@ defmodule LlamaCppEx.MTP do
       * `:dspark` - a DSpark drafter (DFlash plus a Markov head), passed as
         `:draft_model`.
     * `:draft_model` - A separate `LlamaCppEx.Model` holding the drafter.
-      Required for `:dflash` and `:dspark`, and loaded on every device the
-      target uses (`LlamaCppEx.Model.devices/1`): a DFlash drafter computes
-      with the target's embeddings and LM head. For a target split across an
-      RPC worker, load the drafter with the same `:devices` and a
-      `:tensor_split` that keeps its layers local. For `:mtp` it is the sidecar head
-      for checkpoints that ship one rather than embedding it (Qwen 3.8:
+      Required for `:dflash` and `:dspark`. A DFlash drafter computes with the
+      target's embeddings and LM head; its context gets a backend for every
+      device the target uses, so the drafter can sit on a subset of them
+      (e.g. `CUDA0` alone beside a target split onto an RPC worker). The
+      drafter reads the target's features from the target's output device,
+      so a target split onto an RPC worker should list the local device last
+      (`devices: ["RPC0", "CUDA0"]`); with the RPC device last, every verify
+      ships them over the network and DFlash decodes slower than plain
+      (`init/2` logs a warning). For `:mtp` it is the sidecar head for
+      checkpoints that ship one rather than embedding it (Qwen 3.8:
       `Qwen3.8-27B-Q4_K_M.gguf` plus `mtp-Qwen3.8-27B-Q4_0.gguf`; Gemma4 E4B:
       a `gemma4` target plus a `gemma4-assistant` head), loaded with
       `load_mtp: true`. Defaults to `nil`, meaning the MTP head is expected
@@ -159,9 +164,32 @@ defmodule LlamaCppEx.MTP do
 
     with :ok <- validate_n_draft(n_draft),
          {:ok, head_model} <- validate_drafter(type, model, draft_model) do
+      warn_remote_output(type, model)
       do_init(model, head_model, opts, n_draft, type)
     end
   end
+
+  # Upstream (#31506) keeps the target-layer features a DFlash/DSpark drafter
+  # reads in a buffer on the target's output device. When that device is an RPC
+  # worker, every verify moves the features over the network: Qwen3.8-27B NVFP4
+  # split over two GB10s decoded at 7.9 tok/s with ["CUDA0", "RPC0"] against
+  # 32.5 with ["RPC0", "CUDA0"], plain decode 13.7.
+  defp warn_remote_output(type, model) when type in [:dflash, :dspark] do
+    last = List.last(Model.devices(model))
+
+    if last && last in Enum.map(LlamaCppEx.RPC.devices(), & &1.name) do
+      Logger.warning(
+        "LlamaCppEx.MTP: the target's output layer is on RPC device #{last}, so " <>
+          "#{type} reads the target's features over the network and decodes several " <>
+          "times slower than plain. List the local device last in the target's " <>
+          ":devices (e.g. [\"RPC0\", \"CUDA0\"])."
+      )
+    end
+
+    :ok
+  end
+
+  defp warn_remote_output(_type, _model), do: :ok
 
   defp validate_n_draft(n) when is_integer(n) and n > 0, do: :ok
   defp validate_n_draft(_), do: {:error, ":n_draft must be a positive integer"}
@@ -172,25 +200,12 @@ defmodule LlamaCppEx.MTP do
   # in the NIF, where the model's target-layer metadata is readable: upstream's
   # constructor asserts on it, so it has to be refused before init.
   #
-  # The device check has to happen here, before the draft context exists. A
-  # DFlash drafter computes with the target's token embeddings and LM head
-  # (shared through ctx_other), so its context needs a backend for every device
-  # the target placed weights on. A target split onto an RPC worker with the
-  # drafter on CUDA0 alone aborted the VM with "pre-allocated tensor
-  # (output.weight) in a buffer (RPC0) that cannot run the operation".
-  defp validate_drafter(type, target, %Model{} = draft) when type in [:dflash, :dspark] do
-    case Model.devices(target) -- Model.devices(draft) do
-      [] ->
-        {:ok, draft}
-
-      missing ->
-        {:error,
-         "the drafter reads the target's embeddings and LM head, so it must be loaded " <>
-           "on every device the target uses; it is missing #{Enum.join(missing, ", ")}. " <>
-           "Load it with the target's :devices (a :tensor_split can still keep its " <>
-           "own layers on one of them)"}
-    end
-  end
+  # Device placement is not checked. Before upstream #31635 (vendored since
+  # a691b2345) a drafter missing one of the target's devices aborted the VM
+  # ("pre-allocated tensor (output.weight) in a buffer (RPC0) that cannot run
+  # the operation"); the draft context now gets the target's backends too.
+  defp validate_drafter(type, _target, %Model{} = draft) when type in [:dflash, :dspark],
+    do: {:ok, draft}
 
   defp validate_drafter(type, _target, nil) when type in [:dflash, :dspark],
     do: {:error, "type: #{inspect(type)} needs the drafter GGUF passed as draft_model:"}

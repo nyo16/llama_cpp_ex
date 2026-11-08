@@ -690,8 +690,10 @@ bool rpc_probe_hello(const std::string& endpoint, int timeout_ms) {
 
     bool ok = false;
     for (addrinfo* ai = res; ai && !ok; ai = ai->ai_next) {
-        int fd = socket(ai->ai_family, ai->ai_socktype | SOCK_CLOEXEC, ai->ai_protocol);
+        // SOCK_CLOEXEC is Linux/BSD only; macOS has no such socket() flag.
+        int fd = socket(ai->ai_family, ai->ai_socktype, ai->ai_protocol);
         if (fd < 0) continue;
+        fcntl(fd, F_SETFD, FD_CLOEXEC);
 
         int flags = fcntl(fd, F_GETFL, 0);
         fcntl(fd, F_SETFL, flags | O_NONBLOCK);
@@ -1083,10 +1085,6 @@ int64_t model_n_layer_nextn(ErlNifEnv* env, fine::ResourcePtr<LlamaModel> model)
 LLAMA_NIF(model_n_layer_nextn, 0);
 
 // Names of the devices the model's layers were placed on, in placement order.
-// LlamaCppEx.MTP uses it to refuse a DFlash drafter that cannot reach the
-// target's embeddings and LM head (shared via ctx_other): a draft context
-// without the device holding them hits "pre-allocated tensor ... in a buffer
-// that cannot run the operation", a GGML_ABORT.
 std::vector<std::string> model_devices(ErlNifEnv* env, fine::ResourcePtr<LlamaModel> model) {
     std::vector<std::string> names;
     const int32_t n = llama_model_n_devices(model->model);

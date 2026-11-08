@@ -171,7 +171,9 @@ defmodule LlamaCppEx.MTPCancelTest do
   # 2/4 (exit 134); the other two failed with the same `unknown exception` and
   # `"prompt decode failed: code=-2"` as above. At 785322d17 (b12032+1) four
   # runs aborted 3/4 (SIGSEGV, exit 139) and the fourth failed with the same
-  # `unknown exception`.
+  # `unknown exception`. At a691b2345 (b12205) four runs aborted 2/4 (exit 134:
+  # `GGML_ASSERT(idx == i - off)` in `common_batch`, `GGML_ASSERT(backend)` in
+  # `ggml-backend.cpp`) and the other two passed.
   #
   # It therefore still lives in its own module carrying only `:mtp_cancel`, and
   # deliberately *not* `:mtp`: `--include` beats `--exclude` in ExUnit, so a
