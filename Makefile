@@ -36,7 +36,7 @@ endif
 # Pinned llama.cpp commit, used when vendor/llama.cpp has to be cloned. MUST
 # match the vendor/llama.cpp submodule; bump both together, see
 # docs/release-guide.md. Override to build the NIF against another revision.
-LLAMA_COMMIT ?= a691b2345844ce1b430201fc5fd404ce062e05f2
+LLAMA_COMMIT ?= 9daa0aa22b8aa0143344d7549dee1f0e32f048bb
 
 # The commit actually on disk. A submodule can be bumped without LLAMA_COMMIT
 # following it, and the build has to key off what is really there.

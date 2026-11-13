@@ -39,11 +39,13 @@ defmodule LlamaCppEx.RPC do
   > to catch.
   >
   > Registration is the exception and the reason this module is shaped the way it
-  > is. Upstream's registration aborts too (since llama.cpp #18626), so
-  > `add_server/1` first connects and exchanges the protocol HELLO itself: an
-  > unreachable or incompatible endpoint is reported as `{:error, :unreachable}`
-  > rather than aborting, so a two-node setup can be *checked* before a model
-  > load and is only *fatal* during one. Check with `ping/1` before you load;
+  > is. `add_server/1` first connects and exchanges the protocol HELLO itself,
+  > with a 5-second timeout: an unreachable or incompatible endpoint is reported
+  > as `{:error, :unreachable}`, so a two-node setup can be *checked* before a
+  > model load and is only *fatal* during one. (Upstream's own registration
+  > aborted on such an endpoint from llama.cpp #18626 until #30415; it still
+  > connects with no timeout and never re-contacts an endpoint it has already
+  > registered.) Check with `ping/1` before you load;
   > treat the VM as the unit of restart afterwards. Real fault isolation would
   > mean running the RPC client in a separate OS process, which is a different
   > architecture.
@@ -114,10 +116,11 @@ defmodule LlamaCppEx.RPC do
     * `{:error, :rpc_unsupported}` — the NIF was built without `LLAMA_RPC=1`.
     * `{:error, :unreachable}` — nothing answered within 5 seconds, the
       endpoint is not `host:port`, the peer's RPC protocol major/minor did not
-      match ours, or the worker reported no devices. Upstream aborts the VM on
-      the first three, and silently ignores the last one at registration, so
-      this check is the only thing standing between you and a crash or a model
-      that quietly loads onto the wrong devices.
+      match ours, or the worker reported no devices. Upstream returns no
+      registration for all four but waits on the operating system's connect
+      timeout, and `ggml_backend_register` silently ignores a missing
+      registration, so without this check the model would quietly load onto
+      the wrong devices.
   """
   @spec add_server(endpoint()) :: {:ok, non_neg_integer()} | {:error, error()}
   def add_server(endpoint) when is_binary(endpoint) do

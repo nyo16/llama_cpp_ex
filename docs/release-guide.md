@@ -368,10 +368,36 @@ op param (#30206). The RPC client's `supports_op` refuses only
 `kv_rows` attention it does not know to read. Run worker and client from the
 same release.
 
+Re-checked at `9daa0aa22` (b12361+7), covering the 163 commits from
+`a691b2345`, as a source diff: #1, #2 and #3 are as above.
+`ggml-cpu/CMakeLists.txt` was not touched. The `ggml-cuda.cu` diff is MMQ,
+FP8 (#28413), graph and pool work, none of it near
+`ggml_backend_cuda_comm_init`. `ggml_backend_rpc_start_server` was only
+reformatted and still returns `void`. The RPC client's recursive
+`serialize_graph`/`add_tensor` is unchanged, so the `+sssdcpu 256` note
+above still applies (not re-measured: no Spark for this bump).
+
+The RPC protocol goes 8.0.1 → **10.0.0**: #29413 (`cf92c1323`, load times)
+takes it to 9, and #29801 (`29dbbad2b`,
+ggml prune) removes `GGML_OP_ADD1`, `GGML_OP_DIAG_MASK_INF` and
+`GGML_OP_DIAG_MASK_ZERO` (`GGML_OP_COUNT` 102 → 99, every later op
+renumbers) and takes it to 10. The handshake refuses a major mismatch, so a
+v0.8.68 worker and a v0.8.69 client report `{:error, :unreachable}` rather
+than misread each other. The `HELLO` request and response layouts are
+unchanged, so `rpc_probe_hello` only needed its `static_assert` moved to 10.
+#30415 (`6122b566b`) makes `rpc_dispatcher::start` return false instead of
+`GGML_ABORT` on a bad endpoint, a failed connect or a failed HELLO, so
+`ggml_backend_rpc_add_server` returns `nullptr` again. The NIF's probe stays:
+upstream's connect has no timeout, and a registered endpoint is answered from
+`reg_map` without being contacted, so only the probe notices a peer that went
+away after registration.
+
 Of the `nyo16/llama.cpp` branches, `draft-ctx-other-devices` is upstream as
-#31635 (`e853ec9a8`, the same change), `rpc-add-server-no-abort` and
-`rpc-client-spin-wait` still apply unchanged, and `cuda-mmq-src1-reuse`
-conflicts with #31296 and #31047.
+#31635 (`e853ec9a8`, the same change), `rpc-add-server-no-abort` is
+superseded by #30415 (a different patch with the same effect), and
+`rpc-client-spin-wait` (still not upstream: the dispatcher only spins while a
+communicator holds it) conflicts with #29413 and needs a rebase, as does
+`cuda-mmq-src1-reuse`, which conflicts with #31296 and #31047.
 
 | # | Upstream defect | Our workaround | Still needed? |
 |---|---|---|---|

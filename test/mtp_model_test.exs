@@ -173,7 +173,11 @@ defmodule LlamaCppEx.MTPCancelTest do
   # runs aborted 3/4 (SIGSEGV, exit 139) and the fourth failed with the same
   # `unknown exception`. At a691b2345 (b12205) four runs aborted 2/4 (exit 134:
   # `GGML_ASSERT(idx == i - off)` in `common_batch`, `GGML_ASSERT(backend)` in
-  # `ggml-backend.cpp`) and the other two passed.
+  # `ggml-backend.cpp`) and the other two passed. At 9daa0aa22 (b12361+7), with
+  # Qwen3.6-27B (the 35B-A3B was not on the machine), seven runs aborted 4/7
+  # (exit 134, every time `GGML_ASSERT(logits != nullptr)` in
+  # `common/sampling.cpp`, reached from the MTP drafter's
+  # `common_sampler_sample`) and the other three passed.
   #
   # It therefore still lives in its own module carrying only `:mtp_cancel`, and
   # deliberately *not* `:mtp`: `--include` beats `--exclude` in ExUnit, so a

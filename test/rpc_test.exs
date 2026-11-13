@@ -77,10 +77,11 @@ defmodule LlamaCppEx.RPCTest do
     end
 
     test "a listener that is not an RPC worker is an error, never a crash" do
-      # Since llama.cpp #18626 upstream's own handshake aborts the process when
-      # the peer accepts and then answers wrongly, so this is the case the NIF's
-      # pre-flight HELLO exists for: one peer closes after reading the request,
-      # the other answers with bytes that are not a HELLO response.
+      # From llama.cpp #18626 until #30415 upstream's own handshake aborted the
+      # process when the peer accepted and then answered wrongly, so this is the
+      # case the NIF's pre-flight HELLO was written for: one peer closes after
+      # reading the request, the other answers with bytes that are not a HELLO
+      # response.
       for reply <- [:close, "HTTP/1.1 400 Bad Request\r\n\r\n"] do
         {:ok, listen} = :gen_tcp.listen(0, [:binary, active: false, ip: {127, 0, 0, 1}])
         {:ok, port} = :inet.port(listen)
