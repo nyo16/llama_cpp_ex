@@ -531,13 +531,15 @@ LLAMA_NIF(backend_free, 0);
 //   1. RPC_STATUS_ASSERT is GGML_ABORT (ggml-rpc.cpp:30). Any peer crash,
 //      network failure or malformed response terminates the OS process — the
 //      whole BEAM. There is no error return, no retry, no reconnect.
-//   2. Since #18626 (d0132a680) registration aborts too: the connect and the
-//      HELLO moved into rpc_dispatcher::start, which GGML_ABORTs on an
-//      unreachable endpoint, an unparseable one, or a version mismatch where
-//      ggml_backend_rpc_add_server used to return nullptr. rpc_add_server
-//      therefore probes the endpoint itself first (rpc_probe_hello), so a dead
-//      or mismatched node is still *detectable before load* and only *fatal
-//      during it*.
+//   2. Registration used to abort too: #18626 (d0132a680) moved the connect
+//      and the HELLO into rpc_dispatcher::start, which GGML_ABORTed on an
+//      unreachable, unparseable or version-mismatched endpoint. #30415
+//      (6122b566b) made those failures return nullptr again, but upstream
+//      still connects with no timeout and memoizes a registered endpoint
+//      forever, so a peer that has since gone away is only found mid-load,
+//      where it aborts. rpc_add_server therefore still probes the endpoint
+//      itself first (rpc_probe_hello, 5 s), so a dead or mismatched node is
+//      *detectable before load* and only *fatal during it*.
 
 #ifdef GGML_USE_RPC
 
@@ -622,7 +624,7 @@ bool rpc_wait_until_listening(const std::string& host, const std::string& port, 
 // the major version (the server's "client needs upgrade to protocol v%d.x"),
 // so a major bump stops the build here instead of failing every probe at run
 // time.
-static_assert(RPC_PROTO_MAJOR_VERSION == 8,
+static_assert(RPC_PROTO_MAJOR_VERSION == 10,
               "RPC protocol major changed: re-check rpc_probe_hello against "
               "rpc_msg_hello_req/rsp and RPC_CMD_HELLO in ggml-rpc.cpp");
 
@@ -775,16 +777,16 @@ rpc_add_server(ErlNifEnv* env, std::string endpoint) {
 #else
     size_t before = ggml_backend_dev_count();
 
-    // ggml_backend_rpc_add_server aborts the VM on an unreachable or
-    // mismatched endpoint (see the top of this section), so check first.
+    // Upstream connects with no timeout and answers a memoized endpoint without
+    // contacting it (see the top of this section), so check first.
     if (!rpc_probe_hello(endpoint, 5000)) {
         return fine::Error(atoms::unreachable);
     }
 
     ggml_backend_reg_t reg = ggml_backend_rpc_add_server(endpoint.c_str());
     if (!reg) {
-        // A worker reporting zero devices still comes back as nullptr, and
-        // ggml_backend_register silently no-ops on nullptr — so without this
+        // An unreachable worker, or one reporting zero devices, comes back as
+        // nullptr, and ggml_backend_register silently no-ops on nullptr — so without this
         // check that node simply vanishes and the model loads onto the wrong
         // devices.
         return fine::Error(atoms::unreachable);

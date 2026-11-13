@@ -51,3 +51,12 @@ RPC, so the bump that brought it in (v0.8.5x) passed.
 - `rsync -a` preserves source mtimes: after editing a file on a node, a sync
   that restores an older-mtime copy leaves make's `.o` newer than its source.
   `touch` the source before rebuilding.
+
+## Update (llama.cpp 9daa0aa22, v0.8.69)
+
+Upstream #30415 (`6122b566b`) makes `rpc_dispatcher::start` return false
+instead of aborting, so `ggml_backend_rpc_add_server` returns `nullptr` for an
+unreachable, unparseable or mismatched endpoint again. The probe stays: upstream
+connects with no timeout and answers an already-registered endpoint from
+`reg_map` without contacting it. The protocol is 10.0.0 now; the HELLO layout
+did not change, so only the `static_assert` moved.

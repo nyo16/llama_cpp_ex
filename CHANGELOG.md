@@ -1,5 +1,95 @@
 # Changelog
 
+## v0.8.69
+
+llama.cpp bumped to `9daa0aa22` (b12361+7), 163 commits from `a691b2345`
+(b12205). Upstream versions: llama.cpp **1.0.0**, ggml **1.0.0** (#32190,
+ggml/1690). The NIF needed one change, in the RPC probe (below). #30565 and
+#29801 prune deprecated API: every `DEPRECATED` function in `llama.h`
+(`llama_load_model_from_file`, `llama_new_context_with_model`,
+`llama_token_*`, `llama_n_vocab`, the old state/session calls,
+`llama_set_warmup`, `llama_sampler_init_grammar_lazy`), the
+`defrag_thold` field of `llama_context_params`, and the `ggml_add1`,
+`ggml_diag_mask_*`, `ggml_rope_custom*` and `*_set_prec` ops; the NIF calls
+none of them. The NextN/DFlash queries move from `src/llama-ext.h` into
+`llama.h` unchanged. `common.h` and `chat.h` only add.
+`llama_model_default_params` is unchanged and `llama_context_default_params`
+only loses `defrag_thold`. `tokenizer_st_partition` and the BOS/EOS rules in
+`src/llama-vocab.cpp` are untouched (the diff only deletes the deprecated
+wrappers), and so are `tools/server/server-decision.*`, so
+`input_tokenize.cpp` and the decision port need no change.
+
+Checked on an M1 Max (Metal): the default suite on a default build and on an
+`LLAMA_RPC=1` build, plus `:rpc_live` against a local `RPC.Server` worker;
+`:smoke`, `:embeddings` (Qwen3-Embedding and
+embeddinggemma-2), `:slow`, `:mtp` (Qwen3.6-27B), `:tools`, `:decision`,
+`:decision_clef`, `:mtp_sidecar` (Qwen3.8-27B) and `test/vm_exit_test.exs`;
+and `scripts/decision_compare.exs` — ALL MATCH on 9 models (tinylaya,
+tinyopenjev, Clef Flash, d1-3B, d1-omni-600M, d1-2B, vllm-decision2 Kai,
+vllm-d3-edge, h2o-lightning-4b) against llama-server at the same commit. Not
+run on a DGX Spark for this release.
+
+### Changed
+
+- **RPC protocol 10.0.0** (was 8.0.1): #29413 takes it to 9 and the ggml
+  prune (#29801) to 10, removing three ops so every later op id moves. A
+  worker and a client must both run v0.8.69; against an older worker
+  `LlamaCppEx.RPC.add_server/1` and `ping/1` return `{:error, :unreachable}`.
+  The HELLO layout did not change, so the NIF's probe only moves its
+  `static_assert` to 10.
+- Upstream registration no longer aborts on an unreachable, unparseable or
+  mismatched endpoint (#30415). `LlamaCppEx.RPC` keeps its own pre-flight
+  HELLO: upstream's connect has no timeout, and a registered endpoint is
+  answered from upstream's cache without being contacted, so the probe is
+  still what lets `ping/1` notice a peer that went away. The `RPC` docs,
+  `docs/dgx-spark.md` and `docs/release-guide.md` say so; of the
+  `nyo16/llama.cpp` branches, `rpc-add-server-no-abort` is superseded and
+  `rpc-client-spin-wait` now conflicts with #29413 and needs a rebase.
+- `decision.cpp` is now "Ported at" `9daa0aa22`; no hunk needed porting.
+- `test/mtp_model_test.exs` records `:mtp_cancel` at this commit: 4 of 7 runs
+  abort (exit 134, `GGML_ASSERT(logits != nullptr)` in `common_sampler_sample`
+  from the MTP drafter), the other three pass. The race it documents is
+  unchanged.
+
+### Known issue
+
+- `split_mode: :tensor` with an RPC device in `:devices` still needs
+  `+sssdcpu 256`: the RPC client's recursive graph serializer is unchanged
+  (see v0.8.68). Not re-measured.
+
+### Upstream
+
+- From the 163 commits:
+  - MTP reads the target's hidden states from a device buffer (#31927); the
+    NextN API is public in `llama.h`.
+  - FP8 (E4M3) KV cache (#28392) and OCP FP8 on CUDA (#28413). `:type_k` /
+    `:type_v` do not offer it yet.
+  - The non-fused gated delta net path and the ubatch-dependent graph nodes
+    are gone (#32078).
+  - The backend scheduler is reused when its parameters are compatible
+    (#32009) and graph results are reused across reserves (#32089); unused
+    graph metadata pages are no longer touched (#32043); inputs that are not
+    read are not uploaded (#31419).
+  - Every sampling chain is marked as a graph output so its tensors are not
+    aliased (#32015).
+  - CPU flash attention accumulates V in F32 (#29810); the 4x4 SIMD GEMM tile
+    on ARM NEON (#32128). CPU results move slightly.
+  - Grammar matching is faster through left factoring (#29557).
+  - Chat: Kimi K2 Horizon closer at medium/low effort (#30335), Gemma 4
+    schema rules rebuilt (#31915), Muse Spark honours `response_format`
+    (#32017), no lazy grammar when `response_format` is combined with tools
+    (#31956), control characters escaped in tool argument strings (#31937),
+    `allOf` with plain types fixed in JSON-schema grammars (#31834); jinja
+    supports chained comparisons and argument unpacking (#32072).
+  - Metal: out-of-bounds fixes in the FA output (#31662) and `SOLVE_TRI`
+    (#32103); `ggml_tri` selects instead of scaling (#30711).
+  - CUDA: few-row MMQ for batch sizes 2–24 (#31533), NVFP4 weight scale fused
+    in the MMQ epilogue (#26048), BF16 `RMS_NORM` (#32135), SM103 SASS in
+    non-native builds (#30099), deterministic tied top-k (#31084).
+  - The iGPU lazy-mode fallback applies only when mmap is off (#31957); the
+    default iGPU load path is unchanged.
+  - Vulkan, SYCL, OpenCL, Hexagon, WebGPU, zDNN, SpacemiT and mtmd work.
+
 ## v0.8.68
 
 llama.cpp bumped to `a691b2345`

@@ -9,15 +9,19 @@ The work behind this page produced four llama.cpp branches on
 `nyo16/llama.cpp`, each based on `785322d17`, the commit vendored through
 v0.8.67. A fifth, `spark-all`, merges all four. v0.8.68 vendors `a691b2345`,
 which carries `draft-ctx-other-devices` as upstream #31635 (`e853ec9a8`, the
-same change). The two RPC branches still apply to it unchanged;
-`cuda-mmq-src1-reuse` conflicts with upstream's NVFP4 gate/up/GLU MMQ fusion
-(#31296) and MoE layout change (#31047) and needs a rebase.
+same change). v0.8.69 vendors `9daa0aa22`, where #30415 (`6122b566b`) makes
+an unreachable endpoint fail registration instead of aborting, the effect of
+`rpc-add-server-no-abort` by a different patch. `rpc-client-spin-wait` no
+longer applies: it conflicts in `ggml-rpc.cpp` with #29413 (`cf92c1323`, RPC
+load times) and needs a rebase, as does `cuda-mmq-src1-reuse`, which
+conflicts with upstream's NVFP4 gate/up/GLU MMQ fusion (#31296) and MoE
+layout change (#31047).
 
 | branch | effect on GB10 | section |
 |---|---|---|
 | `cuda-mmq-src1-reuse` | NVFP4 prefill +19–20% (src1 reuse, weight-scale fold, SWIGLU in MMQ); gpt-oss-120b prefill +8% (expert biases) | Qwen3.8-27B NVFP4, gpt-oss-120b prefill |
 | `rpc-client-spin-wait` | two-node decode +30% unpinned (gpt-oss-120b 44 → 57.6 tok/s, single node 59) | The cause, and a fix |
-| `rpc-add-server-no-abort` | an unreachable worker returns an error instead of aborting | Five things, #1 |
+| `rpc-add-server-no-abort` | an unreachable worker returns an error instead of aborting (upstream as #30415 since `9daa0aa22`) | Five things, #1 |
 | `draft-ctx-other-devices` | DFlash with the target split over RPC (upstream as #31635 since `a691b2345`) | Speculative decoding across two nodes |
 
 ## The machine
@@ -656,13 +660,14 @@ wrong devices" into `{:error, :unreachable}`. After the load, treat the VM as th
 unit of restart. Real fault isolation means putting the RPC client in a separate
 OS process, which is a different architecture.
 
-Upstream's registration aborts too since #18626 — an unreachable endpoint, a
-listener that is not an RPC worker, a version mismatch and a malformed
-`host:port` all reach `GGML_ABORT` in `rpc_dispatcher::start`. So the NIF
-connects and exchanges the protocol HELLO itself before registering, with a
-5-second timeout. That is what keeps `ping/1` a check rather than a crash on
-this llama.cpp; the matching upstream fix is branch `rpc-add-server-no-abort`
-on `nyo16/llama.cpp`.
+From #18626 until #30415 (v0.8.68 and older), upstream's registration aborted
+too — an unreachable endpoint, a listener that is not an RPC worker, a version
+mismatch and a malformed `host:port` all reached `GGML_ABORT` in
+`rpc_dispatcher::start`. #30415 turns them into a failed registration, but
+upstream still connects with no timeout and answers a registered endpoint from
+its cache without contacting it. So the NIF still connects and exchanges the
+protocol HELLO itself before registering, with a 5-second timeout; that is what
+makes `ping/1` report a peer that has gone away since it was registered.
 
 ### 2. `devices/0` order is NOT `tensor_split` order
 
