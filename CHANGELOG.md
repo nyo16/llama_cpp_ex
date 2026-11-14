@@ -1,6 +1,9 @@
 # Changelog
 
-## Unreleased
+## v0.8.70
+
+llama.cpp stays at `9daa0aa22`. The `generate_mtp_tokens` NIF changed, so
+this release ships new precompiled NIFs.
 
 ### Fixed
 
@@ -13,8 +16,9 @@
   session for its whole run, so a second call waits, at most one
   draft-and-verify iteration after a cancel. The test moves from the
   known-broken `:mtp_cancel` tag into `:mtp` and checks the greedy output
-  after three cancelled streams; the `:mtp_cancel` tag is gone. This changes
-  the NIF, so the release ships new precompiled NIFs.
+  after three cancelled streams; the `:mtp_cancel` tag is gone. A call made
+  while another is still running on the same session also waits for it now,
+  where it used to decode beside it.
 
 ## v0.8.69
 
