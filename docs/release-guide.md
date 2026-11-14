@@ -482,11 +482,6 @@ LLAMA_RPC=1 LLAMA_BACKEND=metal MIX_ENV=test mix run --no-halt -e \
 LLAMA_RPC=1 LLAMA_RPC_ENDPOINT=127.0.0.1:50052 \
   mix test --include rpc_live
 
-# :mtp_cancel is the one tag that is not expected to pass; run it to confirm
-# how it fails, and update test/mtp_model_test.exs if the failure mode moved.
-LLAMA_SMOKE_MTP_MODEL=~/Downloads/Qwen3.6-35B-A3B-MTP-UD-Q4_K_XL.gguf \
-  mix test --only mtp_cancel
-
 # Verify formatting and types
 mix format --check-formatted
 mix dialyzer

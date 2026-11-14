@@ -138,6 +138,26 @@ defmodule LlamaCppEx.MTPModelTest do
     assert MTP.print_stats(mtp) == :ok
   end
 
+  # Regression: cancelling a stream is fire-and-forget, so the consumer gets
+  # control back while the cancelled loop can still be inside a decode on the
+  # session's two contexts. A call made right then decoded into the same KV
+  # caches: from b10435 to 9daa0aa22 this aborted the VM in roughly half the
+  # runs (last as `GGML_ASSERT(logits != nullptr)` in the MTP drafter) or
+  # failed with "verify decode failed". `generate_mtp_tokens` now holds the
+  # session for its whole run, so the next call waits for the cancelled one.
+  # Three rounds, and the greedy text compared, because a lost race need not
+  # crash: it can only corrupt the cache.
+  test "a session is reusable right after a halted stream", %{session: mtp} do
+    opts = [max_tokens: 8, temp: 0.0, seed: 7]
+    assert {:ok, expected} = MTP.generate(mtp, "2 + 2 =", opts)
+
+    for _ <- 1..3 do
+      taken = mtp |> MTP.stream("Write an endless story:", max_tokens: 400) |> Enum.take(3)
+      assert length(taken) == 3
+      assert {:ok, ^expected} = MTP.generate(mtp, "2 + 2 =", opts)
+    end
+  end
+
   # The event vocabulary stream_events/3 documents.
   defp event_kind({:token, id, text}) when is_integer(id) and is_binary(text), do: :token
   defp event_kind({:stats, snapshot}) when is_map(snapshot), do: :stats
@@ -145,89 +165,6 @@ defmodule LlamaCppEx.MTPModelTest do
   defp event_kind({:eog, nil}), do: :terminal
   defp event_kind({:error, _reason}), do: :terminal
   defp event_kind(_), do: :undocumented
-end
-
-defmodule LlamaCppEx.MTPCancelTest do
-  # KNOWN BUG, kept as an executable record rather than deleted.
-  #
-  # At b10435 this test did not fail — it took the VM down, with
-  # `GGML_ASSERT(offset + size <= ggml_nbytes(tensor))` or a plain SIGSEGV.
-  # At b10582 it no longer aborts: it fails, racily, with
-  # `{:error, "prompt decode failed: code=-1"}` or `"verify decode failed:
-  # code=-1"` from the `generate/3` below — and sometimes passes. Measured on
-  # M1 Max / Metal with Qwen3.6-35B-A3B-MTP, four runs each: b10435 aborted 4/4
-  # (one exit 134, three exit 139), b10582 aborted 0/4 (3 failed, 1 passed).
-  # The race is unchanged and unfixed; only its consequence moved from "kills
-  # the BEAM" to "returns an error", so the two decode paths now refuse the
-  # half-released context instead of writing through it.
-  #
-  # It aborts again, somewhere between b10582 and b11479: six runs each at
-  # 88dcc460d (b11479+4) and at 23b0202a1 (b11552) aborted 4/6 (exit 134 or
-  # 139); the rest failed with `"verify decode failed: code=-1"`, `"prompt
-  # decode failed: code=-2"`, or `unknown exception thrown within NIF` raised
-  # from the cancelled stream's own `generate_mtp_tokens` call. Same model and
-  # machine as above, so the abort is not new in 23b0202a1; nothing between
-  # v0.8.49 and v0.8.56 ran this tag. At a0e6dc738 (b11630+9) four runs aborted
-  # 2/4 (exit 134); the other two failed with the same `unknown exception` and
-  # `"prompt decode failed: code=-2"` as above. At 785322d17 (b12032+1) four
-  # runs aborted 3/4 (SIGSEGV, exit 139) and the fourth failed with the same
-  # `unknown exception`. At a691b2345 (b12205) four runs aborted 2/4 (exit 134:
-  # `GGML_ASSERT(idx == i - off)` in `common_batch`, `GGML_ASSERT(backend)` in
-  # `ggml-backend.cpp`) and the other two passed. At 9daa0aa22 (b12361+7), with
-  # Qwen3.6-27B (the 35B-A3B was not on the machine), seven runs aborted 4/7
-  # (exit 134, every time `GGML_ASSERT(logits != nullptr)` in
-  # `common/sampling.cpp`, reached from the MTP drafter's
-  # `common_sampler_sample`) and the other three passed.
-  #
-  # It therefore still lives in its own module carrying only `:mtp_cancel`, and
-  # deliberately *not* `:mtp`: `--include` beats `--exclude` in ExUnit, so a
-  # second gate tag would drag a flaky test back into `--include mtp` runs.
-  # Run it on purpose:
-  #
-  #   LLAMA_BACKEND=auto \
-  #   LLAMA_SMOKE_MTP_MODEL=... mix test --include mtp_cancel
-  #
-  # Cancellation is fire-and-forget: `request_cancel` sets an atomic flag and the
-  # MTP loop then "stops quietly" (`llama_nif.cpp:2009`) without emitting any
-  # terminal event. `Generator.stop/1` cancels, unlinks and drains the mailbox,
-  # but it has no completion signal to wait on, so it returns while the dirty
-  # scheduler may still be inside `llama_decode`. For `LlamaCppEx.stream/3` that
-  # is harmless — each call owns a context that dies with it. An `%MTP{}` session
-  # is not: it holds two long-lived contexts and is documented as reusable across
-  # calls, so the `generate/3` below can start decoding on the very contexts the
-  # cancelled loop has not released. Two writers, one KV cache.
-  #
-  # The fix is to acknowledge cancellation — have the loop emit a terminal event
-  # when it observes the flag and have `Generator.stop/1` await it — which changes
-  # the NIF and the cancellation protocol that non-MTP streaming also uses. That
-  # is why it is not bundled into a submodule bump.
-  use ExUnit.Case, async: false
-
-  alias LlamaCppEx.MTP
-
-  @moduletag :mtp_cancel
-  @moduletag timeout: 300_000
-
-  setup_all do
-    :ok = LlamaCppEx.init()
-
-    {:ok, model} =
-      LlamaCppEx.load_model(LlamaCppEx.TestModels.path!(:mtp),
-        n_gpu_layers: -1,
-        load_mtp: true
-      )
-
-    {:ok, mtp} = MTP.init(model, n_ctx: 2048, n_draft: 3)
-    %{session: mtp}
-  end
-
-  test "a halted stream stops generation instead of running to max_tokens", %{session: mtp} do
-    taken = mtp |> MTP.stream("Write an endless story:", max_tokens: 400) |> Enum.take(3)
-    assert length(taken) == 3
-
-    # The MTP value is still usable afterwards.
-    assert {:ok, _} = MTP.generate(mtp, "2 + 2 =", max_tokens: 4, temp: 0.0)
-  end
 end
 
 defmodule LlamaCppEx.MTPSidecarTest do

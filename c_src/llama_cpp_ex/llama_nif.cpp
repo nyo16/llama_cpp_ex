@@ -3013,6 +3013,10 @@ fine::Ok<> generate_mtp_tokens(
     fine::ResourcePtr<CancelFlag> cancel)
 {
     auto& sp = *spec_res;
+    // One run per session at a time; see LlamaSpeculative::run_mutex. Taken
+    // before anything below touches the contexts, and released after the
+    // abort scope has restored the target's callback.
+    std::lock_guard<std::mutex> run_lock(sp.run_mutex);
     auto* ctx_tgt = sp.ctx_tgt->ctx;
     auto* ctx_dft = sp.ctx_dft->ctx;
     auto* sampler = sampler_res->sampler;

@@ -1,5 +1,21 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+
+- Reusing an `LlamaCppEx.MTP` session right after abandoning one of its
+  streams (`Enum.take/2`, an exception) no longer races the cancelled loop.
+  Cancellation is unacknowledged, so the next `generate/3` or `stream/3`
+  could decode into the session's two contexts while the cancelled loop was
+  still inside a decode; at `9daa0aa22` that aborted the VM in 4 of 7 runs
+  (`GGML_ASSERT(logits != nullptr)`). `generate_mtp_tokens` now holds the
+  session for its whole run, so a second call waits, at most one
+  draft-and-verify iteration after a cancel. The test moves from the
+  known-broken `:mtp_cancel` tag into `:mtp` and checks the greedy output
+  after three cancelled streams; the `:mtp_cancel` tag is gone. This changes
+  the NIF, so the release ships new precompiled NIFs.
+
 ## v0.8.69
 
 llama.cpp bumped to `9daa0aa22` (b12361+7), 163 commits from `a691b2345`
