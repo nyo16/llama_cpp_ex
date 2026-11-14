@@ -1,10 +1,10 @@
 %{
-  "llama_cpp_ex-nif-2.17-aarch64-apple-darwin-0.8.68.tar.gz" => "sha256:6f6fe15d73df4a8d0b448ef68fb574aea21c4343a647f0e60093204129d92a5a",
-  "llama_cpp_ex-nif-2.17-x86_64-linux-gnu-0.8.68.tar.gz" => "sha256:d04f00e4ef42e90b49fbb5ba9448417a5e3423cec41534ad85099e857f0fc057",
-  "llama_cpp_ex-nif-2.17-x86_64-linux-gnu-cu12-0.8.68.tar.gz" => "sha256:c7e14b1978826608a35dff23144245b873b6e01967792e8e0950ad345a682aac",
-  "llama_cpp_ex-nif-2.17-x86_64-linux-gnu-cu13-0.8.68.tar.gz" => "sha256:a53d14081c77b337a04f4d129abd97136a7e20d743cade1b5921e258813a3cd9",
-  "llama_cpp_ex-nif-2.18-aarch64-apple-darwin-0.8.68.tar.gz" => "sha256:7c2ca5b3d5e89c912c5742f6127da037b7b448c4168d1f730305fde2783bfc7e",
-  "llama_cpp_ex-nif-2.18-x86_64-linux-gnu-0.8.68.tar.gz" => "sha256:674b553d6b0dba401402c9c48b7b49867168a07ca88fa643372e708284b24a22",
-  "llama_cpp_ex-nif-2.18-x86_64-linux-gnu-cu12-0.8.68.tar.gz" => "sha256:7d9550c0dafebdd6326c921bb58f1f9210059a4338d82e5cdab43b56a5ea5e40",
-  "llama_cpp_ex-nif-2.18-x86_64-linux-gnu-cu13-0.8.68.tar.gz" => "sha256:b40ed2f8e5fa049f99f1f02479e38268dbf204c7b3dc82999fd4bb0bc07bd215",
+  "llama_cpp_ex-nif-2.17-aarch64-apple-darwin-0.8.69.tar.gz" => "sha256:434885288010788a6d26cddb53af43a5ae00402323a2e0d40680a356e751e7f5",
+  "llama_cpp_ex-nif-2.17-x86_64-linux-gnu-0.8.69.tar.gz" => "sha256:e82eb78d1652c732a4735fd7246d620d4db4dca959f9fa9401edfa4d81d425e0",
+  "llama_cpp_ex-nif-2.17-x86_64-linux-gnu-cu12-0.8.69.tar.gz" => "sha256:9bcce925374da9f04c181e691736d7e2e94070ef11181b9860759dc641a4f1e0",
+  "llama_cpp_ex-nif-2.17-x86_64-linux-gnu-cu13-0.8.69.tar.gz" => "sha256:ac89901375b9a50a73f8ecf3d6f93e4ac14b545b24a4f64366bfb9179a2ab9c4",
+  "llama_cpp_ex-nif-2.18-aarch64-apple-darwin-0.8.69.tar.gz" => "sha256:aa5ed1e95ed4ef385a4a4791d1093b523181ead272b56121c511f03681467dc6",
+  "llama_cpp_ex-nif-2.18-x86_64-linux-gnu-0.8.69.tar.gz" => "sha256:49aba41005d8463d75bce7d88b2f4597cd1b528e9a20c3c964faa8077f7316b4",
+  "llama_cpp_ex-nif-2.18-x86_64-linux-gnu-cu12-0.8.69.tar.gz" => "sha256:5aa6dce4ca865db0fab247571f0ebfe8bdf392c7eca78135ebd26d756f77d6b6",
+  "llama_cpp_ex-nif-2.18-x86_64-linux-gnu-cu13-0.8.69.tar.gz" => "sha256:81c4918a92deef585b8107bd03530e34f3792fa48d58c09df457557feea679b4",
 }
