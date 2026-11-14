@@ -334,6 +334,13 @@ public:
     std::atomic<uint64_t> us_other{0};
     std::atomic<uint64_t> us_total{0};
 
+    // Held by generate_mtp_tokens for its whole run. A session is reusable
+    // across calls, and a cancelled stream is fire-and-forget: the consumer
+    // returns while the cancelled loop can still be inside a target or draft
+    // decode, and only notices the flag at its next check. A second call
+    // waits here instead of decoding into the same two contexts at once.
+    std::mutex run_mutex;
+
     LlamaSpeculative(common_speculative* s,
                      fine::ResourcePtr<LlamaContext> tgt,
                      fine::ResourcePtr<LlamaContext> dft,

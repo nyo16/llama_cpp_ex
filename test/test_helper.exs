@@ -18,14 +18,6 @@
 #                 unset, so `--include mtp_sidecar` with only the Qwen pair
 #                 stays green. Its own tag rather than `:mtp` because that
 #                 tag's single-file model cannot satisfy it.
-#   :mtp_cancel — one known-broken MTP test, excluded on its own tag so that
-#                 `--include mtp` is green. Cancelling an MTP stream is
-#                 fire-and-forget, so reusing the session immediately afterwards
-#                 races the still-running draft loop over shared contexts. At
-#                 b10435 that aborted the VM; at b10582 it failed racily instead
-#                 (3 of 4 runs) and did not abort; by b11479 it aborts again
-#                 (4 of 6 runs at 23b0202a1). Either way it does not belong in
-#                 a green run. See test/mtp_model_test.exs.
 #   :dflash     — DFlash speculative decoding (MTP.init type: :dflash); needs
 #                 LLAMA_SMOKE_DFLASH_MODEL and LLAMA_SMOKE_DFLASH_DRAFT_MODEL,
 #                 a target and the `dflash` drafter trained for it (e.g.
@@ -120,7 +112,6 @@ ExUnit.start(
     :embeddings,
     :slow,
     :mtp,
-    :mtp_cancel,
     :mtp_sidecar,
     :decision,
     :decision_clef,

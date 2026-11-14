@@ -69,18 +69,11 @@ defmodule LlamaCppEx.MTP do
   Upstream currently requires `n_parallel = 1` for MTP. This module reflects
   that — a single MTP session decodes one sequence at a time. Reuse the same
   `%MTP{}` value across calls to `stream/3` / `generate/3` to avoid rebuilding
-  the contexts; KV caches are cleared on each call.
-
-  > #### Do not reuse a session straight after abandoning a stream {: .warning}
-  >
-  > Cancellation is asynchronous and unacknowledged: abandoning a `stream/3`
-  > early (`Enum.take/2`, `break`, an exception) sets a flag that the draft loop
-  > notices and then exits without reporting that it has done so. A session's two
-  > contexts are long-lived and shared by every call on it, so starting the next
-  > `generate/3` or `stream/3` immediately can put a second writer on a KV cache
-  > the cancelled loop has not finished with — which aborts the VM rather than
-  > returning an error. Let an abandoned stream run to a terminal event, or build
-  > a fresh session with `init/2`, before using the session again.
+  the contexts; KV caches are cleared on each call. Calls on one session run
+  one after another: a call made while another is still decoding, including a
+  stream abandoned early (`Enum.take/2`, an exception) whose loop has not yet
+  noticed its cancel flag, waits for it to finish. The wait after an abandoned
+  stream is at most one draft-and-verify iteration.
 
   MTP is the only speculative type this binding exposes. Upstream llama.cpp
   also implements EAGLE-3, DFlash (block-diffusion drafting), n-gram
