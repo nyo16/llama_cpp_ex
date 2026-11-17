@@ -162,7 +162,7 @@ sequenceDiagram
     Ctx->>NIF: generate(ctx, sampler, tokens, 100)
 
     loop For each token (on DirtyCPU scheduler)
-        NIF->>NIF: llama_decode(batch)
+        NIF->>NIF: llama_process(DECODE, batch)
         NIF->>NIF: llama_sampler_sample(sampler, ctx, -1)
         NIF->>NIF: llama_sampler_accept(sampler, token)
         Note over NIF: Check for EOG token
@@ -191,7 +191,7 @@ sequenceDiagram
     Stream->>Gen: spawn_link(generate_tokens NIF)
 
     loop Token generation
-        NIF->>NIF: llama_decode + llama_sampler_sample
+        NIF->>NIF: llama_process + llama_sampler_sample
         NIF-->>Stream: enif_send {ref, {:token, id, "text"}}
         Stream-->>User: "text" (via Enum.each)
     end
@@ -260,8 +260,8 @@ graph TD
     D -->|"One tick = one forward pass"| E[batch_eval NIF]
 
     subgraph "C++ Layer"
-        E --> F[Build llama_batch<br/>decode tokens + prefill chunks]
-        F --> G[Single llama_decode call]
+        E --> F[Build llama_batch_ext<br/>decode tokens + prefill chunks]
+        F --> G[Single llama_process call]
     end
 
     G --> H[sampler_sample_at per slot]

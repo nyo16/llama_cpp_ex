@@ -6,9 +6,11 @@
 #include "speculative.h"
 #include "decision.h"
 #include "input_tokenize.h"
+#include <algorithm>
 #include <atomic>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <set>
 #include <string>
 #include <vector>
@@ -97,11 +99,73 @@ private:
     }
 };
 
+// A llama_batch_ext of single-sequence token entries, plus the per-entry output
+// flags the opaque batch does not expose (decode_tracked records them).
+// llama_batch_ext_init sizes it to the context's n_batch, so add() refuses an
+// entry past that instead of llama_context::decode's
+// GGML_ASSERT(n_tokens_all <= n_batch) aborting the VM. It also refuses a token
+// id outside the vocabulary and a seq id outside [0, n_seq_max), which is what
+// bounds the batch-carried ids coming from Elixir.
+class TokenBatch {
+public:
+    explicit TokenBatch(llama_context* ctx)
+        : ext_(llama_batch_ext_init(ctx))
+        , n_batch_(llama_n_batch(ctx))
+        , n_seq_max_(llama_n_seq_max(ctx)) {}
+    ~TokenBatch() { llama_batch_ext_free(ext_); }
+
+    TokenBatch(const TokenBatch&) = delete;
+    TokenBatch& operator=(const TokenBatch&) = delete;
+
+    void clear() {
+        llama_batch_ext_clear(ext_);
+        outputs_.clear();
+    }
+
+    // Appends one entry. Returns the reason on refusal; the batch is unchanged.
+    std::optional<std::string> add(llama_token id, llama_pos pos, llama_seq_id seq_id, bool output) {
+        const int32_t idx = llama_batch_ext_add_token(ext_, seq_id, id);
+        if (idx < 0) {
+            return add_error(idx, id, seq_id);
+        }
+        llama_batch_ext_set_pos(ext_, idx, &pos);
+        if (output) {
+            llama_batch_ext_set_output_logits(ext_, idx, true);
+        }
+        outputs_.push_back(output ? 1 : 0);
+        return std::nullopt;
+    }
+
+    llama_batch_ext* get() { return ext_; }
+    const std::vector<char>& outputs() const { return outputs_; }
+    int32_t n_batch() const { return n_batch_; }
+
+private:
+    llama_batch_ext* ext_;
+    std::vector<char> outputs_;
+    int32_t n_batch_;
+    uint32_t n_seq_max_;
+
+    std::string add_error(int32_t code, llama_token id, llama_seq_id seq_id) const {
+        switch (code) {
+        case -1:
+            return "batch exceeds n_batch (" + std::to_string(n_batch_) + " tokens)";
+        case -2:
+            return "invalid token id " + std::to_string(id);
+        case -3:
+            return "invalid seq_id " + std::to_string(seq_id) +
+                   " (must be 0 <= seq_id < " + std::to_string(n_seq_max_) + ")";
+        default:
+            return "llama_batch_ext_add_token failed with code: " + std::to_string(code);
+        }
+    }
+};
+
 // RAII wrapper for llama_context*
 // Holds a ResourcePtr to the model to prevent premature GC.
 //
 // INVARIANT: a context is driven by a single process (the Server GenServer or
-// one owning caller). The reusable `batch` below relies on that — decode-side
+// one owning caller). The reusable `batch_` below relies on that — decode-side
 // NIFs must never run concurrently on the same context from multiple
 // processes. (A single process can't overlap NIF calls, so no locking.)
 class LlamaContext {
@@ -115,11 +179,9 @@ public:
     // frees such a context before the one it points at.
     bool has_ctx_other = false;
 
-    // Reusable explicit batch for the decode-side NIFs (batch_eval,
-    // batch_eval_sample, decode_token, prefill), allocated once on first use
-    // and grown on demand instead of llama_batch_init/free per call.
-    llama_batch batch{};
-    int32_t batch_capacity = 0;
+    // Reusable batch for every decode on this context, created on first use.
+    // Its capacity is fixed at n_batch, so one allocation serves all calls.
+    std::unique_ptr<TokenBatch> batch_;
 
     // Whether this context was created with kv_unified: true. Captured because
     // llama_kv_cache::seq_cp aborts (GGML_ASSERT(is_full),
@@ -137,7 +199,7 @@ public:
     // caller, the decision engine, leaves either embeddings off or pooling NONE.
     bool pooled_embeddings = false;
 
-    // Shape of the last *successful* llama_decode on this context.
+    // Shape of the last *successful* decode on this context.
     //
     // `sampler_sample_at/3` takes its index straight from Elixir, and
     // llama_sampler_sample -> llama_get_logits_ith aborts on anything upstream's
@@ -154,22 +216,10 @@ public:
     int32_t n_outputs_last = 0;
     std::vector<char> logits_last;
 
-    void record_batch(const llama_batch& b) {
-        logits_last.assign(static_cast<size_t>(b.n_tokens), 0);
-        if (!b.logits) {
-            // A null logits array means llama.cpp outputs the last token only
-            // (llama-batch.cpp:120-129).
-            n_outputs_last = b.n_tokens > 0 ? 1 : 0;
-            if (b.n_tokens > 0) logits_last.back() = 1;
-            return;
-        }
-        n_outputs_last = 0;
-        for (int32_t i = 0; i < b.n_tokens; i++) {
-            if (b.logits[i]) {
-                logits_last[static_cast<size_t>(i)] = 1;
-                n_outputs_last++;
-            }
-        }
+    void record_batch(const TokenBatch& b) {
+        logits_last = b.outputs();
+        n_outputs_last = static_cast<int32_t>(
+            std::count(logits_last.begin(), logits_last.end(), 1));
     }
 
     void forget_batch() {
@@ -201,22 +251,16 @@ public:
         live::add(this);
     }
 
-    // Returns the reusable batch with capacity for at least n tokens
-    // (per-token seq-id capacity 1 — all decode builders use single-seq
-    // entries). Contents are stale; the caller fills 0..n-1 and n_tokens.
-    llama_batch& reserve_batch(int32_t n) {
-        if (batch_capacity < n) {
-            if (batch_capacity > 0) llama_batch_free(batch);
-            batch = llama_batch_init(n, 0, 1);
-            batch_capacity = n;
-        }
-        return batch;
+    // The reusable batch, emptied. Contents of the previous call are dropped.
+    TokenBatch& fresh_batch() {
+        if (!batch_) batch_ = std::make_unique<TokenBatch>(ctx);
+        batch_->clear();
+        return *batch_;
     }
 
     ~LlamaContext() {
         std::lock_guard<std::recursive_mutex> lock(live::mutex());
         live::remove(this);
-        if (batch_capacity > 0) llama_batch_free(batch);
         release();
         // llama_free the draft first: gemma4-assistant still holds
         // cparams.ctx_other until that returns. Then drop the Fine keep.
@@ -226,6 +270,7 @@ public:
     // Frees the llama context, leaving this object empty. Called by the
     // destructor, or by the exit hook for a context the BEAM still references.
     void release() {
+        batch_.reset();
         if (ctx) llama_free(ctx);
         ctx = nullptr;
     }
@@ -327,7 +372,7 @@ public:
     std::atomic<uint64_t> us_ckpt{0};
     // Everything in the speculative iter NOT inside the three hot-path
     // timers above. On Metal this is dominated by implicit GPU-sync waits
-    // from the previous iter's async verify decode (llama_decode returns
+    // from the previous iter's async verify decode (llama_process returns
     // before the command buffer completes; the wait lands on the next
     // unrelated allocation in the next iter). Sum of draft+verify+sample
     // +other ≈ us_total.
