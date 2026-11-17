@@ -85,7 +85,7 @@ defmodule LlamaCppEx.Server do
 
   ### `[:llama_cpp_ex, :server, :kv_pressure]`
 
-  Emitted when a forward pass hit KV-cache pressure (`llama_decode == 1`) and
+  Emitted when a forward pass hit KV-cache pressure (the decode returned 1) and
   the server recovered by purging idle slots' cached prefixes and/or splitting
   the batch.
 
@@ -1686,7 +1686,7 @@ defmodule LlamaCppEx.Server do
   end
 
   # Idle slots whose retained prefix-cache KV may be dropped by the NIF under
-  # KV pressure (llama_decode == 1). Active slots are never purgeable.
+  # KV pressure (the decode returned 1). Active slots are never purgeable.
   defp purgeable_seq_ids(state) do
     for {seq_id, slot} <- state.slots, slot.state == :idle, slot.cached_pos > 0 do
       seq_id

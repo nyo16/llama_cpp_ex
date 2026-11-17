@@ -1,5 +1,79 @@
 # Changelog
 
+## v0.8.71
+
+llama.cpp bumped to `9581154a2` (b12447+16), 95 commits from `9daa0aa22`
+(b12361+7). #32306 deprecates the `llama_batch` API (`llama_batch_init`,
+`llama_batch_get_one`, `llama_batch_free`, `llama_decode`, `llama_encode`)
+in favour of `llama_batch_ext` and `llama_process`; the NIF now uses only
+the new API and builds without deprecation warnings. `llama.h` otherwise
+adds `llama_model_dflash_variant`; `common.h` adds the
+`draft-dflash2`/`draft-lilicorr` speculative types (#32016).
+`llama_model_default_params` and `llama_context_default_params` are
+unchanged. `src/llama-vocab.cpp` only adds the `zonos3` and `inkling2`
+pre-tokenizers (`tokenizer_st_partition` is untouched), and
+`tools/server/server-decision.*` did not change, so `input_tokenize.cpp`
+needs nothing and `decision.cpp` is "Ported at" `9581154a2` with no hunk to
+port. ggml's headers and the RPC backend did not change: the RPC protocol
+stays 10.0.0.
+
+Checked on an M1 Max (Metal): the default suite on a default build and on an
+`LLAMA_RPC=1` build, plus `:rpc_live` against a local `RPC.Server` worker;
+`:smoke`, `:embeddings` (Qwen3-Embedding), `:slow`, `:tools`, `:decision`,
+`:decision_clef`, `:mtp` (Qwen3.6-27B), `:mtp_sidecar` (Qwen3.8-27B) and
+`test/vm_exit_test.exs`; and `scripts/decision_compare.exs` — ALL MATCH on
+9 models (tinylaya, tinyopenjev, Clef Flash, d1-3B, d1-omni-600M, d1-2B,
+vllm-decision2 Kai, vllm-d3-edge, h2o-lightning-4b) against llama-server at
+the same commit. `:dflash` not run (no DFlash drafter on disk); not run on a
+DGX Spark.
+
+### Changed
+
+- Every decode goes through `llama_batch_ext` (`TokenBatch` in
+  `llama_nif.h`, one per context, sized to `n_batch`) and `llama_process`.
+  The MTP path feeds `common_speculative_process` the same entries as its
+  target decode, as before.
+- A batch NIF handed more entries than the context's `n_batch`
+  (`batch_eval`, `batch_eval_sample`, `decode_batch`, `embed_decode`,
+  `embed_batch_decode`, an MTP verify batch) now returns
+  `{:error, "... batch exceeds n_batch (N tokens)"}`. It used to abort the VM
+  in `llama_context::decode` (`GGML_ASSERT(n_tokens_all <= n_batch)`).
+- A token id outside the vocabulary or an out-of-range seq id inside a batch
+  is now reported by name (`invalid token id N`, `invalid seq_id N ...`)
+  instead of `... failed with code: -1`. Decode errors read
+  `"<nif> failed with code: N"` or `"<nif> failed: <reason>"`.
+- The `generate` and `generate_tokens` NIFs request logits for the last
+  prompt token only, not for the last token of every `n_batch` chunk
+  (`llama_batch_get_one`'s behaviour).
+- `LlamaCppEx.MTP` docs: `:dflash` runs DFlash, DFlash 2 and LiliCorr
+  drafters (upstream picks the head from the drafter's metadata); `:dspark`
+  refuses any drafter that is not DSpark.
+
+### Upstream
+
+- From the 95 commits:
+  - The `llama_batch` API is deprecated (#32306) and upstream's own callers
+    moved to `llama_batch_ext` (#32356).
+  - DFlash speculative decoding split into one driver per head, with
+    `draft-dflash2` and `draft-lilicorr` types (#32016); DFLASH2 for
+    Recursive Ripple-65B (#31904).
+  - New models: Inkling 2 (text + vision, #32217, parser #32381), MiniMax-M3.1
+    (#32301); mtmd gains YuE2-3B, fish audio s2, higgs v3 STT, vibevoice-ASR
+    and zonos3-mini TTS.
+  - KV cells no longer scan every cell per sequence removal (#32380); the
+    M-RoPE non-consecutive position warning is fixed (#32287).
+  - The tensor staging buffer comes from the CPU buffer type (#31438); the
+    backend scheduler starts a new split at an incompatible weight (#31775).
+  - Chat: tool calls inside reasoning for Gemma 4 (#32232) and Ministral 3
+    (#32271), undeclared tool calls in the LFM2 grammar (#32164), the
+    Mistral workaround removed (#32230); jinja gains scope-chain lookup,
+    `sort_keys` and four missing features, and renders faster (#32023).
+  - `common_sampler_init` throws on an unknown grammar trigger type instead
+    of aborting (#31478).
+  - Metal: `mul_mv` destination offset overflow fixed (#32221), fusion
+    workaround for LFM3 (#32296). CUDA: `MUL_MAT_ID` abort on AMD (#32385).
+  - Vulkan, OpenCL, Hexagon, WebGPU, SYCL and s390x work.
+
 ## v0.8.70
 
 llama.cpp stays at `9daa0aa22`. The `generate_mtp_tokens` NIF changed, so

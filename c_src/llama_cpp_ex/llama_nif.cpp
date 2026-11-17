@@ -278,15 +278,17 @@ LLAMA_NIF(log_set_level, 0);
 //      DIRECTLY are bounded here. Those functions assert on their arguments,
 //      and nothing upstream sees the value first.
 //
-//   2. Values carried INSIDE a `llama_batch` are bounded by upstream's
-//      `llama_batch_allocr::init` (vendor/llama.cpp/src/llama-batch.cpp:61-64),
-//      which range-checks batch seq ids and positions and returns false rather
-//      than asserting — so `llama_decode` returns non-zero and the NIF returns
-//      `{:error, _}`. That check is load-bearing and invisible from this file,
-//      which is part of why the three unguarded sites in category 1
-//      (embed_decode, embed_batch_decode, batch_eval_sample's purge list)
-//      looked closed: their neighbours really were safe, for a reason nobody
-//      had written down.
+//   2. Values carried INSIDE a batch are bounded by upstream's
+//      `llama_batch_ext_add_token` (vendor/llama.cpp/src/llama-batch.cpp),
+//      which refuses a seq id outside [0, n_seq_max), a token id outside the
+//      vocabulary and an entry past n_batch with an error code rather than an
+//      assert; `TokenBatch::add` turns that into `{:error, _}`. Positions are
+//      checked by `llama_batch_allocr::init` at decode time, which returns
+//      false, so `llama_process` returns non-zero. Those checks are
+//      load-bearing and invisible from this file, which is part of why the
+//      three unguarded sites in category 1 (embed_decode, embed_batch_decode,
+//      batch_eval_sample's purge list) looked closed: their neighbours really
+//      were safe, for a reason nobody had written down.
 //
 // `test/nif_guards_test.exs` enumerates both categories and is checked against
 // LlamaCppEx.NIF's own source, so a new seq_id-taking NIF cannot be added
@@ -319,52 +321,73 @@ static std::string invalid_seq_id_message(llama_context* ctx, int64_t seq_id) {
            " (must be 0 <= seq_id < " + std::to_string(llama_n_seq_max(ctx)) + ")";
 }
 
-// Single choke point for every llama_decode in this file, so the recorded batch
-// shape cannot drift from reality as decode paths are added. Only a successful
-// decode publishes a new shape; a failed one leaves the previous logits (and
-// therefore the previous shape) in place.
+// Single choke point for every target decode in this file, so the recorded
+// batch shape cannot drift from reality as decode paths are added. Only a
+// successful decode publishes a new shape; a failed one leaves the previous
+// logits (and therefore the previous shape) in place.
 //
 // This claim was false for seven direct `llama_decode` calls (the two streaming
 // generators, the blocking `generate`, and the MTP prefill/verify/rollback), and
 // false in the *permissive* direction: `sampler_sample_at`'s bound was computed
 // from a stale batch, so it accepted indices upstream would abort on. A
 // permissively-stale bound is worse than no bound because it reads as safe.
-// Every `llama_decode` in this translation unit now goes through here; the only
-// decodes that do not are inside upstream's `common_speculative_*`, which run on
-// the draft context and are never sampled through this boundary.
-static int decode_tracked(LlamaContext& c, const llama_batch& batch) {
-    int ret = llama_decode(c.ctx, batch);
+// Every decode in this translation unit now goes through here; the only ones
+// that do not are inside upstream's `common_speculative_*`, which run on the
+// draft context and are never sampled through this boundary, and the decision
+// engine's, which forgets the shape (decision_decide).
+static int decode_tracked(LlamaContext& c, TokenBatch& batch) {
+    int ret = llama_process(c.ctx, LLAMA_PROCESS_TYPE_DECODE, batch.get());
     if (ret == 0) {
         c.record_batch(batch);
     }
     return ret;
 }
 
-// Append one single-sequence entry to a batch from llama_batch_init(n, 0, 1).
-// Stands in for common_batch_add(llama_batch&, ...), which upstream removed in
-// 60e9cf7a7 along with the rest of the legacy-batch helpers in common/.
-static void batch_push(llama_batch& b, llama_token id, llama_pos pos,
-                       llama_seq_id seq_id, bool logits) {
-    const int32_t i = b.n_tokens++;
-    b.token[i]     = id;
-    b.pos[i]       = pos;
-    b.n_seq_id[i]  = 1;
-    b.seq_id[i][0] = seq_id;
-    b.logits[i]    = logits;
+// Appends `tokens` to sequence 0 after the last position it holds, in n_batch
+// chunks, with logits for the final token only: llama_batch_get_one's append
+// semantics without its logit row per chunk. Returns llama_process's code; a
+// token the batch refuses returns -1 with `err` set.
+static int decode_append(LlamaContext& c, const llama_token* tokens, size_t n_tokens,
+                         std::string& err) {
+    const llama_pos start = llama_memory_seq_pos_max(llama_get_memory(c.ctx), 0) + 1;
+    TokenBatch& batch = c.fresh_batch();
+    const size_t n_batch = static_cast<size_t>(batch.n_batch());
+
+    for (size_t i = 0; i < n_tokens; i += n_batch) {
+        const size_t n = std::min(n_tokens - i, n_batch);
+        batch.clear();
+        for (size_t j = 0; j < n; j++) {
+            if (auto e = batch.add(tokens[i + j], start + static_cast<llama_pos>(i + j), 0,
+                                   i + j == n_tokens - 1)) {
+                err = std::move(*e);
+                return -1;
+            }
+        }
+        const int ret = decode_tracked(c, batch);
+        if (ret != 0) {
+            return ret;
+        }
+    }
+    return 0;
 }
 
-// common_speculative_process only takes a common_batch since 60e9cf7a7; the
-// llama_batch overload is gone. The MTP path still decodes the target through
-// decode_tracked (llama_decode), so the spec is fed a mirror of that same batch
-// rather than a second, separately-built one that could drift from it. `mirror`
-// is reused across calls; clear() keeps its allocation.
-static bool speculative_process(common_speculative* spec, common_batch& mirror,
-                                const llama_batch& b) {
-    mirror.clear();
-    for (int32_t i = 0; i < b.n_tokens; i++) {
-        mirror.add(b.token[i], b.pos[i], b.seq_id[i][0], b.logits[i] != 0);
+// The message for a failed decode_append / decode_tracked.
+static std::string decode_error(const char* what, int ret, const std::string& err) {
+    return err.empty() ? std::string(what) + " failed with code: " + std::to_string(ret)
+                       : std::string(what) + " failed: " + err;
+}
+
+// MTP: one entry into both the target's decode batch and the common_batch the
+// speculative state is fed (common_speculative_process only takes a
+// common_batch), so the two cannot drift apart.
+static std::optional<std::string> mtp_push(TokenBatch& b, common_batch& mirror,
+                                           llama_token id, llama_pos pos,
+                                           llama_seq_id seq_id, bool output) {
+    auto err = b.add(id, pos, seq_id, output);
+    if (!err) {
+        mirror.add(id, pos, seq_id, output);
     }
-    return common_speculative_process(spec, mirror);
+    return err;
 }
 
 // Same rationale as check_seq_id: an out-of-range logits index is a caller bug,
@@ -458,22 +481,6 @@ struct MsgEnvGuard {
     operator ErlNifEnv*() const { return env; }
 };
 
-// Frees a llama_batch obtained from llama_batch_init on scope exit. Same
-// rationale as MsgEnvGuard: several statements between the init and the free
-// can throw (fine decoders, std::bad_alloc, detokenize failures), and an unwind
-// past a bare llama_batch_init leaks the batch's token/pos/seq_id buffers.
-// Binds to an existing local so the surrounding code keeps using `batch`
-// directly.
-struct BatchFreeGuard {
-    llama_batch& batch;
-
-    explicit BatchFreeGuard(llama_batch& b) : batch(b) {}
-    ~BatchFreeGuard() { llama_batch_free(batch); }
-
-    BatchFreeGuard(const BatchFreeGuard&) = delete;
-    BatchFreeGuard& operator=(const BatchFreeGuard&) = delete;
-};
-
 // --- Cancellation ---
 
 fine::ResourcePtr<CancelFlag> cancel_flag_new(ErlNifEnv* env) {
@@ -494,7 +501,7 @@ static bool cancel_abort_cb(void* data) {
 
 // Installs the flag as the context's abort callback for the duration of a
 // generation loop, so a cancel interrupts even a long prefill decode
-// (llama_decode returns 2). Cleared on scope exit.
+// (llama_process returns 2). Cleared on scope exit.
 struct AbortCallbackScope {
     llama_context* ctx;
 
@@ -1557,40 +1564,17 @@ LLAMA_NIF(sampler_sample, ERL_NIF_DIRTY_JOB_CPU_BOUND);
 
 std::variant<fine::Ok<>, fine::Error<std::string>>
 decode(ErlNifEnv* env, fine::ResourcePtr<LlamaContext> ctx, std::vector<int64_t> token_ids) {
-    int n_tokens = static_cast<int>(token_ids.size());
-    if (n_tokens == 0) {
+    if (token_ids.empty()) {
         return fine::Ok();
     }
 
-    // Explicit batch instead of llama_batch_get_one: get_one requests logits
-    // for the LAST TOKEN OF EVERY CHUNK, computing (and copying) a full-vocab
-    // logit row per n_batch tokens of prompt for nothing. Only the very last
-    // token needs logits. Positions continue seq 0 from wherever the context
-    // is, preserving get_one's append semantics for repeated decode calls.
-    llama_pos start =
-        llama_memory_seq_pos_max(llama_get_memory(ctx->ctx), 0) + 1;
-
-    int n_batch = llama_n_batch(ctx->ctx);
-    llama_batch& batch = ctx->reserve_batch(std::min(n_tokens, n_batch));
-
-    for (int i = 0; i < n_tokens; i += n_batch) {
-        int n = std::min(n_tokens - i, n_batch);
-        bool is_last_chunk = (i + n >= n_tokens);
-
-        batch.n_tokens = n;
-
-        for (int j = 0; j < n; j++) {
-            batch.token[j]      = static_cast<llama_token>(token_ids[i + j]);
-            batch.pos[j]        = start + static_cast<llama_pos>(i + j);
-            batch.n_seq_id[j]   = 1;
-            batch.seq_id[j][0]  = 0;
-            batch.logits[j]     = (is_last_chunk && j == n - 1);
-        }
-
-        int ret = decode_tracked(*ctx, batch);
-        if (ret != 0) {
-            return fine::Error(std::string("llama_decode failed with code: " + std::to_string(ret)));
-        }
+    // Positions continue seq 0 from wherever the context is, so repeated
+    // decode calls append.
+    std::vector<llama_token> tokens(token_ids.begin(), token_ids.end());
+    std::string err;
+    int ret = decode_append(*ctx, tokens.data(), tokens.size(), err);
+    if (ret != 0) {
+        return fine::Error(decode_error("decode", ret, err));
     }
 
     return fine::Ok();
@@ -1733,7 +1717,7 @@ embed_decode(
     }
 
     // `seq_id` goes to llama_memory_seq_rm below, which is OUTSIDE any batch, so
-    // upstream's llama_batch_allocr::init never sees it and
+    // upstream's llama_batch_ext_add_token never sees it and
     // GGML_ASSERT(seq_id == -1 || (seq_id >= 0 && ...)) at
     // llama-kv-cache.cpp:385 aborts the VM. Batch-carried seq ids are bounded by
     // upstream; ones that reach a memory op first are not.
@@ -1746,23 +1730,19 @@ embed_decode(
     llama_memory_seq_rm(llama_get_memory(ctx->ctx),
                         static_cast<llama_seq_id>(seq_id), -1, -1);
 
-    // Build batch with explicit seq_id and position tracking
-    llama_batch batch = llama_batch_init(n_tokens, 0, 1);
-    BatchFreeGuard batch_guard(batch);
-    batch.n_tokens = n_tokens;
-
+    // All tokens get embeddings, so the whole input has to fit one batch.
+    TokenBatch& batch = ctx->fresh_batch();
     for (int i = 0; i < n_tokens; i++) {
-        batch.token[i]      = static_cast<llama_token>(token_ids[i]);
-        batch.pos[i]        = static_cast<llama_pos>(i);
-        batch.n_seq_id[i]   = 1;
-        batch.seq_id[i][0]  = static_cast<llama_seq_id>(seq_id);
-        batch.logits[i]     = true; // all tokens get embeddings
+        if (auto err = batch.add(static_cast<llama_token>(token_ids[i]), static_cast<llama_pos>(i),
+                                 static_cast<llama_seq_id>(seq_id), true)) {
+            return fine::Error(decode_error("embed_decode", -1, *err));
+        }
     }
 
     int ret = decode_tracked(*ctx, batch);
 
     if (ret != 0) {
-        return fine::Error(std::string("embed_decode failed with code: " + std::to_string(ret)));
+        return fine::Error(decode_error("embed_decode", ret, ""));
     }
 
     return fine::Ok();
@@ -1830,10 +1810,11 @@ LLAMA_NIF(get_embeddings, 0);
 // --- Batched embeddings: decode many sequences in a single batch ---
 //
 // Each {seq_id, token_ids} sequence is laid out at its own positions (0..len-1)
-// under its own seq_id, so one llama_decode populates per-sequence pooled
+// under its own seq_id, so one decode populates per-sequence pooled
 // embeddings retrievable via get_embeddings(ctx, seq_id, ...). The caller must
 // size the context with embeddings=true and n_seq_max >= number of sequences,
-// and keep the total token count within n_batch/n_ubatch.
+// and keep the total token count within n_batch/n_ubatch (an entry past
+// n_batch is refused).
 std::variant<fine::Ok<>, fine::Error<std::string>>
 embed_batch_decode(
     ErlNifEnv* env,
@@ -1869,27 +1850,22 @@ embed_batch_decode(
                             static_cast<llama_seq_id>(seq_id), -1, -1);
     }
 
-    llama_batch batch = llama_batch_init(total, 0, 1);
-    BatchFreeGuard batch_guard(batch);
-    batch.n_tokens = total;
-
-    int idx = 0;
+    TokenBatch& batch = ctx->fresh_batch();
     for (auto& [seq_id, tokens] : sequences) {
         int len = static_cast<int>(tokens.size());
         for (int i = 0; i < len; i++) {
-            batch.token[idx]     = static_cast<llama_token>(tokens[i]);
-            batch.pos[idx]       = static_cast<llama_pos>(i);
-            batch.n_seq_id[idx]  = 1;
-            batch.seq_id[idx][0] = static_cast<llama_seq_id>(seq_id);
-            batch.logits[idx]    = true; // all tokens get embeddings
-            idx++;
+            // all tokens get embeddings
+            if (auto err = batch.add(static_cast<llama_token>(tokens[i]), static_cast<llama_pos>(i),
+                                     static_cast<llama_seq_id>(seq_id), true)) {
+                return fine::Error(decode_error("embed_batch_decode", -1, *err));
+            }
         }
     }
 
     int ret = decode_tracked(*ctx, batch);
 
     if (ret != 0) {
-        return fine::Error(std::string("embed_batch_decode failed with code: " + std::to_string(ret)));
+        return fine::Error(decode_error("embed_batch_decode", ret, ""));
     }
 
     return fine::Ok();
@@ -1910,28 +1886,26 @@ prefill(
         return fine::Error(std::string("empty token list"));
     }
 
-    int n_batch = llama_n_batch(ctx->ctx);
-    llama_batch& batch = ctx->reserve_batch(std::min(n_tokens, n_batch));
+    TokenBatch& batch = ctx->fresh_batch();
+    const int n_batch = batch.n_batch();
 
     for (int i = 0; i < n_tokens; i += n_batch) {
         int n = std::min(n_tokens - i, n_batch);
-        bool is_last_chunk = (i + n >= n_tokens);
-
-        batch.n_tokens = n;
+        batch.clear();
 
         for (int j = 0; j < n; j++) {
-            batch.token[j]      = static_cast<llama_token>(token_ids[i + j]);
-            batch.pos[j]        = static_cast<llama_pos>(i + j);
-            batch.n_seq_id[j]   = 1;
-            batch.seq_id[j][0]  = static_cast<llama_seq_id>(seq_id);
             // Only request logits for the last token of the last chunk
-            batch.logits[j]     = (is_last_chunk && j == n - 1);
+            if (auto err = batch.add(static_cast<llama_token>(token_ids[i + j]),
+                                     static_cast<llama_pos>(i + j),
+                                     static_cast<llama_seq_id>(seq_id), i + j == n_tokens - 1)) {
+                return fine::Error(decode_error("prefill decode", -1, *err));
+            }
         }
 
         int ret = decode_tracked(*ctx, batch);
 
         if (ret != 0) {
-            return fine::Error(std::string("prefill decode failed with code: " + std::to_string(ret)));
+            return fine::Error(decode_error("prefill decode", ret, ""));
         }
     }
 
@@ -1962,18 +1936,14 @@ decode_batch(
 
     const auto* vocab = ctx->model->vocab();
 
-    // Build a single batch with all entries
-    llama_batch batch = llama_batch_init(n, 0, 1);
-    BatchFreeGuard batch_guard(batch);
-    batch.n_tokens = n;
-
+    // Build a single batch with all entries; every one needs logits to sample.
+    TokenBatch& batch = ctx->fresh_batch();
     for (int i = 0; i < n; i++) {
         auto& [seq_id, token_id, pos] = entries[i];
-        batch.token[i]      = static_cast<llama_token>(token_id);
-        batch.pos[i]        = static_cast<llama_pos>(pos);
-        batch.n_seq_id[i]   = 1;
-        batch.seq_id[i][0]  = static_cast<llama_seq_id>(seq_id);
-        batch.logits[i]     = true; // need logits for all entries to sample
+        if (auto err = batch.add(static_cast<llama_token>(token_id), static_cast<llama_pos>(pos),
+                                 static_cast<llama_seq_id>(seq_id), true)) {
+            return fine::Error(decode_error("decode_batch", -1, *err));
+        }
     }
 
     int ret = decode_tracked(*ctx, batch);
@@ -2025,18 +1995,16 @@ decode_token(
     int64_t pos,
     int64_t seq_id)
 {
-    llama_batch& batch = ctx->reserve_batch(1);
-    batch.n_tokens     = 1;
-    batch.token[0]     = static_cast<llama_token>(token_id);
-    batch.pos[0]       = static_cast<llama_pos>(pos);
-    batch.n_seq_id[0]  = 1;
-    batch.seq_id[0][0] = static_cast<llama_seq_id>(seq_id);
-    batch.logits[0]    = true;
+    TokenBatch& batch = ctx->fresh_batch();
+    if (auto err = batch.add(static_cast<llama_token>(token_id), static_cast<llama_pos>(pos),
+                             static_cast<llama_seq_id>(seq_id), true)) {
+        return fine::Error(decode_error("decode_token", -1, *err));
+    }
 
     int ret = decode_tracked(*ctx, batch);
 
     if (ret != 0) {
-        return fine::Error(std::string("decode_token failed with code: " + std::to_string(ret)));
+        return fine::Error(decode_error("decode_token", ret, ""));
     }
 
     return fine::Ok();
@@ -2056,22 +2024,19 @@ batch_eval(
         return fine::Error(std::string("empty entries list"));
     }
 
-    llama_batch& batch = ctx->reserve_batch(n);
-    batch.n_tokens = n;
-
+    TokenBatch& batch = ctx->fresh_batch();
     for (int i = 0; i < n; i++) {
         auto& [token_id, pos, seq_id, logits] = entries[i];
-        batch.token[i]      = static_cast<llama_token>(token_id);
-        batch.pos[i]        = static_cast<llama_pos>(pos);
-        batch.n_seq_id[i]   = 1;
-        batch.seq_id[i][0]  = static_cast<llama_seq_id>(seq_id);
-        batch.logits[i]     = logits;
+        if (auto err = batch.add(static_cast<llama_token>(token_id), static_cast<llama_pos>(pos),
+                                 static_cast<llama_seq_id>(seq_id), logits)) {
+            return fine::Error(decode_error("batch_eval", -1, *err));
+        }
     }
 
     int ret = decode_tracked(*ctx, batch);
 
     if (ret != 0) {
-        return fine::Error(std::string("batch_eval failed with code: " + std::to_string(ret)));
+        return fine::Error(decode_error("batch_eval", ret, ""));
     }
 
     return fine::Ok();
@@ -2081,14 +2046,14 @@ LLAMA_NIF(batch_eval, ERL_NIF_DIRTY_JOB_CPU_BOUND);
 // --- Fused batch eval + sample (Server hot loop) ---
 //
 // One NIF call per Server tick: builds a batch from `entries`
-// ({token, pos, seq_id, wants_logits}), runs llama_decode, then samples every
+// ({token, pos, seq_id, wants_logits}), decodes it, then samples every
 // wants_logits entry whose seq_id has a sampler registered in `samplers`,
 // returning {seq_id, new_token, piece, is_eog}. The piece is empty for EOG
 // tokens. Unlike decode_batch above, samplers are per-sequence resources owned
 // by the caller — their grammar/penalty state advances across ticks and is
 // never reset or shared here.
 //
-// KV-pressure policy (llama_decode == 1, "no KV slot found"), mirroring
+// KV-pressure policy (decode returns 1, "no KV slot found"), mirroring
 // llama-server's update_slots(): first drop whole sequences listed in
 // `purgeable_seq_ids` (idle slots whose cache the caller is willing to lose),
 // retrying after each purge; once the purge list is exhausted, recursively
@@ -2099,7 +2064,8 @@ LLAMA_NIF(batch_eval, ERL_NIF_DIRTY_JOB_CPU_BOUND);
 // other sequences keep going (the caller fails just that request). Purged and
 // failed seq ids plus the split count are returned so the caller can fix up
 // its bookkeeping and emit telemetry. Purgeable seqs must not have entries in
-// the batch.
+// the batch. An entry the batch refuses (see TokenBatch::add) returns -1 with
+// `err` set.
 
 static int bes_decode_range(
     LlamaContext& lctx,
@@ -2113,7 +2079,8 @@ static int bes_decode_range(
     int64_t& n_splits,
     std::vector<int64_t>& failed,
     std::vector<std::tuple<int64_t, int64_t, std::string, bool>>& results,
-    llama_batch& batch) // reserved by the caller for >= entries.size() tokens
+    TokenBatch& batch,
+    std::string& err)
 {
     // Skip entries whose sequence already failed this call — decoding past a
     // failed (missing) position would leave a hole in that sequence's KV.
@@ -2131,15 +2098,15 @@ static int bes_decode_range(
         return 0;
     }
 
-    batch.n_tokens = static_cast<int32_t>(n);
+    batch.clear();
 
     for (size_t i = 0; i < n; i++) {
         const auto& [token_id, pos, seq_id, logits] = entries[idxs[i]];
-        batch.token[i]      = static_cast<llama_token>(token_id);
-        batch.pos[i]        = static_cast<llama_pos>(pos);
-        batch.n_seq_id[i]   = 1;
-        batch.seq_id[i][0]  = static_cast<llama_seq_id>(seq_id);
-        batch.logits[i]     = logits;
+        if (auto e = batch.add(static_cast<llama_token>(token_id), static_cast<llama_pos>(pos),
+                               static_cast<llama_seq_id>(seq_id), logits)) {
+            err = std::move(*e);
+            return -1;
+        }
     }
 
     int ret = decode_tracked(lctx, batch);
@@ -2206,11 +2173,11 @@ static int bes_decode_range(
         size_t mid = begin + (end - begin) / 2;
         int rc = bes_decode_range(lctx, vocab, entries, begin, mid, samplers,
                                   purgeable, purge_idx, purged, n_splits,
-                                  failed, results, batch);
+                                  failed, results, batch, err);
         if (rc != 0) return rc;
         return bes_decode_range(lctx, vocab, entries, mid, end, samplers,
                                 purgeable, purge_idx, purged, n_splits,
-                                failed, results, batch);
+                                failed, results, batch, err);
     }
 
     return ret;
@@ -2255,7 +2222,7 @@ batch_eval_sample(
     // `purgeable_seq_ids` reaches llama_memory_seq_rm inside bes_decode_range's
     // KV-pressure loop, outside any batch — same abort as embed_decode's. The
     // entries' seq ids are batch-carried and bounded by upstream's
-    // llama_batch_allocr::init; these are not, so they are rejected here rather
+    // llama_batch_ext_add_token; these are not, so they are rejected here rather
     // than filtered: a purge id the caller cannot name is a bookkeeping bug in
     // the caller, not a condition to paper over.
     for (int64_t seq_id : purgeable_seq_ids) {
@@ -2264,15 +2231,15 @@ batch_eval_sample(
         }
     }
 
-    llama_batch& batch = ctx->reserve_batch(static_cast<int32_t>(entries.size()));
+    TokenBatch& batch = ctx->fresh_batch();
+    std::string err;
 
     int rc = bes_decode_range(*ctx, vocab, entries, 0, entries.size(),
                               smpls, purgeable_seq_ids, purge_idx, purged,
-                              n_splits, failed, results, batch);
+                              n_splits, failed, results, batch, err);
 
     if (rc != 0) {
-        return fine::Error(std::string(
-            "batch_eval_sample failed with code: " + std::to_string(rc)));
+        return fine::Error(decode_error("batch_eval_sample", rc, err));
     }
 
     return fine::Ok(std::move(results), std::move(purged), n_splits,
@@ -3067,18 +3034,21 @@ fine::Ok<> generate_mtp_tokens(
     // for the whole prompt. We ask for logits on the final prompt token only,
     // because we sample the first generated token from them below.
     common_batch spec_batch(ctx_tgt);
-    int n_batch = llama_n_batch(ctx_tgt);
+    TokenBatch& batch = sp.ctx_tgt->fresh_batch();
+    const size_t n_batch = static_cast<size_t>(batch.n_batch());
     llama_pos n_past = 0;
     for (size_t i = 0; i < prompt.size(); i += n_batch) {
-        int n = std::min(static_cast<int>(prompt.size() - i), n_batch);
-        bool is_last_chunk = (i + n >= prompt.size());
+        const size_t n = std::min(prompt.size() - i, n_batch);
 
-        llama_batch batch = llama_batch_init(n, 0, 1);
-        BatchFreeGuard batch_guard(batch);
-        for (int j = 0; j < n; j++) {
-            const bool want_logits = is_last_chunk && j == n - 1;
-            batch_push(batch, prompt[i + j], static_cast<llama_pos>(i + j),
-                       seq_id, want_logits);
+        batch.clear();
+        spec_batch.clear();
+        for (size_t j = 0; j < n; j++) {
+            const bool want_logits = i + j == prompt.size() - 1;
+            if (auto err = mtp_push(batch, spec_batch, prompt[i + j],
+                                    static_cast<llama_pos>(i + j), seq_id, want_logits)) {
+                send_error("prompt decode failed: " + *err);
+                return fine::Ok();
+            }
         }
 
         int ret = decode_tracked(*sp.ctx_tgt, batch);
@@ -3086,11 +3056,11 @@ fine::Ok<> generate_mtp_tokens(
             send_error("prompt decode failed: code=" + std::to_string(ret));
             return fine::Ok();
         }
-        bool proc_ok = speculative_process(sp.spec, spec_batch, batch);
+        bool proc_ok = common_speculative_process(sp.spec, spec_batch);
         if (!proc_ok) {
             fprintf(stderr,
                 "MTP prefill: common_speculative_process returned false "
-                "at chunk i=%zu n=%d\n", i, n);
+                "at chunk i=%zu n=%zu\n", i, n);
         }
     }
     n_past = static_cast<llama_pos>(prompt.size());
@@ -3282,18 +3252,21 @@ fine::Ok<> generate_mtp_tokens(
         // 2. Build the verification batch: [sampled, drafts...] at consecutive
         //    positions starting at n_past, all with logits.
         const int n_verify = 1 + static_cast<int>(drafts.size());
-        llama_batch batch = llama_batch_init(n_verify, 0, 1);
-        BatchFreeGuard batch_guard(batch);
-        batch_push(batch, sampled, n_past, seq_id, true);
-        for (size_t i = 0; i < drafts.size(); i++) {
-            batch_push(batch, drafts[i],
-                       n_past + 1 + static_cast<llama_pos>(i), seq_id, true);
+        batch.clear();
+        spec_batch.clear();
+        for (int i = 0; i < n_verify; i++) {
+            const llama_token tok = i == 0 ? sampled : drafts[i - 1];
+            if (auto err = mtp_push(batch, spec_batch, tok,
+                                    n_past + static_cast<llama_pos>(i), seq_id, true)) {
+                send_error("verify decode failed: " + *err);
+                return fine::Ok();
+            }
         }
 
         // 2b. Roll the draft ctx back to n_past so common_speculative_process
         //     can re-decode the verify batch on it. common_speculative_draft
         //     advances ctx_dft to roughly n_past + drafts.size() via internal
-        //     AR decoding; without this rollback, the next llama_decode on
+        //     AR decoding; without this rollback, the next decode on
         //     ctx_dft would hit an "inconsistent sequence positions" abort
         //     (M-RoPE requires the current pos_max to be < the batch's first
         //     position). Mirrors the upstream server's seq_rm between draft
@@ -3312,7 +3285,7 @@ fine::Ok<> generate_mtp_tokens(
                 send_error("verify decode failed: code=" + std::to_string(ret));
                 return fine::Ok();
             }
-            if (!speculative_process(sp.spec, spec_batch, batch)) {
+            if (!common_speculative_process(sp.spec, spec_batch)) {
                 send_error("common_speculative_process failed");
                 return fine::Ok();
             }
@@ -3429,21 +3402,24 @@ fine::Ok<> generate_mtp_tokens(
                 // target. Every row asks for output, as the verify batch did,
                 // because the drafter's extraction follows the output rows.
                 if (n_accepted_total > 0) {
-                    llama_batch redo = llama_batch_init(n_accepted_total, 0, 1);
-                    BatchFreeGuard redo_guard(redo);
+                    batch.clear();
+                    spec_batch.clear();
                     for (int i = 0; i < n_accepted_total; i++) {
                         llama_token tok =
                             prompt[prompt.size() - n_accepted_total - 1 + i];
-                        batch_push(redo, tok,
-                                   n_past + static_cast<llama_pos>(i), seq_id,
-                                   /*logits=*/ true);
+                        if (auto err = mtp_push(batch, spec_batch, tok,
+                                                n_past + static_cast<llama_pos>(i), seq_id,
+                                                /*output=*/ true)) {
+                            send_error("rollback re-decode failed: " + *err);
+                            return fine::Ok();
+                        }
                     }
-                    int ret = decode_tracked(*sp.ctx_tgt, redo);
+                    int ret = decode_tracked(*sp.ctx_tgt, batch);
                     if (ret != 0) {
                         send_error("rollback re-decode failed: code=" + std::to_string(ret));
                         return fine::Ok();
                     }
-                    if (!speculative_process(sp.spec, spec_batch, redo)) {
+                    if (!common_speculative_process(sp.spec, spec_batch)) {
                         send_error("common_speculative_process failed after rollback");
                         return fine::Ok();
                     }
@@ -3462,7 +3438,7 @@ fine::Ok<> generate_mtp_tokens(
 
         // Close out us_other for this iter — captures the post-sample-loop
         // work plus any implicit GPU-sync wait that bleeds into the next
-        // iter from llama_decode's async submission on Metal.
+        // iter from llama_process's async submission on Metal.
         sp.us_other.fetch_add(
             std::chrono::duration_cast<std::chrono::microseconds>(
                 std::chrono::steady_clock::now() - t_anchor).count(),
@@ -3544,12 +3520,10 @@ fine::Ok<> generate_tokens(
         return fine::Ok();
     }
 
-    // Process prompt in chunks
-    int n_batch = llama_n_batch(ctx);
-    for (size_t i = 0; i < prompt_tokens.size(); i += n_batch) {
-        int n = std::min(static_cast<int>(prompt_tokens.size() - i), n_batch);
-        llama_batch batch = llama_batch_get_one(prompt_tokens.data() + i, n);
-        int ret = decode_tracked(*ctx_res, batch);
+    // Process the prompt in n_batch chunks
+    {
+        std::string err;
+        int ret = decode_append(*ctx_res, prompt_tokens.data(), prompt_tokens.size(), err);
         if (ret == 2) {
             // Aborted by the cancel flag mid-prefill — stop quietly.
             return fine::Ok();
@@ -3627,8 +3601,8 @@ fine::Ok<> generate_tokens(
         }
 
         // Decode next token
-        llama_batch batch = llama_batch_get_one(&new_token, 1);
-        int ret = decode_tracked(*ctx_res, batch);
+        std::string err;
+        int ret = decode_append(*ctx_res, &new_token, 1, err);
         if (ret == 2) {
             // Aborted by the cancel flag — stop quietly.
             return fine::Ok();
@@ -3684,18 +3658,14 @@ generate(
         return fine::Error(kNoLogitsMessage);
     }
 
-    // Process prompt in chunks of n_batch
-    int n_batch = llama_n_batch(ctx);
-    for (size_t i = 0; i < prompt_tokens.size(); i += n_batch) {
-        int n = std::min(static_cast<int>(prompt_tokens.size() - i), n_batch);
-        llama_batch batch = llama_batch_get_one(prompt_tokens.data() + i, n);
-        int ret = decode_tracked(*ctx_res, batch);
-        if (ret == 2) {
-            return fine::Ok(std::string());
-        }
-        if (ret != 0) {
-            return fine::Error(std::string("prompt decode failed with code: " + std::to_string(ret)));
-        }
+    // Process the prompt in n_batch chunks
+    std::string err;
+    int ret = decode_append(*ctx_res, prompt_tokens.data(), prompt_tokens.size(), err);
+    if (ret == 2) {
+        return fine::Ok(std::string());
+    }
+    if (ret != 0) {
+        return fine::Error(decode_error("prompt decode", ret, err));
     }
 
     // Generation loop
@@ -3728,13 +3698,12 @@ generate(
         }
 
         // Decode the new token for next iteration
-        llama_batch batch = llama_batch_get_one(&new_token, 1);
-        int ret = decode_tracked(*ctx_res, batch);
+        ret = decode_append(*ctx_res, &new_token, 1, err);
         if (ret == 2) {
             break;
         }
         if (ret != 0) {
-            return fine::Error(std::string("generation decode failed with code: " + std::to_string(ret)));
+            return fine::Error(decode_error("generation decode", ret, err));
         }
     }
 

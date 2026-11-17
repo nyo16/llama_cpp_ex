@@ -78,7 +78,9 @@ Watch for two harder ones:
 The NIF uses these key APIs (grep `llama_nif.cpp` for the full list):
 - `llama_model_*`, `llama_context_*`, `llama_vocab_*` — model/context/vocab management
 - `llama_tokenize`, `llama_detokenize`, `llama_token_to_piece` — tokenization
-- `llama_batch_*`, `llama_decode` — inference
+- `llama_batch_ext_*`, `llama_process` — inference, through `TokenBatch`
+  (`llama_nif.h`); the MTP path also builds the `common_batch` that
+  `common_speculative_process` takes
 - `llama_sampler_*` — sampling chain
 - `llama_memory_*` — KV cache / memory management
 - `llama_get_embeddings_*`, `llama_pooling_type` — embeddings
@@ -399,6 +401,24 @@ superseded by #30415 (a different patch with the same effect), and
 communicator holds it) conflicts with #29413 and needs a rebase, as does
 `cuda-mmq-src1-reuse`, which conflicts with #31296 and #31047.
 
+Re-checked at `9581154a2` (b12447+16), covering the 95 commits from
+`9daa0aa22`, as a source diff: #1, #2 and #3 are as above.
+`ggml-cpu/CMakeLists.txt`, `ggml/include`, `ggml-rpc` and `ggml-rpc.h` were
+not touched, so the RPC protocol stays 10.0.0, `GGML_OP_COUNT` 99, and a
+v0.8.69 worker and a v0.8.71 client still talk. The `ggml-cuda.cu` diff is
+#32385 (MUL_MAT_ID on AMD) and #31617 (warp primitives), none of it near
+`ggml_backend_cuda_comm_init`. Not re-measured: no Spark for this bump.
+
+The same range deprecates the `llama_batch` API (#32306): `llama_batch_init`,
+`llama_batch_get_one`, `llama_batch_free`, `llama_decode` and `llama_encode`.
+The deprecated calls still work — `llama_decode` copies the batch into a
+`llama_batch_ext` per call (`llama_batch_compat`) — but the NIF moved to
+`llama_batch_ext` and `llama_process` rather than build with the warnings.
+A `llama_batch_ext` from `llama_batch_ext_init(ctx)` holds at most `n_batch`
+entries and checks token and seq ids as they are added, so its error codes
+(-1 full, -2 token, -3 seq id) are now where the NIF learns about bad batch
+contents.
+
 | # | Upstream defect | Our workaround | Still needed? |
 |---|---|---|---|
 | 1 | `GGML_NATIVE=ON` makes ggml's `-mcpu=native` probe resolve to **base ARMv8-A** on Cortex-X925/A725 with GCC 13.3 — silently, with a soft CMake warning and exit 0. Costs every `sdot`/`smmla`/SVE kernel. | `LLAMA_CPU_ARM_ARCH` + `LLAMA_CUDA_ARCH` in the `Makefile`, which must be set together. See [DGX Spark](dgx-spark.md) and [Cross-Platform Builds](cross-platform-builds.md). | `scripts/spark/verify-build-flags.sh` on an aarch64 host. If a default build (no `LLAMA_CPU_ARM_ARCH`) now reports non-zero `sdot`/`smmla`, upstream fixed the probe. |
@@ -566,7 +586,7 @@ mix hex.publish
 ### Compilation errors after upgrade
 
 - **Missing function**: check if the API was renamed or removed in `include/llama.h`
-- **Struct field changes**: check `llama_model_params`, `llama_context_params`, `llama_batch` structs
+- **Struct field changes**: check `llama_model_params`, `llama_context_params`, `common_batch`
 - **Common library changes**: `common/chat.h` is the most volatile dependency — check `common_chat_templates_inputs` and `common_chat_msg`
 
 ### Build downloads precompiled binary instead of compiling from source

@@ -115,13 +115,16 @@ defmodule LlamaCppEx.MTP do
       * `:mtp` - a Multi-Token Prediction head, inside the target GGUF or in a
         sidecar passed as `:draft_model`. The draft context is built with
         `ctx_type: :mtp`.
-      * `:dflash` - a DFlash / DFlash 2 block-diffusion drafter (GGUF
-        architecture `dflash`), passed as `:draft_model`. It drafts a whole
-        block in one pass from the target's hidden states, and is the fastest
-        option measured on GB10: 3.3× plain decode on Qwen3.8-27B NVFP4 against
-        2.1× for its MTP head (see `docs/dgx-spark.md`).
+      * `:dflash` - a DFlash block-diffusion drafter (GGUF architecture
+        `dflash`), passed as `:draft_model`. Upstream picks the head from the
+        drafter's metadata, so DFlash 2 and LiliCorr drafters run under this
+        type too. It drafts a whole block in one pass from the target's
+        hidden states, and is the fastest option measured on GB10: 3.3× plain
+        decode on Qwen3.8-27B NVFP4 against 2.1× for its MTP head (see
+        `docs/dgx-spark.md`).
       * `:dspark` - a DSpark drafter (DFlash plus a Markov head), passed as
-        `:draft_model`.
+        `:draft_model`. `init/2` refuses any other DFlash-family drafter for
+        this type; `:dflash` runs them all.
     * `:draft_model` - A separate `LlamaCppEx.Model` holding the drafter.
       Required for `:dflash` and `:dspark`. A DFlash drafter computes with the
       target's embeddings and LM head; its context gets a backend for every

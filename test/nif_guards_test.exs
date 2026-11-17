@@ -77,12 +77,12 @@ defmodule LlamaCppEx.NIFGuardsTest do
   #   * `:message`  — `{:error, "invalid seq_id N (must be ...)"}`, for NIFs
   #     already returning a string error. Adding a guard never changes a NIF's
   #     error *type*.
-  #   * `:upstream` — no local guard: the id is carried *inside a `llama_batch`*,
-  #     and `llama_batch_allocr::init`
-  #     (`vendor/llama.cpp/src/llama-batch.cpp:61-64`) range-checks batch seq ids
-  #     and returns false, so `llama_decode` returns non-zero. The three blockers
-  #     this enumeration was written for were distinct precisely because they
-  #     reached `llama_memory_seq_rm` *outside* any batch.
+  #   * `:upstream` — no local guard: the id is carried *inside a batch*, and
+  #     `llama_batch_ext_add_token` (`vendor/llama.cpp/src/llama-batch.cpp`)
+  #     range-checks it and returns an error code, which the NIF's
+  #     `TokenBatch::add` turns into `{:error, "invalid seq_id ..."}`. The three
+  #     blockers this enumeration was written for were distinct precisely
+  #     because they reached `llama_memory_seq_rm` *outside* any batch.
   #   * `:lookup`   — no local guard: `llama_get_embeddings_seq` is a
   #     `std::map::find` (`llama-context.cpp:921-928`) returning nullptr.
   #
@@ -230,7 +230,7 @@ defmodule LlamaCppEx.NIFGuardsTest do
 
              Add each one with its outcome class. A seq_id that reaches a
              llama_memory_* call outside a batch needs a local guard
-             (:raise/:atom/:message); one carried inside a llama_batch is bounded
+             (:raise/:atom/:message); one carried inside a batch is bounded
              by upstream (:upstream). Guessing wrong is safe — the generated test
              will disagree with you.
              """
@@ -242,6 +242,31 @@ defmodule LlamaCppEx.NIFGuardsTest do
         assert function_exported?(NIF, nif, arity),
                "@seq_id_surface declares #{nif}/#{arity}, which is not exported"
       end
+    end
+  end
+
+  # `llama_context::decode` has GGML_ASSERT(n_tokens <= n_batch). A batch NIF
+  # handed more entries than that aborted the VM; the batch now refuses the
+  # entry past n_batch, and a token id outside the vocabulary, before decoding.
+  describe "batch contents" do
+    test "more entries than n_batch, or an unknown token, is refused", %{
+      model: model,
+      tokens: tokens
+    } do
+      {:ok, ctx} = Context.create(model, n_ctx: 512, n_batch: 4, n_seq_max: @n_seq_max)
+      entries = for i <- 0..4, do: {hd(tokens), i, 0, i == 4}
+
+      assert {:error, message} = NIF.batch_eval(ctx.ref, entries)
+      assert message =~ "n_batch"
+      assert NIF.memory_seq_pos_max(ctx.ref, 0) == -1
+
+      n_vocab = NIF.vocab_n_tokens(model.ref)
+      assert {:error, message} = NIF.decode_token(ctx.ref, n_vocab, 0, 0)
+      assert message =~ "invalid token id #{n_vocab}"
+
+      # `tokens` is longer than n_batch, so this also decodes in chunks.
+      assert length(tokens) > 4
+      assert_context_healthy(ctx, tokens, model)
     end
   end
 
