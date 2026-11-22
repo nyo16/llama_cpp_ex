@@ -419,6 +419,29 @@ entries and checks token and seq ids as they are added, so its error codes
 (-1 full, -2 token, -3 seq id) are now where the NIF learns about bad batch
 contents.
 
+Re-checked at `225a5345b` (b12627), covering the 164 commits from
+`9581154a2`, as a source diff: #1, #2 and #3 are as above. The
+`ggml-cpu/CMakeLists.txt` diff is #32265 (KleidiAI on OHOS); the
+`-mcpu=native` probe is untouched. `ggml-rpc.cpp` was not touched and
+`ggml_backend_rpc_start_server` still returns `void`. The `ggml-cuda.cu` diff
+is MMQ, fusion, BF16 and precision-gating work; its one hunk near the
+communicators renames the GB10 compute-capability constant in
+`ggml_backend_cuda_comm_init_rank` (#30672), and `ggml_backend_cuda_comm_init`
+still returns `nullptr` on a non-CUDA member. Not re-measured: no Spark for
+this bump.
+
+The RPC protocol goes 10.0.0 → **10.0.1**: #27258 appends `GGML_OP_SLEEP`
+just before `GGML_OP_COUNT` (99 → 100), so no existing op renumbers. The
+handshake compares major and minor only, so a v0.8.71 worker accepts a
+v0.8.72 client; `ggml_sleep` is only built by tests and the Vulkan debug
+path, so no model graph carries the new op.
+
+The decision port gains lfm3-d1 packing (#32553): up to 16 questions after
+one state in one prompt, each question's tokens in its own decision group
+(`llama_batch_ext_set_decision_group`) and its answer read at its own
+position (`label_pos`). #32578 makes a server without an audio encoder
+refuse a spoken question for every type, which is this build.
+
 | # | Upstream defect | Our workaround | Still needed? |
 |---|---|---|---|
 | 1 | `GGML_NATIVE=ON` makes ggml's `-mcpu=native` probe resolve to **base ARMv8-A** on Cortex-X925/A725 with GCC 13.3 — silently, with a soft CMake warning and exit 0. Costs every `sdot`/`smmla`/SVE kernel. | `LLAMA_CPU_ARM_ARCH` + `LLAMA_CUDA_ARCH` in the `Makefile`, which must be set together. See [DGX Spark](dgx-spark.md) and [Cross-Platform Builds](cross-platform-builds.md). | `scripts/spark/verify-build-flags.sh` on an aarch64 host. If a default build (no `LLAMA_CPU_ARM_ARCH`) now reports non-zero `sdot`/`smmla`, upstream fixed the probe. |

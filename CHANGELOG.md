@@ -1,5 +1,75 @@
 # Changelog
 
+## v0.8.72
+
+llama.cpp bumped to `225a5345b` (b12627), 164 commits from `9581154a2`
+(b12447+16). The NIF's public calls need no change: `llama.h` only adds
+`llama_model_meta_arr_n`/`llama_model_meta_arr_str`, `common.h` and
+`chat.h` only add, and `llama_model_default_params` /
+`llama_context_default_params` are unchanged. `src/llama-vocab.cpp` moves
+BPE merge loading into a helper and speeds up the PLaMo table build;
+`tokenizer_st_partition` and the BOS/EOS rules are untouched, so
+`input_tokenize.cpp` needs nothing. The decision port takes three upstream
+changes (below) and is "Ported at" `225a5345b`.
+
+Checked on an M1 Max (Metal): the default suite on a default build and on an
+`LLAMA_RPC=1` build, plus `:rpc_live` against a local `RPC.Server` worker;
+`:smoke`, `:embeddings` (Qwen3-Embedding), `:slow`, `:tools`, `:decision`,
+`:decision_clef`, `:mtp` (Qwen3.6-27B), `:mtp_sidecar` (Qwen3.8-27B) and
+`test/vm_exit_test.exs`; and `scripts/decision_compare.exs` — ALL MATCH on
+9 models (tinylaya, tinyopenjev, Clef Flash, d1-3B, d1-omni-600M, d1-2B,
+vllm-decision2 Kai, vllm-d3-edge, h2o-lightning-4b) against llama-server at
+the same commit, including d1-2B's packed 18-question request (486 tokens on
+both sides). `:dflash` not run (no DFlash drafter on disk); not run on a DGX
+Spark.
+
+### Changed
+
+- **lfm3-d1 packs questions** (#32553): `LlamaCppEx.decide/4` on an
+  lfm3-d1 model (e.g. d1-2B) reads up to 16 questions after one state in a
+  single prompt, each question in its own decision group so full-attention
+  layers hide the others from it, and each answer read at its own position.
+  A request with more questions makes one prompt per 16. Answers match
+  llama-server, which does the same; `input_tokens` is now the size of the
+  packed prompts. A packed prompt is longer than one question's, and lfm3-d1
+  evaluates it in one batch, so a long state with many questions may need a
+  larger `:n_batch` (2048 by default) or `:n_ctx`.
+- A spoken question (instructions as an `input_audio` part) is refused with
+  upstream's message, `spoken instructions are only supported by
+  lfm3-d1-omni with audio input`, for every type (#32578). This build has no
+  audio encoder, so that is what llama-server without one answers too; the
+  old `audio input is not supported` message is gone.
+- `scripts/decision_compare.exs` checks a spoken question on every type and
+  adds an 18-question request (two packed prompts on lfm3-d1).
+- **RPC protocol 10.0.1** (was 10.0.0): #27258 appends `GGML_OP_SLEEP`, a
+  test-only op, before `GGML_OP_COUNT`. No existing op renumbers and the
+  handshake only compares major and minor, so v0.8.71 workers still accept
+  v0.8.72 clients.
+
+### Upstream
+
+- From the 164 commits:
+  - New models: Inkling 2 Mini (#32694), Domyn Edge 4B (#32559), Zaya1 8B
+    (#32071); `.scale` tensors applied automatically (#32669); Gemma 4
+    multi-sequence prompt processing is faster (#32342).
+  - Clef and vllm-decision2 graphs no longer reallocate per request (#32754).
+  - The recurrent state no longer keeps a NaN once one appears (#31913);
+    model files fall back to buffered I/O on `EIO` (#32545); grammar integer
+    overflow fixed (#32551).
+  - Metal: implicit GEMM `CONV_2D` (#28069), tensor API `CONV_2D` for M5
+    and split-K for all chips (#32542), norm chain in either operand of the
+    fused MUL/ADD (#32300), `NSMakeRange` argument fix (#32602).
+  - CUDA: duplicate expert IDs (#32505), few-row MMQ for `MUL_MAT_ID`
+    (#32065), NORM + MUL (+ ADD) fusion (#32454), BF16 `ROPE`/`SET_ROWS`
+    (#32387), SKU-aware FP16/BF16 accumulation (#30672), 64-bit `mul_mat_q`
+    offsets (#32374), MMQ for MoE on V100 (#32504).
+  - CPU: better memory access in `mul_mat_one_chunk` (#30846), all threads
+    for large `GET_ROWS` (#32514), x86 VNNI `Q2_0` (#26348).
+  - Chat: `reasoning_effort = none` passed when the template supports it
+    (#32763).
+  - Vulkan, OpenCL, SYCL, Hexagon, WebGPU, zDNN, OpenVINO, s390x and mtmd
+    work.
+
 ## v0.8.71
 
 llama.cpp bumped to `9581154a2` (b12447+16), 95 commits from `9daa0aa22`
