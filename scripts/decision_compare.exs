@@ -94,6 +94,13 @@ requests = [
      "pick" => %{"type" => "choice", "instructions" => "Which option?", "criteria" => many30}
    }},
   {"single", state, %{"angry" => base["angry"]}},
+  # lfm3-d1 packs up to 16 questions after one state (#32553), so 18 make two
+  # packed prompts there; every other type still asks them one by one.
+  {"18 questions", state,
+   Map.new(1..18, fn i ->
+     {"q#{String.pad_leading(Integer.to_string(i), 2, "0")}",
+      %{"type" => "noul", "instructions" => "Does the message mention topic number #{i}?"}}
+   end)},
   # lfm2-d1-omni also reads noul descriptions under "yes"/"no"; the others
   # ignore them, which both sides must agree on too.
   {"yes/no noul", "Customer: this is the third time I write, I am furious!",
@@ -362,23 +369,18 @@ failed = if compare.("noul true first", ours, post_raw.(true_first)), do: failed
 # question without instructions; there the two must agree on the answers
 # instead.
 #
-# A spoken question (instructions as an input_audio part) is only compared on
-# lfm3-d1, which refuses it before reading the clip. Every other type has
-# upstream load the clip through libmtmd, which we refuse outright.
-spoken =
-  if decision.type == :lfm3_d1 do
-    [
-      {state,
-       %{
-         "q" => %{
-           "type" => "noul",
-           "instructions" => %{"type" => "input_audio", "input_audio" => %{"data" => "AAAA"}}
-         }
-       }}
-    ]
-  else
-    []
-  end
+# A spoken question (instructions as an input_audio part): llama-server
+# without an audio encoder refuses it for every type before reading the clip
+# (#32578), and this build has none.
+spoken = [
+  {state,
+   %{
+     "q" => %{
+       "type" => "noul",
+       "instructions" => %{"type" => "input_audio", "input_audio" => %{"data" => "AAAA"}}
+     }
+   }}
+]
 
 invalid =
   [

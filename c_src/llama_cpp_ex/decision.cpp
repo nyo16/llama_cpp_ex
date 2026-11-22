@@ -2,7 +2,7 @@
 // of tools/server/server-context.cpp (send_decision, the batch layout rules and
 // the /v1/systemone handler). See decision.h for scope.
 //
-// Ported at 9581154a2. Functions that are upstream's carry its name in a
+// Ported at 225a5345b. Functions that are upstream's carry its name in a
 // trailing comment so a bump can diff them one by one; everything below the
 // "evaluation" banner replaces server slots and is ours.
 
@@ -59,6 +59,7 @@ struct decision_task {
 
     std::vector<llama_token> labels;       // logits of these tokens, at the last prompt token
     std::vector<int32_t>     label_groups; // if set, number of labels per output, the output is their max
+    std::vector<int32_t>     label_pos;    // if set, prompt position of each output, else the last token
     std::vector<int32_t>     markers;      // embeddings[column] at these prompt positions
     int32_t                  column  = 0;
     // if set, embeddings is [q | k], and the output is instead the scaled dot product of q[pointer] and k[marker]
@@ -68,6 +69,9 @@ struct decision_task {
     // the scores are the first n_scores rows of the embeddings
     std::vector<int32_t> order;
     int32_t              n_scores = 0;
+
+    // one value per prompt token, see llama_batch_ext_set_decision_group()
+    std::vector<int32_t> group;
 
     // first prompt position that is read, -1 if none
     int32_t pos_first() const {
@@ -998,12 +1002,9 @@ struct Engine::Impl {
             if (strict_payload && (!is_payload(instructions) || instructions == "")) {
                 throw err("\"instructions\" must be non-empty text, an object or an array");
             }
-            if (type == COMMON_DECISION_TYPE_LFM3_D1 && is_spoken(instructions)) {
-                throw err("spoken instructions need a model with audio input");
-            }
-            // upstream's fill_task loads the clip of a spoken question for every type, through libmtmd
+            // this build has no audio encoder, so support_audio_input is false and every type refuses a spoken question
             if (is_spoken(instructions)) {
-                throw err("audio input is not supported: LlamaCppEx is built without libmtmd");
+                throw err("spoken instructions are only supported by lfm3-d1-omni with audio input");
             }
 
             decision_question question;
@@ -1447,8 +1448,13 @@ struct Engine::Impl {
     // ours: as common_tokenize(vocab, text, false, true), except that no
     // special token comes from the caller's spans
     llama_tokens tokenize_prompt(const rendered_prompt & prompt, size_t begin, size_t end) const {
-        return llama_cpp_ex::tokenize_pieces(vocab, *specials, prompt.pieces(begin, end), false,
-                                             llama_cpp_ex::input_policy::strict);
+        return tokenize_pieces(prompt.pieces(begin, end));
+    }
+
+    // ours: as common_tokenize(vocab, <the pieces joined>, false, true), except
+    // that no special token comes from the caller's pieces
+    llama_tokens tokenize_pieces(const std::vector<llama_cpp_ex::prompt_piece> & pieces) const {
+        return llama_cpp_ex::tokenize_pieces(vocab, *specials, pieces, false, llama_cpp_ex::input_policy::strict);
     }
 
     // ours: caller text alone, tokenized so that it produces no special token
@@ -1715,6 +1721,75 @@ struct Engine::Impl {
         // the output has one score per question type
         task.column = question.type;
         task.tokens = std::move(tokens);
+        return task;
+    }
+
+    // lfm3-d1: max questions per prompt, 0 if each question has its own prompt
+    size_t set_size(const std::vector<decision_question> & questions) const { // server_decision_context::set_size
+        if (!is_lfm3_d1()) {
+            return 0;
+        }
+        // TODO: pack spoken questions
+        for (const auto & question : questions) {
+            if (is_spoken(question.instructions)) {
+                return 0;
+            }
+        }
+        return COMMON_DECISION_LFM3_D1_SET_SIZE;
+    }
+
+    // server_decision_context::fill_task_set without files (no media markers
+    // in the head). Upstream tokenizes the tail of each lone prompt with
+    // common_tokenize(vocab, text, false, true); this keeps it as template and
+    // caller pieces and tokenizes it through tokenize_pieces.
+    decision_task fill_task_set(const json & state, const std::vector<decision_question> & questions) const {
+        if (questions.empty()) {
+            throw std::runtime_error("no decision question to pack");
+        }
+
+        // lfm3-d1 packs the questions of a state as d1 attention.py pack_set does
+        static const std::string D1_HEAD   = "<|startoftext|><|im_start|>user\n";
+        static const std::string D1_HEADER = "QUESTION:\n";
+
+        auto suffix = [&](const decision_question & question) {
+            const rendered_prompt lone = render(json(), questions, question, 0);
+            if (!string_starts_with(lone.text, D1_HEAD)) {
+                throw std::runtime_error("unexpected layout of the decision prompt");
+            }
+            return lone.pieces(D1_HEAD.size(), lone.text.size());
+        };
+
+        // the first question is its lone prompt
+        decision_task task = fill_task(state, questions, questions[0], 0);
+        const size_t n_first = tokenize_pieces(suffix(questions[0])).size();
+        if (n_first >= task.tokens.size()) {
+            throw std::runtime_error("unexpected layout of the decision prompt");
+        }
+        task.group.assign(task.tokens.size(), 0);
+        std::fill(task.group.end() - n_first, task.group.end(), 1);
+        task.label_pos.assign(task.label_groups.size(), task.tokens.size() - 1);
+
+        for (size_t k = 1; k < questions.size(); k++) {
+            std::vector<llama_cpp_ex::prompt_piece> pieces;
+            if (!state.is_null()) {
+                pieces.push_back({D1_HEADER, false});
+            }
+            const auto tail = suffix(questions[k]);
+            pieces.insert(pieces.end(), tail.begin(), tail.end());
+            for (const llama_token token : tokenize_pieces(pieces)) {
+                task.tokens.push_back(token);
+                task.group.push_back(k + 1);
+            }
+
+            std::vector<std::string>  texts;
+            std::vector<llama_tokens> groups;
+            d1_labels(questions[k], texts, groups);
+            for (const auto & group : groups) {
+                task.labels.insert(task.labels.end(), group.begin(), group.end());
+                task.label_groups.push_back(group.size());
+                task.label_pos.push_back(task.tokens.size() - 1);
+            }
+        }
         return task;
     }
 
@@ -2001,10 +2076,11 @@ struct Engine::Impl {
     // Decodes tokens [from, to) of `task` on `seq`, at positions equal to their
     // index. Every position from `batch_from` on lands in the last batch
     // (check_fits guarantees they fit in one). Every position from `out_from`
-    // (>= batch_from) on is an output, and every position is for the types that
-    // read embeddings: upstream's server_task::need_embd, and what
-    // llama_decode forces anyway when embeddings are on. Returns the position
-    // of the first entry of that last batch.
+    // (>= batch_from) on is an output, so is the answer of each packed question
+    // (label_pos), and every position is for the types that read embeddings:
+    // upstream's server_task::need_embd, and what llama_decode forces anyway
+    // when embeddings are on. Returns the position of the first entry of that
+    // last batch.
     int32_t decode(const decision_task & task, int32_t from, int32_t to, llama_seq_id seq, int32_t batch_from, int32_t out_from) {
         const int32_t n_batch = (int32_t) llama_n_batch(ctx);
         const int32_t last    = std::max(from, std::min(batch_from, to - n_batch));
@@ -2012,9 +2088,15 @@ struct Engine::Impl {
         auto run = [&](int32_t off, int32_t end) {
             batch.clear();
             for (int32_t i = off; i < end; i++) {
-                batch.add(task.tokens[i], i, seq, reads_embeddings() || i >= out_from);
+                // label_pos is non-decreasing: the first question's outputs, then each packed one's
+                const bool output = reads_embeddings() || i >= out_from ||
+                                    std::binary_search(task.label_pos.begin(), task.label_pos.end(), i);
+                batch.add(task.tokens[i], i, seq, output);
                 if (!task.order.empty()) {
                     batch.tokens.back().decision_order = task.order[i];
+                }
+                if (!task.group.empty()) {
+                    batch.tokens.back().decision_group = task.group[i];
                 }
             }
             const int32_t ret = llama_process(ctx, LLAMA_PROCESS_TYPE_DECODE, batch.get());
@@ -2036,28 +2118,31 @@ struct Engine::Impl {
         std::vector<float> scores;
 
         if (!task.labels.empty()) {
-            const float * logits = llama_get_logits_ith(ctx, n_tokens - 1 - batch_start);
-            if (logits == nullptr) {
-                throw std::runtime_error("failed to get logits");
-            }
             const int32_t n_vocab = llama_vocab_n_tokens(vocab);
-            for (const llama_token label : task.labels) {
-                if (label < 0 || label >= n_vocab) {
-                    throw std::runtime_error("decision label is outside the vocabulary");
-                }
-                scores.push_back(logits[label]);
+            const size_t  n_out   = task.label_groups.empty() ? task.labels.size() : task.label_groups.size();
+            if (!task.label_pos.empty() && task.label_pos.size() != n_out) {
+                throw std::runtime_error("decision label positions do not match the outputs");
             }
-            if (!task.label_groups.empty()) {
-                std::vector<float> grouped;
-                size_t i = 0;
-                for (const int32_t n : task.label_groups) {
-                    if (n <= 0 || i + n > scores.size()) {
-                        throw std::runtime_error("decision label groups do not match the labels");
-                    }
-                    grouped.push_back(*std::max_element(scores.begin() + i, scores.begin() + i + n));
-                    i += n;
+            size_t i = 0;
+            for (size_t o = 0; o < n_out; o++) {
+                const int32_t pos = task.label_pos.empty() ? n_tokens - 1 : task.label_pos[o];
+                const float * logits = pos >= batch_start ? llama_get_logits_ith(ctx, pos - batch_start) : nullptr;
+                if (logits == nullptr) {
+                    throw std::runtime_error("failed to get logits");
                 }
-                scores = std::move(grouped);
+                const size_t n = task.label_groups.empty() ? 1 : task.label_groups[o];
+                if (n == 0 || i + n > task.labels.size()) {
+                    throw std::runtime_error("decision label groups do not match the labels");
+                }
+                float score = -INFINITY;
+                for (size_t j = i; j < i + n; j++) {
+                    if (task.labels[j] < 0 || task.labels[j] >= n_vocab) {
+                        throw std::runtime_error("decision label is outside the vocabulary");
+                    }
+                    score = std::max(score, logits[task.labels[j]]);
+                }
+                scores.push_back(score);
+                i += n;
             }
             return scores;
         }
@@ -2179,11 +2264,19 @@ struct Engine::Impl {
         }
 
         const auto questions = parse_questions(body);
+        const size_t set_size = this->set_size(questions);
         const json state     = prepare_state(parse_state(body));
 
+        // one task per variant of each question, or one task for all the questions, or per packed set
+        const bool is_packed = is_joint() || set_size > 0;
         std::vector<decision_task> tasks;
         if (is_joint()) {
             tasks.push_back(fill_task_joint(state, questions));
+        } else if (set_size > 0) {
+            for (size_t i = 0; i < questions.size(); i += set_size) {
+                const std::vector<decision_question> set(questions.begin() + i, questions.begin() + std::min(questions.size(), i + set_size));
+                tasks.push_back(fill_task_set(state, set));
+            }
         } else {
             for (const auto & question : questions) {
                 for (size_t variant = 0; variant < n_variants(question); variant++) {
@@ -2204,16 +2297,20 @@ struct Engine::Impl {
         size_t i_score  = 0;
         for (const auto & question : questions) {
             std::vector<std::vector<float>> scores;
-            if (is_joint()) {
-                // one result with the scores of all the questions, in order
-                const auto & all = results[0];
+            if (is_packed) {
+                // a result has the scores of the questions of its task, in order
+                const auto & all = results.at(i_result);
                 if (i_score + question.options.size() > all.size()) {
                     throw std::runtime_error("decision result does not match the number of options");
                 }
                 scores.emplace_back(all.begin() + i_score, all.begin() + i_score + question.options.size());
                 i_score += question.options.size();
+                if (i_score == all.size()) {
+                    i_result++;
+                    i_score = 0;
+                }
             }
-            for (size_t variant = 0; !is_joint() && variant < n_variants(question); variant++) {
+            for (size_t variant = 0; !is_packed && variant < n_variants(question); variant++) {
                 scores.push_back(results[i_result++]);
             }
             answers[question.id] = format_answer(question, scores);

@@ -278,7 +278,8 @@ defmodule LlamaCppEx.Decision do
 
     * `:n_ctx` - Context size. Defaults to `#{@default_n_ctx}`. A prompt holds
       the state, one question and its options (all questions for clef and
-      nimble), so a long state needs a larger context.
+      nimble, up to 16 questions for lfm3-d1), so a long state needs a larger
+      context.
     * `:n_batch` - Max tokens per batch. For laya, kev, clef, lfm2-d1-omni,
       vllm-decision2, vllm-d3, lfm3-d1 and lfm3-d1-omni it is also the
       micro-batch size and caps the prompt that can be evaluated at once;
