@@ -442,6 +442,29 @@ one state in one prompt, each question's tokens in its own decision group
 position (`label_pos`). #32578 makes a server without an audio encoder
 refuse a spoken question for every type, which is this build.
 
+Re-checked at `e8906e6b0` (b12627+97), covering the 97 commits from
+`225a5345b`, as a source diff: #1, #2 and #3 are as above.
+`ggml-cpu/CMakeLists.txt` was not touched. The `ggml-rpc.cpp` diff is
+#32651 (typed request helpers, one validation step on the server) and
+#32896 (one context for request tensors on the server): the `rpc_cmd`
+enum, `rpc_tensor`, `rpc_msg_hello_req/rsp` and the client's recursive
+`add_tensor` are unchanged, the RPC buffer's 2-D hooks stay implemented and
+`ggml_backend_rpc_start_server` still returns `void`. The `ggml-cuda.cu`
+diff is the RMS_NORM + MUL + MROPE fusion (#32500), nowhere near
+`ggml_backend_cuda_comm_init`. Not re-measured: no Spark for this bump.
+
+The RPC protocol goes 10.0.1 → **10.0.2**: #32126 appends
+`GGML_OP_SIGMOID_BACK` before `GGML_OP_COUNT` (100 → 101), so no op
+renumbers. Two graph changes ride on existing ops, as `kv_rows` did at
+`a691b2345`: the gated delta net replay (#31669, extra sources and op param
+1) and the flash-attention indexed bias (#32740, op param 5). A v0.8.72
+worker accepts a v0.8.73 client and does not know either; run both from the
+same release.
+
+No decision code changed (`server-decision.{h,cpp}` untouched, no
+decision/systemone commit in `server-context.cpp` or `common/common.cpp`),
+so the port stays "Ported at" `225a5345b`.
+
 | # | Upstream defect | Our workaround | Still needed? |
 |---|---|---|---|
 | 1 | `GGML_NATIVE=ON` makes ggml's `-mcpu=native` probe resolve to **base ARMv8-A** on Cortex-X925/A725 with GCC 13.3 — silently, with a soft CMake warning and exit 0. Costs every `sdot`/`smmla`/SVE kernel. | `LLAMA_CPU_ARM_ARCH` + `LLAMA_CUDA_ARCH` in the `Makefile`, which must be set together. See [DGX Spark](dgx-spark.md) and [Cross-Platform Builds](cross-platform-builds.md). | `scripts/spark/verify-build-flags.sh` on an aarch64 host. If a default build (no `LLAMA_CPU_ARM_ARCH`) now reports non-zero `sdot`/`smmla`, upstream fixed the probe. |
