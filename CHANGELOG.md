@@ -1,5 +1,74 @@
 # Changelog
 
+## v0.8.73
+
+llama.cpp bumped to `e8906e6b0` (b12627+97), 97 commits from `225a5345b`
+(b12627). The NIF needs no change: `llama.h` only adds target-size fields to
+`llama_model_quantize_params` (#15550), `common.h` adds `ui_agent`, `chat.h`
+adds `common_chat_templates_set_specials` and a test-only `tokenize` hook on
+`common_chat_session_params`, and `llama_model_default_params` /
+`llama_context_default_params` are unchanged. `ggml.h` deprecates
+`ggml_gated_delta_net` for `ggml_gated_delta_net_ext`; the NIF calls
+neither. `src/llama-vocab.cpp` only speeds up BPE merges (#32859) and sets
+`ignore_merges` for Inkling 2; `tokenizer_st_partition`,
+`cache_special_tokens` and the BOS/EOS rules are untouched, so
+`input_tokenize.cpp` needs nothing. No decision code changed upstream
+(`server-decision.{h,cpp}` untouched, `llama-ext.h` only constifies
+`llama_quant_free`), so `decision.cpp` stays "Ported at" `225a5345b`.
+
+Checked on an M1 Max (Metal): the default suite on a default build and on an
+`LLAMA_RPC=1` build; `:smoke`, `:tools`, `:embeddings` (Qwen3-Embedding and
+embeddinggemma-2), `:slow`, `:decision`, `:decision_clef`, `:mtp`
+(Qwen3.6-27B), `:mtp_sidecar` (Qwen3.8-27B) and `test/vm_exit_test.exs`;
+and `scripts/decision_compare.exs` — ALL MATCH on 9 models (tinylaya,
+tinyopenjev, Clef Flash, d1-3B, d1-omni-600M, d1-2B, vllm-decision2 Kai,
+vllm-d3-edge, h2o-lightning-4b) against llama-server at the same commit.
+`:dflash` and `:rpc_live` not run; not run on a DGX Spark.
+
+### Changed
+
+- **Recurrent rollback replays instead of snapshotting** (#31669): on
+  Qwen3.5/3.6, Qwen4-exp, Clover MoE and the KDA models (Kimi K3/K3.1,
+  GLM-5 Next, Bailing MoE 3), a context with `n_rs_seq > 0` (the MTP and
+  speculative paths) keeps one state plus the last ubatch's inputs, and the
+  gated delta net op replays the kept tokens rather than restoring one of
+  `n_rs_seq` snapshots. `llama_memory_seq_rm` still accepts a rollback of up
+  to `n_rs_seq` positions; the `:mtp` and `:mtp_sidecar` tests pass unchanged.
+- **Tool calls**: templates whose tool calls are bare JSON with no start
+  marker (Llama 3.x) now get a lazy grammar under `tool_choice: :auto`,
+  triggered by a pattern on `{"name":` (#32497). Before, such requests
+  produced no grammar at all. The parser also matches special tokens by id
+  when the reply carries them (#29307); the NIF already feeds token ids to
+  `common_chat_parse`, so nothing changes on our side.
+- **RPC protocol 10.0.2** (was 10.0.1): #32126 appends
+  `GGML_OP_SIGMOID_BACK` before `GGML_OP_COUNT` (100 → 101), so no op
+  renumbers. The replay above rides on the existing `GGML_OP_GATED_DELTA_NET`
+  (extra sources, op param 1 = pending tokens) and #32740's indexed bias on
+  `GGML_OP_FLASH_ATTN_EXT` (op param 5); a v0.8.72 worker accepts the
+  handshake but does not know either. Run worker and client from the same
+  release. #32651/#32896 rework the RPC server's request handling; the
+  `HELLO` layout and command numbers are unchanged.
+
+### Upstream
+
+- From the 97 commits:
+  - Models: Inkling 2 DSpark speculative drafts (#32218), Inkling 2 graph
+    and parser work (#32948, #32855, #32940, #32833), qwen3-omni
+    conversion (#32941), LFM2.5-VL template detection (#32843).
+  - Metal: NVFP4 (#32825), BF16/F32 `src1` for `MUL_MAT`/`MUL_MAT_ID`
+    (#32677), batched concat (#32824), top-k scratch only for short rows
+    (#32942).
+  - CUDA: RMS_NORM + MUL + MROPE fusion (#32500), NVFP4 dequant (#32875),
+    MMVF offset overflow (#32965), cooperative softmax with > 256 SMs
+    (#32897).
+  - CPU: SVE `q5_0`/`q5_1` dot products (#30867), ARMv8.0 repack kernels
+    without dotprod (#32142), the threadpool pauses while other backends
+    finish a split instead of polling (#32378).
+  - Quantize: target file size / bpw selection (#15550).
+  - gguf: no invalid enum values from untrusted files (#32641).
+  - Vulkan, OpenCL, WebGPU, HIP, OpenVINO, SpacemiT, mtmd and server/UI
+    work.
+
 ## v0.8.72
 
 llama.cpp bumped to `225a5345b` (b12627), 164 commits from `9581154a2`
