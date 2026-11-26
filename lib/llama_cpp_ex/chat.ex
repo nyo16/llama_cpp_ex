@@ -241,7 +241,8 @@ defmodule LlamaCppEx.Chat do
     do: {:ok, tools, choice}
 
   # OpenAI's named form forces that one function: offer only it, and require a
-  # call. llama.cpp itself only takes the three strings.
+  # call. llama.cpp takes the named form too (#31564), but keeps every tool in
+  # the prompt and only some of its parsers narrow the grammar to the name.
   defp tool_choice(tools, %{} = choice) do
     case choice |> field(:function) |> function_name() do
       nil ->

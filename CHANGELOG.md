@@ -1,5 +1,84 @@
 # Changelog
 
+## v0.8.74
+
+llama.cpp bumped to `436d7e81c` (b12627+163), 66 commits from `e8906e6b0`
+(b12627+97). `llama.h`, `ggml.h`, `common.h` and `speculative.h` are
+unchanged, as are `llama_model_default_params` and
+`llama_context_default_params`. `chat.h` turns `common_chat_tool_choice` into
+a struct and `common_chat_tool_choice_parse_oaicompat` now takes the JSON
+value and the parsed tools (#31564); the NIF's one call is adapted.
+`ggml-backend.h` adds `fast_async_host_input` to the device caps. No decision
+code changed upstream, so `decision.cpp` stays "Ported at" `225a5345b`.
+
+Checked on an M1 Max (Metal): the default suite on a default build and on an
+`LLAMA_RPC=1` build, plus `:rpc_live` against a local `RPC.Server` worker;
+`:smoke`, `:tools`, `:embeddings` (Qwen3-Embedding and embeddinggemma-2),
+`:slow`, `:decision`, `:decision_clef`, `:mtp` (Qwen3.6-27B),
+`:mtp_sidecar` (Qwen3.8-27B), `:dflash` (Inkling-2-Mini Q8_0 with
+Inkling-2-Mini-DFlash2) and `test/vm_exit_test.exs`; and
+`scripts/decision_compare.exs` — ALL MATCH on 9 models against llama-server
+at the same commit. Not run on a DGX Spark.
+
+### Fixed
+
+- `MTP.init(..., type: :dflash)` refused a drafter that reads the target's
+  final layer (`draft model reads target layer 48, but the target has 48
+  layers`). A target layer id is the input of that layer, and upstream
+  accepts ids up to `n_layer` inclusive; the Inkling 2 DFlash2 drafter reads
+  `[5, 23, 41, 48]` on a 48-layer target. The check now matches upstream.
+
+### Changed
+
+- **Named tool choice**: llama.cpp now accepts `%{type: "function",
+  function: %{name: name}}` and `allowed_tools` itself (#31564), but keeps
+  every tool in the prompt and narrows the grammar only in the generated
+  (auto) parsers and qwen3-coder; hand-written ones such as gemma4 and
+  gpt-oss still offer every tool. `LlamaCppEx` keeps doing what it did: the
+  named form offers only that tool and requires a call, for every template.
+- **DFlash2 on Inkling 2 Mini** (#33073): `MTP.init(target, type: :dflash,
+  draft_model: draft)` drafts for Inkling-2-Mini with
+  `incoai/Inkling-2-Mini-DFlash2`. The drafter has to be converted at this
+  commit or later: #33073 adds the `selector_softcap_after_correction` key
+  and the target's embedding norm (`token_embd_norm`), and the DFlash2 GGUFs
+  published before it lack both. Greedy, 256 tokens on Inkling-2-Mini Q8_0:
+  a drafter converted at `436d7e81c` accepts 170 of 258 drafted tokens (66%)
+  and runs in 9.8 s against 11.3 s without drafting; a GGUF published before
+  #33073 accepts 0 of 765 and takes 27.4 s. The text is the same either way.
+- **Tokenizer**: SPM vocabularies honour the Metaspace `prepend_scheme`
+  (#31986) and BPE vocabularies accept `always` (#33038). An SPM GGUF whose
+  tokenizer says `first` no longer gets a space after each special token.
+  The fast path of `Chat.prepare/3` (no special-token text in the caller's
+  text) tokenizes the whole prompt in one call and follows this exactly. The
+  slow path tokenizes each raw fragment in its own `llama_tokenize` call, so
+  on a `first` vocabulary (SPM now, BPE already since #23343) a fragment
+  after a template special token still gets the leading space: the public
+  API has no call that tokenizes without it. The key is written only by
+  conversions since #23343 (`0693dbfb9`) from a `tokenizer.json` with a
+  Metaspace pre-tokenizer; no model on the test machine carries it.
+- `state_seq_set_data` with `ON_DEVICE` on a sequence that has no stored
+  device state returns 0 instead of aborting (#30318).
+
+### Upstream
+
+- From the 66 commits:
+  - Models: RAON-1-mini-preview (#32176), Hunyuan v4 flash on the DSA iSWA
+    cache (#32960), Inkling 2 graph uses the indexed flash-attention bias
+    (#33053) and its LoRA tensor names convert (#33055), YaRN hparams for
+    every model (#33032); `-sm tensor` is refused for Hadamard-folded models
+    (#33080).
+  - Metal: the graph is committed in chunks from one command-buffer thread
+    (#32947), short mat-vec lanes spread over `src1` rows (#33034), the
+    iPhone command-buffer change from #31815 reverted (#33050).
+  - CUDA: BF16 `src1` for `MUL_MAT`/`MUL_MAT_ID` (#32533, also CPU), top-k
+    MoE weight norm fused with a sum bias (#32943), MMF offset overflow
+    (#33044), fusion code moved out of `ggml-cuda.cu` (#33087).
+  - ggml: input tensors copied asynchronously where the backend allows it
+    (#30685), scratch memory in `graph_optimize` (#31898), `TANH` backward
+    (#32136); ggml 1.1.1, llama.cpp 1.1.0.
+  - Chat: JSON schema `true` values accepted (#32908).
+  - SYCL, Hexagon 2.0, OpenCL, WebGPU, OpenVINO, ROCm CI and server/UI work.
+
 ## v0.8.73
 
 llama.cpp bumped to `e8906e6b0` (b12627+97), 97 commits from `225a5345b`

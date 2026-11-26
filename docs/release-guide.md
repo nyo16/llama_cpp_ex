@@ -119,6 +119,16 @@ on jinja's `tojson`, `trim`, `upper` and `lower` leaving ASCII digits, `@` and
 `_` alone. The `:smoke` and `:tools` chat tests and the `:decision` tests pin
 the behaviour.
 
+One rule of `llama_vocab::impl::tokenize` cannot be ported through the public
+API: the Metaspace prefix. The slow path tokenizes each raw fragment in its own
+`llama_tokenize` call, and every call starts as the first fragment of a prompt.
+With `tokenizer.ggml.metaspace.prepend_scheme = "first"` (BPE since #23343,
+SPM since #31986) upstream gives only the first raw fragment a leading `▁`;
+the slow path gives one to every fragment after a template special token. The
+fast path is exact. No model used here carries the key; if one does, compare
+`Chat.prepare/3` on a message that spells the model's turn markup against
+the same prompt through `llama_tokenize`.
+
 ### Decision engine port
 
 `c_src/llama_cpp_ex/decision.cpp` is a port of upstream code this build does not
@@ -464,6 +474,30 @@ same release.
 No decision code changed (`server-decision.{h,cpp}` untouched, no
 decision/systemone commit in `server-context.cpp` or `common/common.cpp`),
 so the port stays "Ported at" `225a5345b`.
+
+Re-checked at `436d7e81c` (b12627+163), covering the 66 commits from
+`e8906e6b0`, as a source diff: #1, #2 and #3 are as above.
+`ggml-cpu/CMakeLists.txt` and `ggml/include/ggml.h` were not touched, so the
+RPC protocol stays 10.0.2. The `ggml-rpc.cpp` diff only fills the new
+`fast_async_host_input` device cap (`false`); `ggml_backend_rpc_start_server`
+still returns `void`. The `ggml-cuda.cu` diff moves the fusion code into its
+own file (#33087); `ggml_backend_cuda_comm_init` still returns `nullptr` on a
+non-CUDA member. Not re-measured: no Spark for this bump. No decision code
+changed, so the port stays "Ported at" `225a5345b`.
+
+`common_chat_tool_choice_parse_oaicompat` takes the JSON value and the tools
+(#31564). Upstream's named choice keeps every tool in the prompt and only the
+generated parsers and qwen3-coder narrow the grammar to it, so
+`LlamaCppEx.Chat` still filters the tools itself before the request reaches
+the NIF.
+
+The `:dflash` tag runs on Inkling-2-Mini (ggml-org Q8_0) with
+`incoai/Inkling-2-Mini-DFlash2`, converted at this commit. The converter
+needs the target's `config.json`, tokenizer files and one tensor,
+`model.llm.embed_norm.weight`; a stub target directory with those and a
+one-entry `model.safetensors.index.json` is enough, so the 19.5 GB checkpoint
+does not have to be downloaded (fetch the tensor with an HTTP range request
+from the safetensors header's offsets).
 
 | # | Upstream defect | Our workaround | Still needed? |
 |---|---|---|---|
