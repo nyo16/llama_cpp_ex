@@ -21,7 +21,11 @@
 #   :dflash     — DFlash speculative decoding (MTP.init type: :dflash); needs
 #                 LLAMA_SMOKE_DFLASH_MODEL and LLAMA_SMOKE_DFLASH_DRAFT_MODEL,
 #                 a target and the `dflash` drafter trained for it (e.g.
-#                 Qwen3.8-27B-Q4_K_M and z-lab/Qwen3.8-27B-DFlash2-GGUF).
+#                 Qwen3.8-27B-Q4_K_M and z-lab/Qwen3.8-27B-DFlash2-GGUF, or
+#                 ggml-org's Inkling-2-Mini-Q8_0 and incoai/Inkling-2-Mini-
+#                 DFlash2 converted with the submodule's convert_hf_to_gguf.py
+#                 --target-model-dir; GGUFs of it from before llama.cpp
+#                 #33073 load but accept no draft).
 #   :slow       — long-running comparison matrices (F16 vs Q8_0 KV cache);
 #                 needs LLAMA_SMOKE_GEN_MODEL
 #   :decision   — decision models (LlamaCppEx.Decision); needs both

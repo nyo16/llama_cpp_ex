@@ -2488,7 +2488,8 @@ static common_chat_templates_inputs chat_request_inputs(LlamaModel& model, const
     }
     if (req.contains("tools")) {
         inputs.tools = common_chat_tools_parse_oaicompat(req.at("tools"));
-        inputs.tool_choice = common_chat_tool_choice_parse_oaicompat(req.value("tool_choice", std::string("auto")));
+        inputs.tool_choice = common_chat_tool_choice_parse_oaicompat(
+            req.value("tool_choice", common_json("auto")), inputs.tools);
         inputs.parallel_tool_calls = req.value("parallel_tool_calls", false);
         // The reply is parsed with the template's own parser; have it split
         // reasoning out, as llama-server's default ("auto") does.
@@ -2801,7 +2802,10 @@ speculative_init(
     // The DFlash/DSpark constructor GGML_ASSERTs that the draft names the
     // target layers it reads, and it reads them by index from the target: a
     // draft that is not a DFlash checkpoint, or one trained for a different
-    // target, aborts the VM instead of failing. Check both here.
+    // target, aborts the VM instead of failing. Check both here. An id is the
+    // input of that layer, so n_layer itself (the final norm's input, which
+    // the Inkling 2 DFlash2 drafter reads) is valid, as in
+    // llama_context::set_embeddings_layer_inp.
     if (spec_type != COMMON_SPECULATIVE_TYPE_DRAFT_MTP) {
         const uint32_t n_ids = llama_model_target_layer_ids_n(model_dft);
         if (n_ids == 0) {
@@ -2811,7 +2815,7 @@ speculative_init(
         const int32_t* ids = llama_model_target_layer_ids(model_dft);
         const int32_t n_layer_tgt = llama_model_n_layer(model_tgt);
         for (uint32_t k = 0; k < n_ids; k++) {
-            if (ids[k] < 0 || ids[k] >= n_layer_tgt) {
+            if (ids[k] < 0 || ids[k] > n_layer_tgt) {
                 return fine::Error("draft model reads target layer " + std::to_string(ids[k]) +
                                    ", but the target has " + std::to_string(n_layer_tgt) +
                                    " layers; the drafter belongs to a different model");
